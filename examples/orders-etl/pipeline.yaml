@@ -1,0 +1,26 @@
+pipeline:
+  name: orders-etl
+  version: 1
+
+connectors:
+  redpanda:
+    brokers: [localhost:9092]
+  paimon:
+    warehouse: ./warehouse
+    catalog: local
+
+inputs:
+  - name: orders
+    topic: orders-topic
+    key: order_id            # == state key == bucket key (invariante de alineación)
+    schema: avro/orders-v1
+
+output:
+  name: orders_lake
+  table: default.orders_lake
+  key: order_id
+  bucket: 4                  # == deployment.partitions (alineado)
+  sequence_field: source_version
+
+deployment:
+  partitions: 4

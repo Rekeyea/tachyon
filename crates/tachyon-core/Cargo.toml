@@ -1,0 +1,9 @@
+[package]
+name = "tachyon-core"
+description = "Tipos base y plan de pipeline para Tachyon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "paimon-write-spike"
+description = "Slice 0.5 spike: escribir a una tabla Paimon local con paimon-rs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Crate standalone (NO es miembro del workspace de Tachyon) para aislar la
+# dependencia pesada de `paimon` del workspace principal.
+[workspace]
+
+[dependencies]
+paimon = "0.3"
+arrow = "58"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"

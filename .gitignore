@@ -1,0 +1,22 @@
+# Rust
+target/
+
+# Build artifacts
+*.so
+*.dylib
+
+# Warehouses de test/desarrollo (datos Paimon locales)
+warehouse/
+warehouses/
+
+# Logs y temp
+*.log
+tmp/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store

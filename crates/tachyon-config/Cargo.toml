@@ -1,0 +1,12 @@
+[package]
+name = "tachyon-config"
+description = "Parsing y validación de pipeline.yaml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true

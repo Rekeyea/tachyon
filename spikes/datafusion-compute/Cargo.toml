@@ -1,0 +1,16 @@
+[package]
+name = "datafusion-compute-spike"
+description = "Slice 0.5 spike: DataFusion SQL sobre RecordBatch (capa de computo)"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Crate standalone (NO es miembro del workspace de Tachyon) para aislar la
+# dependencia pesada de `datafusion` del workspace principal.
+[workspace]
+
+[dependencies]
+datafusion = "55"
+arrow = "59"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"

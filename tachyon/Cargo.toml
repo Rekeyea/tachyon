@@ -1,0 +1,23 @@
+[package]
+name = "tachyon"
+description = "Binario de Tachyon: corre un pipeline de streaming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tachyon"
+path = "src/main.rs"
+
+[dependencies]
+tachyon-config = { path = "../crates/tachyon-config" }
+tachyon-runtime = { path = "../crates/tachyon-runtime" }
+anyhow.workspace = true
+clap.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml.workspace = true
+arrow.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

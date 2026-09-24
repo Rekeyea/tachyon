@@ -1,0 +1,26 @@
+[package]
+name = "tachyon-source"
+description = "Conector fuente Redpanda (StreamTableExec)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+arrow.workspace = true
+datafusion.workspace = true
+anyhow.workspace = true
+# rdkafka con cmake-build: compila librdkafka desde fuente (necesita cmake,
+# que sí está disponible). Sin SSL/SASL (llega si el broker lo exige).
+rdkafka = { version = "0.39", features = ["cmake-build"] }
+apache-avro = "0.21"
+arrow-json = "58"
+futures = "0.3"
+async-stream = "0.3"
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# para la fuente in-memory de tests
+tokio-stream = "0.1"

@@ -1,0 +1,19 @@
+[package]
+name = "tachyon-sink"
+description = "Conector sink Paimon (writer por bucket)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+# Stack alineado (ver invariante de versiones en el Cargo.toml del workspace):
+# paimon 0.3.0 trae arrow 58 vía paimon-datafusion; no actualizar sin re-alinear.
+paimon = "0.3"
+arrow = "58"
+anyhow = "1"
+tracing = "0.1"
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

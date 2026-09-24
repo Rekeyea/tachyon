@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tachyon-core",
+    "crates/tachyon-config",
+    "crates/tachyon-sql",
+    "crates/tachyon-source",
+    "crates/tachyon-sink",
+    "crates/tachyon-runtime",
+    "crates/tachyon-metrics",
+    "tachyon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/tachyon/tachyon"
+
+# Dependencias de workspace (se añaden las pesadas por slice; ver MVP.md §5).
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# --- Stack de computo + lakehouse (alineado; ver DESIGN.md / MVP.md) ---
+# INVARIANTE: `arrow` debe coincidir con la arrow que usa `paimon`.
+# paimon 0.3.0 usa arrow 58 -> datafusion debe ser 54 (usa arrow 58).
+# NO subir datafusion a 55 (usa arrow 59) sin un paimon que use arrow 59/60,
+# o el RecordBatch de DataFusion y el de paimon serian tipos distintos.
+datafusion = "54"
+arrow = "58"
+paimon = "0.3"
+paimon-datafusion = "0.3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

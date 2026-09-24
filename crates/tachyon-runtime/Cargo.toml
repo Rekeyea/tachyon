@@ -1,0 +1,27 @@
+[package]
+name = "tachyon-runtime"
+description = "Runtime de ejecución de Tachyon (loop: consume -> transform -> write)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+tachyon-config = { path = "../tachyon-config" }
+tachyon-sql = { path = "../tachyon-sql" }
+tachyon-source = { path = "../tachyon-source" }
+tachyon-sink = { path = "../tachyon-sink" }
+tachyon-metrics = { path = "../tachyon-metrics" }
+anyhow.workspace = true
+tracing.workspace = true
+datafusion.workspace = true
+tokio.workspace = true
+arrow.workspace = true
+futures = "0.3"
+rdkafka = { version = "0.39", features = ["cmake-build"] }
+
+[dev-dependencies]
+serde_yaml.workspace = true
+anyhow.workspace = true
+paimon = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,13 @@
+[package]
+name = "tachyon-metrics"
+description = "Métricas de Tachyon (OpenTelemetry)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# MVP: métricas básicas + endpoint HTTP minimalista (sin OpenTelemetry todavía;
+# la integración OTel llega en la Fase 4, ver DESIGN.md §10.2).
+tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+tracing = "0.1"
