@@ -5,8 +5,10 @@
 
 use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
+use std::sync::Arc;
 use tachyon_config::{validate_config, PipelineConfig};
 use tachyon_core::{OutputDef, PartitionKey, PipelinePlan, StreamDef};
+use tachyon_metrics::InstanceMetrics;
 use tachyon_sink::writer::PaimonSink;
 use tachyon_sql::parse_sql;
 
@@ -89,8 +91,16 @@ impl Pipeline {
         .with_context(|| format!("abriendo sink Paimon para {}", self.config.output.table))?;
 
         let options = RunOptions::from_config(&self.config);
-        run_pipeline(&self.config, &self.select_sql, &options, &mut sink, input_schemas)
-            .await
+        let metrics = Arc::new(InstanceMetrics::new());
+        run_pipeline(
+            &self.config,
+            &self.select_sql,
+            &options,
+            &mut sink,
+            input_schemas,
+            &metrics,
+        )
+        .await
     }
 }
 

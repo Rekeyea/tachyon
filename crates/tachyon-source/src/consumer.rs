@@ -32,12 +32,25 @@ pub type RecordStream =
 /// particiones: al suscribirse al topic, el protocolo de grupo reparte las
 /// particiones entre las instancias del mismo `group.id`.
 ///
-/// El `BaseConsumer` vive en un `Arc<Mutex<Option<_>>>` para que el stream de
-/// registros lo use en el poll y el runtime pueda recuperarlo después para el
-/// commit de offsets (Slice 5: exactly-once en Fase 1, at-least-once +
-/// idempotencia por sequence en el MVP).
+/// El `BaseConsumer` vive en un `Arc<Mutex<Option<_>>>` hasta que `record_stream()`
+/// lo `take()`a y lo mueve al task de poll (que lo posee y lo reutiliza). Como
+/// `BaseConsumer` no es `Sync`, no puede compartirse entre threads vía `Arc`; el
+/// commit de offsets se delega al task de poll a través de un canal de comandos
+/// (`commit_tx`): `commit()` envía un comando y el task (que posee el consumer)
+/// lo ejecuta y responde. Sin esto, `commit()` vería el `Option` vacío y
+/// silenciosamente no commitaría nada (bug de recuperación).
 pub struct RdkafkaSource {
     consumer: Arc<Mutex<Option<BaseConsumer>>>,
+    /// Canal de comandos de commit hacia el task de poll.
+    commit_tx: tokio::sync::mpsc::UnboundedSender<CommitCommand>,
+    /// Receiver del canal de commit (se mueve al task de poll en `record_stream`).
+    commit_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CommitCommand>>>,
+}
+
+/// Comando de commit de offsets: el task de poll lo ejecuta sobre el
+/// `BaseConsumer` que posee y responde con el resultado.
+struct CommitCommand {
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 impl RdkafkaSource {
@@ -49,33 +62,36 @@ impl RdkafkaSource {
         consumer
             .subscribe(&[topic])
             .context("suscriciendose al topic")?;
+        let (commit_tx, commit_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             consumer: Arc::new(Mutex::new(Some(consumer))),
+            commit_tx,
+            commit_rx: Mutex::new(Some(commit_rx)),
         })
     }
 
     /// Commitea los offsets consumidos (consumer group).
+    ///
+    /// El `BaseConsumer` vive en el task de poll (no es `Sync`, no puede
+    /// compartirse), así que el commit se delega: se envía un comando por el
+    /// canal y el task (que posee el consumer) lo ejecuta y responde. Se espera
+    /// la respuesta con timeout para no colgar si el task de poll ya terminó.
     ///
     /// En el MVP es at-least-once: si el proceso muere entre el commit de
     /// Paimon y este commit, los eventos se re-procesan a la reconexión; la
     /// idempotencia la da el sequence number en Paimon (dedup por clave).
     /// En la Fase 1 el commit de offsets es atómico con el commit de Paimon
     /// (ver DESIGN.md §9.2.4).
-    pub fn commit(&self) -> Result<()> {
-        let guard = self
-            .consumer
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock de consumer: {e}"))?;
-        match guard.as_ref() {
-            Some(consumer) => consumer
-                .commit_consumer_state(CommitMode::Async)
-                .context("commit de offsets rdkafka"),
-            None => {
-                // El stream ya tomó el consumer y no lo devolvió (terminó o
-                // falló): no hay offsets que commitar.
-                Ok(())
-            }
-        }
+    pub async fn commit(&self) -> Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.commit_tx
+            .send(CommitCommand { reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("task de poll no disponible para commit de offsets"))?;
+        let result = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("timeout esperando el commit de offsets"))?
+            .map_err(|_| anyhow::anyhow!("el task de poll terminó antes de commitar"))?;
+        result.map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Produce un stream de registros del consumidor (poll continuo).
@@ -93,6 +109,13 @@ impl RdkafkaSource {
         let poll_timeout = Duration::from_secs(1);
         let state = self.consumer.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        // El receiver del canal de commit se mueve al task de poll (no es Clone).
+        let commit_rx = self
+            .commit_rx
+            .lock()
+            .expect("lock del canal de commit")
+            .take()
+            .expect("canal de commit presente");
 
         tokio::spawn(async move {
             // El consumer vive dentro del task de poll: se toma una sola vez
@@ -104,6 +127,7 @@ impl RdkafkaSource {
                 .expect("consumidor presente");
             let _ = tokio::task::spawn_blocking(move || {
                 let mut consumer = consumer;
+                let mut commit_rx = commit_rx;
                 loop {
                     // Si el receiver se soltó (el stream de datos terminó),
                     // salir: dejar el `BaseConsumer` en el suelo mantendría
@@ -111,6 +135,19 @@ impl RdkafkaSource {
                     // no podría terminar.
                     if tx.is_closed() {
                         break;
+                    }
+                    // Drenar comandos de commit pendientes (el consumer lo
+                    // ejecuta aquí, en el thread que lo posee).
+                    loop {
+                        match commit_rx.try_recv() {
+                            Ok(cmd) => {
+                                let result = consumer
+                                    .commit_consumer_state(CommitMode::Sync)
+                                    .map_err(|e| e.to_string());
+                                let _ = cmd.reply.send(result);
+                            }
+                            Err(_) => break, // Empty o Disconnected
+                        }
                     }
                     match consumer.poll(poll_timeout) {
                         Some(Ok(message)) => {

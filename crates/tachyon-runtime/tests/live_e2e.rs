@@ -175,6 +175,7 @@ async fn live_end_to_end_redpanda_to_paimon() {
     let select_sql = "SELECT order_id, status, source_version, amount \
                       FROM orders WHERE status <> 'cancelled'";
     let config = Arc::new(config);
+    let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
     let run_task = tokio::spawn(async move {
         run_pipeline(
             &config,
@@ -182,6 +183,7 @@ async fn live_end_to_end_redpanda_to_paimon() {
             &options,
             &mut sink,
             &input_schemas,
+            &metrics,
         )
         .await
     });

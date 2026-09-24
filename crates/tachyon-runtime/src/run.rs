@@ -109,6 +109,9 @@ fn source_client_config(config: &PipelineConfig, group_id: &str) -> ClientConfig
 /// No retorna mientras el pipeline esté activo (el stream de salida es
 /// infinito). En tests se lanza en una tarea y se cancela; en producción
 /// corre hasta recibir una señal de shutdown.
+///
+/// `metrics` es pre-creada por el caller para que pueda leerse **mientras el
+/// pipeline corre** (tests de recuperación, supervisor, admin API).
 pub async fn run_pipeline(
     config: &PipelineConfig,
     select_sql: &str,
@@ -118,9 +121,9 @@ pub async fn run_pipeline(
     // Schemas de los inputs (nombre lógico -> schema Arrow). En producción
     // vienen del schema Avro/JSON del topic; en tests se proporcionan.
     input_schemas: &std::collections::HashMap<String, SchemaRef>,
+    // Métricas de la instancia (pre-creadas por el caller).
+    metrics: &Arc<InstanceMetrics>,
 ) -> Result<PipelineHandle> {
-    let metrics = Arc::new(InstanceMetrics::new());
-
     // --- Métricas (endpoint HTTP) ---
     let metrics_addr = if let Some(bind) = options.metrics_bind {
         let server = MetricsServer::new(bind, metrics.clone());
@@ -231,7 +234,7 @@ pub async fn run_pipeline(
                     metrics.inc_commits();
                     // Commit de offsets (at-least-once).
                     for source in &sources {
-                        if let Err(e) = source.commit() {
+                        if let Err(e) = source.commit().await {
                             tracing::warn!(error = %e, "commit de offsets");
                             metrics.inc_errors();
                         }
@@ -247,11 +250,11 @@ pub async fn run_pipeline(
     sink.commit().await.context("commit final del sink")?;
     metrics.inc_commits();
     for source in &sources {
-        let _ = source.commit();
+        let _ = source.commit().await;
     }
 
     Ok(PipelineHandle {
         metrics_addr,
-        metrics,
+        metrics: metrics.clone(),
     })
 }

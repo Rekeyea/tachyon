@@ -229,8 +229,9 @@ async fn live_scaling_two_instances_disjoint_partitions() {
         )
         .expect("abriendo sink");
         let schemas = input_schemas.clone();
+        let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
         run_tasks.push(tokio::spawn(async move {
-            run_pipeline(&config, select_sql, &options, &mut sink, &schemas).await
+            run_pipeline(&config, select_sql, &options, &mut sink, &schemas, &metrics).await
         }));
     }
 
