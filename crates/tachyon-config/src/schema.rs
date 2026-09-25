@@ -99,6 +99,14 @@ pub struct Deployment {
     /// Métricas de la instancia (endpoint HTTP).
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    /// Consumidores paralelos por topic (mismo consumer group). El protocolo de
+    /// grupo reparte las particiones entre ellos y cada instancia hace fetch en
+    /// paralelo. Un solo cliente librdkafka se satura en ~200K rows/s por
+    /// serialización de round trips de fetch, así que más clientes = más
+    /// throughput. Default: `min(partitions, 4)` (óptimo observado; más allá
+    /// hay retornos decrecientes).
+    #[serde(default)]
+    pub consumers_per_topic: Option<usize>,
 }
 
 fn default_commit_interval() -> String {

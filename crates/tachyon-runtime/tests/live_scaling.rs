@@ -221,7 +221,7 @@ async fn live_scaling_two_instances_disjoint_partitions() {
             metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
             group_id: group_id.clone(), // MISMO grupo -> reparto de particiones
         };
-        let mut sink = PaimonSink::from_table(
+        let sink = PaimonSink::from_table(
             tables[instance].clone(),
             "order_id",
             1,
@@ -231,7 +231,7 @@ async fn live_scaling_two_instances_disjoint_partitions() {
         let schemas = input_schemas.clone();
         let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
         run_tasks.push(tokio::spawn(async move {
-            run_pipeline(&config, select_sql, &options, &mut sink, &schemas, &metrics).await
+            run_pipeline(&config, select_sql, &options, sink, &schemas, &metrics).await
         }));
     }
 

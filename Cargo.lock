@@ -4777,6 +4777,7 @@ dependencies = [
  "arrow",
  "datafusion",
  "futures",
+ "libc",
  "paimon",
  "rdkafka",
  "serde_yaml",

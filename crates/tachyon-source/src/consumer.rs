@@ -22,9 +22,12 @@ use rdkafka::Message;
 
 use crate::record::SourceRecord;
 
-/// Un stream de registros crudos (la abstracción que decoupla el broker).
+/// Un stream de **lotes** de registros crudos (la abstracción que decoupla el
+/// broker). Cada elemento es un `Vec<SourceRecord>` (un lote drenado del buffer
+/// interno de librdkafka). Emitir lotes en vez de un registro a la vez reduce el
+/// overhead por mensaje (un salto de canal mpsc por lote, no por registro).
 pub type RecordStream =
-    std::pin::Pin<Box<dyn futures::Stream<Item = Result<SourceRecord>> + Send + 'static>>;
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<SourceRecord>>> + Send + 'static>>;
 
 /// Consumidor de Redpanda por consumer group.
 ///
@@ -107,6 +110,13 @@ impl RdkafkaSource {
     /// `spawn_blocking` para no bloquear el runtime async.
     pub fn record_stream(&self) -> RecordStream {
         let poll_timeout = Duration::from_secs(1);
+        // Tope de registros por lote (acota la memoria por envío al mpsc). Se
+        // drena todo el buffer de librdkafka por envío: cada envío que toca la
+        // red es un round trip al broker, así que un lote grande amortiza el
+        // round trip sobre muchos más registros (con el tope antiguo de 1000,
+        // el loop hacía un round trip cada ~1000 filas y el throughput quedaba
+        // acotado por la latencia de red, no por el cómputo).
+        let max_batch = 65536usize;
         let state = self.consumer.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         // El receiver del canal de commit se mueve al task de poll (no es Clone).
@@ -126,8 +136,18 @@ impl RdkafkaSource {
                 .take()
                 .expect("consumidor presente");
             let _ = tokio::task::spawn_blocking(move || {
-                let mut consumer = consumer;
+                let consumer = consumer;
                 let mut commit_rx = commit_rx;
+                // Instrumentación de diagnóstico (solo con TACHYON_DEBUG_POLL=1):
+                // permite ver si el task de poll arranca, recibe mensajes y
+                // logra enviarlos por el canal mpsc.
+                let debug_poll = std::env::var("TACHYON_DEBUG_POLL").is_ok();
+                if debug_poll {
+                    eprintln!("[poll] task iniciado");
+                }
+                let mut sent_batches = 0u64;
+                let mut sent_rows = 0u64;
+                let mut last_report = std::time::Instant::now();
                 loop {
                     // Si el receiver se soltó (el stream de datos terminó),
                     // salir: dejar el `BaseConsumer` en el suelo mantendría
@@ -136,34 +156,72 @@ impl RdkafkaSource {
                     if tx.is_closed() {
                         break;
                     }
-                    // Drenar comandos de commit pendientes (el consumer lo
-                    // ejecuta aquí, en el thread que lo posee).
+                    // Drenar comandos de commit pendientes. `CommitMode::Async`:
+                    // el commit se encola y el ack llega en background; NO
+                    // bloquea el poll (un Sync aquí paralizaba el consumo).
                     loop {
                         match commit_rx.try_recv() {
                             Ok(cmd) => {
                                 let result = consumer
-                                    .commit_consumer_state(CommitMode::Sync)
+                                    .commit_consumer_state(CommitMode::Async)
                                     .map_err(|e| e.to_string());
                                 let _ = cmd.reply.send(result);
                             }
                             Err(_) => break, // Empty o Disconnected
                         }
                     }
+                    // Consumir un LOTE: el primer `poll` bloquea (espera hasta
+                    // `poll_timeout` por el primer mensaje); luego se drena el
+                    // buffer interno de librdkafka con `poll(0)` (no bloquea)
+                    // hasta vaciarlo o alcanzar `max_batch`. Un solo envío al
+                    // mpsc por lote (no por registro).
+                    let mut batch: Vec<SourceRecord> = Vec::new();
                     match consumer.poll(poll_timeout) {
                         Some(Ok(message)) => {
-                            // El `BorrowedMessage` de rdkafka no puede escapar
-                            // del poll, así que se convierte a `SourceRecord`
-                            // (owned) aquí.
-                            let record = message_to_record(&message);
-                            if tx.blocking_send(record).is_err() {
-                                break; // receiver caído: nada más que hacer
+                            batch.push(message_to_record(&message));
+                            while batch.len() < max_batch {
+                                match consumer.poll(Duration::from_millis(0)) {
+                                    Some(Ok(m)) => batch.push(message_to_record(&m)),
+                                    Some(Err(e)) => {
+                                        tracing::warn!(error = %e, "error de poll rdkafka");
+                                        break;
+                                    }
+                                    None => break, // buffer vacío
+                                }
                             }
                         }
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "error de poll rdkafka");
+                            if debug_poll {
+                                eprintln!("[poll] ERROR en poll(timeout): {e} -> el task de poll TERMINA");
+                            }
                             break;
                         }
                         None => continue, // timeout sin mensajes
+                    }
+                    if batch.is_empty() {
+                        if debug_poll
+                            && last_report.elapsed() > std::time::Duration::from_secs(2)
+                        {
+                            eprintln!(
+                                "[poll] {sent_batches} lotes / {sent_rows} filas enviados hasta ahora (poll sin mensajes aún?)"
+                            );
+                            last_report = std::time::Instant::now();
+                        }
+                        continue;
+                    }
+                    let batch_len = batch.len();
+                    if tx.blocking_send(batch).is_err() {
+                        break; // receiver caído: nada más que hacer
+                    }
+                    sent_batches += 1;
+                    sent_rows += batch_len as u64;
+                    if debug_poll && last_report.elapsed() > std::time::Duration::from_secs(2) {
+                        eprintln!(
+                            "[poll] {sent_batches} lotes / {sent_rows} filas enviados (media {:.0} filas/lote)",
+                            sent_rows as f64 / sent_batches as f64
+                        );
+                        last_report = std::time::Instant::now();
                     }
                 }
             })
@@ -176,30 +234,29 @@ impl RdkafkaSource {
     }
 }
 
-/// Stream de `SourceRecord` desde el canal mpsc del task de poll.
+/// Stream de lotes de `SourceRecord` desde el canal mpsc del task de poll.
 ///
 /// Implementa `Stream` directamente (sin macro) para evitar la dependencia
 /// `async-stream`. Es cancelation-safe: soltar el stream no afecta al task
 /// de poll, que sigue poseyendo el `BaseConsumer`.
 struct ReceiverStream {
-    rx: tokio::sync::mpsc::Receiver<SourceRecord>,
+    rx: tokio::sync::mpsc::Receiver<Vec<SourceRecord>>,
 }
 
 impl futures::Stream for ReceiverStream {
-    type Item = Result<SourceRecord>;
+    type Item = Result<Vec<SourceRecord>>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         match std::pin::Pin::new(&mut self.rx).poll_recv(cx) {
-            std::task::Poll::Ready(Some(record)) => {
+            std::task::Poll::Ready(Some(batch)) => {
                 tracing::debug!(
-                    partition = record.partition,
-                    offset = record.offset,
-                    "record consumido de Redpanda"
+                    rows = batch.len(),
+                    "lote consumido de Redpanda"
                 );
-                std::task::Poll::Ready(Some(Ok(record)))
+                std::task::Poll::Ready(Some(Ok(batch)))
             }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None), // canal cerrado
             std::task::Poll::Pending => std::task::Poll::Pending,
@@ -219,7 +276,8 @@ fn message_to_record(message: &impl Message) -> SourceRecord {
 
 /// Fuente in-memory de registros (para tests y para emular el broker).
 ///
-/// Produce un `RecordStream` a partir de una lista de `SourceRecord`.
+/// Produce un `RecordStream` (lotes) a partir de una lista de `SourceRecord`.
+/// Todos los registros van en un único lote (los tests no miden throughput).
 pub fn in_memory_stream(records: Vec<SourceRecord>) -> RecordStream {
-    Box::pin(stream::iter(records.into_iter().map(Ok)))
+    Box::pin(stream::iter(std::iter::once(Ok(records))))
 }

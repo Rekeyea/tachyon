@@ -166,7 +166,7 @@ async fn live_end_to_end_redpanda_to_paimon() {
     };
 
     // --- 3. Sink + schemas ---
-    let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
+    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
         .expect("abriendo sink");
     let input_schemas: HashMap<String, Arc<Schema>> =
         HashMap::from([("orders".to_string(), orders_schema())]);
@@ -181,7 +181,7 @@ async fn live_end_to_end_redpanda_to_paimon() {
             &config,
             select_sql,
             &options,
-            &mut sink,
+            sink,
             &input_schemas,
             &metrics,
         )

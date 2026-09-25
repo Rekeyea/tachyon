@@ -79,7 +79,7 @@ impl Pipeline {
     pub async fn run(&self, input_schemas: &std::collections::HashMap<String, SchemaRef>) -> Result<PipelineHandle> {
         // Abrir el sink Paimon desde el warehouse de la config.
         let (db, table) = split_table_identifier(&self.config.output.table);
-        let mut sink = PaimonSink::open(
+        let sink = PaimonSink::open(
             &self.config.connectors.paimon.warehouse,
             &db,
             &table,
@@ -96,7 +96,7 @@ impl Pipeline {
             &self.config,
             &self.select_sql,
             &options,
-            &mut sink,
+            sink,
             input_schemas,
             &metrics,
         )

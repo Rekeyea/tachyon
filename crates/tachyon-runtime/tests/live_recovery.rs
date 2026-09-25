@@ -149,7 +149,7 @@ async fn start_instance(
         metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
         group_id: group_id.to_string(),
     };
-    let mut sink =
+    let sink =
         PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
             .expect("abriendo sink");
     let input_schemas: HashMap<String, Arc<Schema>> =
@@ -159,7 +159,7 @@ async fn start_instance(
     let task = tokio::spawn({
         let metrics = metrics.clone();
         async move {
-            run_pipeline(&config, &select_sql, &options, &mut sink, &input_schemas, &metrics).await
+            run_pipeline(&config, &select_sql, &options, sink, &input_schemas, &metrics).await
         }
     });
     (task, metrics)

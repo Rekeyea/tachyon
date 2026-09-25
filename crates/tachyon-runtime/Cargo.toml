@@ -25,3 +25,4 @@ serde_yaml.workspace = true
 anyhow.workspace = true
 paimon = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"

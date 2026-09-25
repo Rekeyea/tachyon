@@ -90,6 +90,11 @@ fn source_client_config(config: &PipelineConfig, group_id: &str) -> ClientConfig
     cc.set("auto.offset.reset", "earliest");
     cc.set("enable.auto.commit", "false");
     cc.set("session.timeout.ms", "10000");
+    // Tuning de fetch: el broker acumula hasta `fetch.min.bytes` antes de
+    // responder (con el default de 1 byte cada round trip trae poquísimas
+    // filas y el throughput queda acotado por la latencia de red).
+    cc.set("fetch.min.bytes", "524288");
+    cc.set("fetch.wait.max.ms", "1000");
     if let Some(sec) = &config.connectors.redpanda.security {
         if let Some(mech) = &sec.sasl_mechanism {
             cc.set("sasl.mechanism", mech);
@@ -102,6 +107,20 @@ fn source_client_config(config: &PipelineConfig, group_id: &str) -> ClientConfig
         }
     }
     cc
+}
+
+/// Número de consumidores paralelos por topic (instancias librdkafka en el
+/// mismo consumer group). Un solo cliente se satura en ~200K rows/s por
+/// serialización de round trips de fetch; el protocolo de grupo reparte las
+/// particiones entre los N clientes y cada uno hace fetch en paralelo.
+/// Default opinionated: `min(partitions, 4)` (óptimo observado en benchmarks;
+/// más consumidores que particiones no tiene sentido porque una partición solo
+/// puede estar asignada a un consumidor).
+fn consumers_per_topic(config: &PipelineConfig) -> usize {
+    config
+        .deployment
+        .consumers_per_topic
+        .unwrap_or_else(|| config.deployment.partitions.min(4).max(1))
 }
 
 /// Corre el pipeline end-to-end.
@@ -117,7 +136,8 @@ pub async fn run_pipeline(
     select_sql: &str,
     options: &RunOptions,
     // La tabla Paimon ya abierta (para no depender del catalog en el loop).
-    sink: &mut PaimonSink,
+    // Se pasa por valor: el writer task la posee (write + commit en background).
+    sink: PaimonSink,
     // Schemas de los inputs (nombre lógico -> schema Arrow). En producción
     // vienen del schema Avro/JSON del topic; en tests se proporcionan.
     input_schemas: &std::collections::HashMap<String, SchemaRef>,
@@ -132,12 +152,17 @@ pub async fn run_pipeline(
         None
     };
 
-    // --- Fuentes Redpanda: una por input ---
+    // --- Fuentes Redpanda: N consumidores por input (mismo consumer group) ---
     // Cada input tiene su propio consumer group (independiente por topic) para
-    // que el rebalanceo de uno no afecte a los demás.
+    // que el rebalanceo de uno no afecte a los demás. Dentro de cada grupo, N
+    // instancias librdkafka reparten las particiones y hacen fetch en paralelo
+    // (un solo cliente se satura en ~200K rows/s; ver consumers_per_topic).
     let mut sources: Vec<Arc<RdkafkaSource>> = Vec::new();
     let mut inputs: Vec<InputSource> = Vec::new();
+    let mut name_to_sources: std::collections::HashMap<String, Vec<Arc<RdkafkaSource>>> =
+        std::collections::HashMap::new();
     let cc = source_client_config(config, &options.group_id);
+    let n_consumers = consumers_per_topic(config);
 
     for input_def in &config.inputs {
         let schema = input_schemas
@@ -148,11 +173,18 @@ pub async fn run_pipeline(
         let source_group = format!("{}-{}", options.group_id, input_def.name);
         let mut source_cc = cc.clone();
         source_cc.set("group.id", &source_group);
-        let source = Arc::new(
-            RdkafkaSource::new(&source_cc, &input_def.topic)
-                .with_context(|| format!("creando source para '{}'", input_def.name))?,
-        );
-        sources.push(source.clone());
+        let input_sources: Vec<Arc<RdkafkaSource>> = (0..n_consumers)
+            .map(|_| -> Result<Arc<RdkafkaSource>> {
+                Ok(Arc::new(
+                    RdkafkaSource::new(&source_cc, &input_def.topic)
+                        .with_context(|| format!("creando source para '{}'", input_def.name))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for s in &input_sources {
+            sources.push(s.clone());
+        }
+        name_to_sources.insert(input_def.name.clone(), input_sources);
         inputs.push(InputSource {
             name: input_def.name.clone(),
             schema: schema.clone(),
@@ -160,21 +192,29 @@ pub async fn run_pipeline(
     }
 
     // --- Factory de producción: cablea cada input a su StreamingTable ---
-    // Mapa nombre lógico -> source (1:1 con los inputs de la config).
+    // Mapa nombre lógico -> sources (N consumidores por input, mismo grupo).
     let batch_size: usize = 100;
-    let name_to_source: std::collections::HashMap<String, Arc<RdkafkaSource>> = config
-        .inputs
-        .iter()
-        .zip(sources.iter())
-        .map(|(def, src)| (def.name.clone(), src.clone()))
-        .collect();
     let factory: Box<StreamTableFactory> = Box::new(move |name, schema| {
-        let source = name_to_source
+        let input_sources = name_to_sources
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("source no encontrado para '{name}'"))?;
         let decoder = Decoder::new(schema.clone(), DecodeFormat::Json);
-        let make_stream = Arc::new(move || source.record_stream());
+        // Un `record_stream()` por consumidor, fusionados con `select_all`:
+        // el grupo reparte las particiones entre ellos y cada instancia
+        // drena su propio buffer de fetch en paralelo. La factory se invoca
+        // una vez por ejecución, así que cada consumidor se `take()`a una vez.
+        let make_stream = Arc::new(move || {
+            let streams: Vec<tachyon_source::consumer::RecordStream> = input_sources
+                .iter()
+                .map(|s| s.record_stream())
+                .collect();
+            // Coerción explícita a `RecordStream` (el `SelectAll` concreto no
+            // se coercea solo a `Pin<Box<dyn Stream>>` en posición de retorno).
+            let merged: tachyon_source::consumer::RecordStream =
+                Box::pin(futures::stream::select_all(streams));
+            merged
+        });
         let ps = Arc::new(RedpandaPartitionStream::new(
             0,
             schema.clone(),
@@ -195,63 +235,82 @@ pub async fn run_pipeline(
         .await
         .context("ejecutando la transformación")?;
 
-    // --- Loop: consume el stream y escribe al sink ---
-    // El commit es time-driven (no batch-driven): con `select!` el timer
-    // dispara el commit cada `commit_interval` aunque no llegue ningún batch
-    // (streams de bajo tráfico). Si el commit dependiera de la llegada de
-    // batches, un stream silencioso retendría los datos en el writer sin
-    // commitar indefinidamente.
+    // --- Writer task: decoupla el write+commit de Paimon del consumo ---
+    // El commit de Paimon (LSM flush a disco) bloquea. Si se hiciera en el loop
+    // de consumo, detendría `stream.next()` y backpresionaría toda la cadena
+    // (mpsc lleno -> poll task bloqueado en `blocking_send` -> el comando de
+    // commit de offsets no se drena -> timeout). Con un writer task dedicado,
+    // el loop de consumo sigue tirando de DataFusion (y por tanto del source y
+    // del poll task) mientras el writer escribe y commita en background. El
+    // canal acotado da backpressure limitada: el loop solo se frena si el
+    // writer no da abasto (el canal se llena).
     let commit_interval = options.commit_interval;
-    let mut commit_timer = tokio::time::interval(commit_interval);
-    commit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // La primera tick es inmediata: se consume para que el primer commit real
-    // ocurra a los `commit_interval`.
-    commit_timer.tick().await;
-    let mut dirty = false;
+    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel(512);
 
-    loop {
-        tokio::select! {
-            maybe_batch = stream.next() => {
-                match maybe_batch {
-                    Some(Ok(batch)) => {
-                        let rows = batch.num_rows() as u64;
-                        tracing::debug!(rows, "batch de salida desde DataFusion");
-                        metrics.inc_rows_read(rows);
-
-                        sink.write(&batch)
-                            .await
-                            .context("escribiendo al sink Paimon")?;
-                        metrics.inc_rows_written(rows);
-                        dirty = true;
-                    }
-                    Some(Err(e)) => return Err(e).context("batch de salida"),
-                    None => break, // stream terminó
-                }
-            }
-            _ = commit_timer.tick() => {
-                if dirty {
-                    sink.commit().await.context("commit del sink")?;
-                    metrics.inc_commits();
-                    // Commit de offsets (at-least-once).
-                    for source in &sources {
-                        if let Err(e) = source.commit().await {
-                            tracing::warn!(error = %e, "commit de offsets");
-                            metrics.inc_errors();
+    let writer_metrics = metrics.clone();
+    let writer: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let mut sink = sink;
+        let mut commit_timer = tokio::time::interval(commit_interval);
+        commit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        commit_timer.tick().await; // primera tick inmediata
+        let mut dirty = false;
+        loop {
+            tokio::select! {
+                maybe_batch = batch_rx.recv() => {
+                    match maybe_batch {
+                        Some(batch) => {
+                            sink.write(&batch)
+                                .await
+                                .context("escribiendo al sink Paimon")?;
+                            writer_metrics.inc_rows_written(batch.num_rows() as u64);
+                            dirty = true;
                         }
+                        None => break, // canal cerrado (fin del stream)
                     }
-                    dirty = false;
+                }
+                _ = commit_timer.tick() => {
+                    if dirty {
+                        sink.commit().await.context("commit del sink")?;
+                        writer_metrics.inc_commits();
+                        // Commit de offsets (at-least-once).
+                        for source in &sources {
+                            if let Err(e) = source.commit().await {
+                                tracing::warn!(error = %e, "commit de offsets");
+                                writer_metrics.inc_errors();
+                            }
+                        }
+                        dirty = false;
+                    }
                 }
             }
         }
+        // Commit final (fin del stream).
+        sink.commit().await.context("commit final del sink")?;
+        writer_metrics.inc_commits();
+        for source in &sources {
+            let _ = source.commit().await;
+        }
+        Ok(())
+    });
+
+    // --- Loop de consumo: tira de DataFusion y envía batches al writer ---
+    loop {
+        match stream.next().await {
+            Some(Ok(batch)) => {
+                let rows = batch.num_rows() as u64;
+                tracing::debug!(rows, "batch de salida desde DataFusion");
+                metrics.inc_rows_read(rows);
+                // Backpressure limitada: bloquea solo si el writer no da abasto.
+                batch_tx.send(batch).await.context("enviando batch al writer")?;
+            }
+            Some(Err(e)) => return Err(e).context("batch de salida"),
+            None => break, // stream terminó
+        }
     }
 
-    // El stream terminó (en producción es infinito; en tests puede terminar).
-    // Commit final para no perder datos.
-    sink.commit().await.context("commit final del sink")?;
-    metrics.inc_commits();
-    for source in &sources {
-        let _ = source.commit().await;
-    }
+    // Fin del stream: cerrar el canal y esperar el commit final del writer.
+    drop(batch_tx);
+    writer.await.context("task del writer")??;
 
     Ok(PipelineHandle {
         metrics_addr,

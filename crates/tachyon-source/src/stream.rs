@@ -121,16 +121,19 @@ impl PartitionStream for RedpandaPartitionStream {
                                 return Some((result, (records, acc, None)));
                             }
                         }
-                        // Esperar el siguiente record (con timeout corto para
+                        // Esperar el siguiente lote (con timeout corto para
                         // poder re-verificar el límite de tiempo).
                         match tokio::time::timeout(Duration::from_millis(100), records.next())
                             .await
                         {
-                            Ok(Some(Ok(record))) => {
+                            Ok(Some(Ok(batch))) => {
                                 if since_first.is_none() {
                                     since_first = Some(Instant::now());
                                 }
-                                acc.push(record.value);
+                                // Extender el acumulador con los payloads del lote.
+                                for record in batch {
+                                    acc.push(record.value);
+                                }
                             }
                             Ok(Some(Err(e))) => {
                                 return Some((
@@ -223,8 +226,9 @@ mod tests {
         let make_stream: Arc<dyn Fn() -> crate::consumer::RecordStream + Send + Sync> =
             Arc::new(move || {
                 Box::pin(
-                    futures::stream::iter(std::iter::once(Ok(record.clone())))
-                        .chain(futures::stream::pending()),
+                    futures::stream::iter(std::iter::once(Ok(vec![record.clone()]))).chain(
+                        futures::stream::pending(),
+                    ),
                 )
             });
 
