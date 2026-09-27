@@ -200,3 +200,94 @@ async fn rejects_unknown_key_column() {
     );
     let _ = std::fs::remove_dir_all(&warehouse);
 }
+
+fn offsets(entries: &[(i32, i64)]) -> tachyon_core::SourceOffsets {
+    tachyon_core::SourceOffsets::from([(
+        "orders".to_string(),
+        entries.iter().copied().collect(),
+    )])
+}
+
+/// Exactly-once: `commit_checkpoint` persiste los offsets atómicamente con el
+/// snapshot y `recover` los devuelve tras un reinicio (mismo `commit_user`).
+/// Un archivo de offsets sin snapshot (crash entre ambos pasos) no cuenta, y
+/// otro `commit_user` no ve los checkpoints ajenos.
+#[tokio::test]
+async fn checkpoint_offsets_survive_restart() {
+    let warehouse = fresh_warehouse("checkpoint").await;
+    let table = create_test_table(
+        &warehouse,
+        DB,
+        TABLE,
+        &[
+            ("order_id", DataType::BigInt(BigIntType::with_nullable(false))),
+            ("status", DataType::VarChar(VarCharType::string_type())),
+            ("source_version", DataType::BigInt(BigIntType::new())),
+            ("amount", DataType::Double(DoubleType::new())),
+        ],
+        &["order_id"],
+        1,
+        Some("source_version"),
+    )
+    .await
+    .expect("creando tabla");
+    let open = |user: &str| {
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
+            .expect("abriendo sink")
+            .with_commit_user(user)
+            .expect("commit_user")
+    };
+
+    // --- Instancia fresca: sin checkpoint ---
+    let mut sink = open("tachyon-eos");
+    assert_eq!(sink.recover().await.expect("recover"), None);
+
+    // Sin datos escritos no hay checkpoint (los offsets no avanzan).
+    assert_eq!(sink.commit_checkpoint(&offsets(&[(0, 3)])).await.expect("vacío"), None);
+
+    // --- Dos checkpoints ---
+    sink.write(&batch(vec![1, 2], vec!["paid", "paid"], vec![1, 2], vec![1.0, 2.0]))
+        .await
+        .expect("write 1");
+    assert_eq!(sink.commit_checkpoint(&offsets(&[(0, 2)])).await.expect("ckpt 1"), Some(1));
+    sink.write(&batch(vec![3], vec!["paid"], vec![3], vec![3.0]))
+        .await
+        .expect("write 2");
+    assert_eq!(
+        sink.commit_checkpoint(&offsets(&[(0, 2), (1, 1)])).await.expect("ckpt 2"),
+        Some(2)
+    );
+
+    // --- Crash entre offsets y snapshot: archivo del checkpoint 3 huérfano ---
+    let orphan = std::path::Path::new(&warehouse)
+        .join(format!("{DB}.db"))
+        .join(TABLE)
+        .join("tachyon-offsets/tachyon-eos/3.json");
+    std::fs::write(&orphan, r#"{"orders":{"0":99}}"#).expect("offsets huérfanos");
+
+    // --- Reinicio: recupera el checkpoint 2 y continúa en el 3 ---
+    let mut sink = open("tachyon-eos");
+    assert_eq!(
+        sink.recover().await.expect("recover"),
+        Some(offsets(&[(0, 2), (1, 1)])),
+        "debe recuperar los offsets del último snapshot commiteado, no el huérfano"
+    );
+    sink.write(&batch(vec![4], vec!["paid"], vec![4], vec![4.0]))
+        .await
+        .expect("write 3");
+    assert_eq!(
+        sink.commit_checkpoint(&offsets(&[(0, 3), (1, 1)])).await.expect("ckpt 3"),
+        Some(3),
+        "el identifier sigue siendo monótono tras el reinicio"
+    );
+    let mut sink = open("tachyon-eos");
+    assert_eq!(sink.recover().await.expect("recover"), Some(offsets(&[(0, 3), (1, 1)])));
+
+    // --- Otro commit_user no ve estos checkpoints ---
+    let mut other = open("tachyon-eos-otra-instancia");
+    assert_eq!(other.recover().await.expect("recover otro"), None);
+
+    let rows = rows_sorted(&read_table_rows(&table).await.expect("lectura"));
+    assert_eq!(rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    let _ = std::fs::remove_dir_all(&warehouse);
+}

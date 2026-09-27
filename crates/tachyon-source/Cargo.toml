@@ -13,8 +13,13 @@ anyhow.workspace = true
 # rdkafka con cmake-build: compila librdkafka desde fuente (necesita cmake,
 # que sí está disponible). Sin SSL/SASL (llega si el broker lo exige).
 rdkafka = { version = "0.39", features = ["cmake-build"] }
+# FFI directo a librdkafka para consumo por lotes (rd_kafka_consume_batch_queue):
+# elimina el overhead por mensaje del poll individual (~3µs/msg).
+rdkafka-sys = "4.10"
 apache-avro = "0.21"
 arrow-json = "58"
+# Parseo JSON SIMD in-place para el fast path del decoder (schemas planos).
+simd-json = "0.18"
 futures = "0.3"
 async-stream = "0.3"
 tokio.workspace = true

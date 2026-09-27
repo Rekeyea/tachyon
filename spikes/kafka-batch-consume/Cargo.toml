@@ -1,0 +1,22 @@
+[package]
+name = "kafka-batch-consume-spike"
+description = "Spike: consumo por lotes via rd_kafka_consume_batch_queue (FFI) vs poll clasico"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Crate standalone (NO es miembro del workspace de Tachyon).
+[workspace]
+
+[profile.benchfast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
+[dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build"] }
+rdkafka-sys = "4.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"

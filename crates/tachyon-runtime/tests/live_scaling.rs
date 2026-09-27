@@ -220,6 +220,7 @@ async fn live_scaling_two_instances_disjoint_partitions() {
             commit_interval: Duration::from_secs(2),
             metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
             group_id: group_id.clone(), // MISMO grupo -> reparto de particiones
+            commit_user: format!("{group_id}-{instance}"),
         };
         let sink = PaimonSink::from_table(
             tables[instance].clone(),

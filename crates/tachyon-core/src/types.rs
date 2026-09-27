@@ -25,3 +25,12 @@ pub struct PartitionKey {
     /// Columna que actúa como clave de particionado.
     pub column: String,
 }
+
+/// Offsets de fuente de un checkpoint: `topic -> partición -> próximo offset a
+/// consumir` (el offset del último registro incluido + 1, convención Kafka).
+///
+/// Es la unidad de progreso del exactly-once: se persiste atómicamente junto
+/// al commit de Paimon (ver `tachyon-sink::writer::PaimonSink::commit_checkpoint`)
+/// y al recuperar se re-posiciona el consumo exactamente ahí.
+pub type SourceOffsets =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<i32, i64>>;

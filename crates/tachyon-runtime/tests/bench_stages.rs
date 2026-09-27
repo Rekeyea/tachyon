@@ -149,19 +149,21 @@ async fn bench_json_decode() {
             .into_bytes()
         })
         .collect();
-    let chunk = 1000;
-    // Warmup.
-    let _ = decoder.decode(&payloads[..chunk]).expect("warmup decode");
+    // El chunk replica el lote de producción (un drenado del broker = un batch).
+    let chunk = 32768;
+    // Warmup sobre una copia: el fast path SIMD muta los buffers in-place.
+    let _ = decoder.decode(&mut payloads[..chunk].to_vec()).expect("warmup decode");
     // Timed.
     let t0 = Instant::now();
     let cpu0 = cpu_seconds();
     let mut rows = 0;
-    for c in payloads.chunks(chunk) {
+    let mut payloads = payloads;
+    for c in payloads.chunks_mut(chunk) {
         rows += decoder.decode(c).expect("decode").num_rows();
     }
     let wall = t0.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu0;
-    report("1. JSON decode (arrow-json)", rows, wall, cpu, rss_mb());
+    report("1. JSON decode (simd fast path)", rows, wall, cpu, rss_mb());
 }
 
 /// Etapa 2: transformación DataFusion (filter + project), plan de producción.

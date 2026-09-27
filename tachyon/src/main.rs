@@ -14,7 +14,7 @@ use clap::Parser;
 use serde::Deserialize;
 use std::sync::Arc;
 use tachyon_config::PipelineConfig;
-use tachyon_runtime::Pipeline;
+use tachyon_runtime::{Pipeline, StatelessBudget};
 
 /// Tachyon: motor de ejecución de pipelines streaming sobre lakehouse.
 #[derive(Parser, Debug)]
@@ -80,8 +80,7 @@ fn load_schema(path: &PathBuf) -> Result<Arc<Schema>> {
     Ok(Arc::new(Schema::new(arrow_fields)))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
@@ -110,20 +109,41 @@ async fn main() -> Result<()> {
         input_schemas.insert(input.name.clone(), schema);
     }
 
-    let pipeline = Pipeline::new(&config, &sql_str)?;
-    let handle = pipeline.run(&input_schemas).await?;
-
-    if let Some(addr) = handle.metrics_addr {
-        tracing::info!(%addr, "métricas disponibles en http://{addr}/metrics");
-    }
+    // El runtime se arma DESPUÉS de leer el pin: un `#[tokio::main]` default
+    // abre un worker por core de la máquina y el throughput deja de depender
+    // de los CPUs pineados. El trabajo de CPU (decode, poll) vive en el pool
+    // de blocking, dimensionado al presupuesto.
+    let budget = StatelessBudget::resolve(&config).context("presupuesto del pipeline")?;
     tracing::info!(
-        pipeline = %config.pipeline.name,
-        "pipeline corriendo (Ctrl+C para detener)"
+        cpus = budget.cpus,
+        worker_threads = budget.worker_threads(),
+        blocking_threads = budget.max_blocking_threads(),
+        "runtime dimensionado al pin"
     );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(budget.worker_threads())
+        .max_blocking_threads(budget.max_blocking_threads())
+        .enable_all()
+        .thread_name("tachyon")
+        .build()
+        .context("creando el runtime")?;
 
-    // Esperar señal de shutdown (SIGINT/SIGTERM).
-    tokio::signal::ctrl_c().await.context("esperando señal de shutdown")?;
-    tracing::info!("shutdown solicitado");
+    rt.block_on(async move {
+        let pipeline = Pipeline::new(&config, &sql_str)?;
+        let handle = pipeline.run(&input_schemas).await?;
 
-    Ok(())
+        if let Some(addr) = handle.metrics_addr {
+            tracing::info!(%addr, "métricas disponibles en http://{addr}/metrics");
+        }
+        tracing::info!(
+            pipeline = %config.pipeline.name,
+            "pipeline corriendo (Ctrl+C para detener)"
+        );
+
+        tokio::signal::ctrl_c()
+            .await
+            .context("esperando señal de shutdown")?;
+        tracing::info!("shutdown solicitado");
+        Ok(())
+    })
 }

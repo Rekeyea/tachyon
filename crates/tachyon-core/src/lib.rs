@@ -10,4 +10,4 @@ pub mod types;
 
 pub use error::Error;
 pub use plan::{OutputDef, PipelinePlan};
-pub use types::{Column, PartitionKey, StreamDef};
+pub use types::{Column, PartitionKey, SourceOffsets, StreamDef};

@@ -30,7 +30,7 @@ use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use tachyon_config::PipelineConfig;
-use tachyon_runtime::{run_pipeline, RunOptions};
+use tachyon_runtime::{run_pipeline, RunOptions, StatelessBudget};
 use tachyon_sink::writer::{create_test_table, PaimonSink};
 
 const BROKER: &str = "localhost:9092";
@@ -39,7 +39,13 @@ const TABLE: &str = "bench_lake";
 const TOPIC: &str = "tachyon-bench-e2e";
 /// Eventos pre-producidos. Lo suficientemente grande para que el drenado dure
 /// varios segundos (medición estable) sin saturar el broker.
-const EVENTS: i64 = 10_000_000;
+/// `BENCH_EVENTS` lo achica para una pasada corta.
+fn events() -> i64 {
+    std::env::var("BENCH_EVENTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000_000)
+}
 /// Particiones del topic (overridable con `BENCH_PARTITIONS`). Con 1 partición
 /// solo hay 1 consumidor activo; con N particiones se pueden usar N
 /// consumidores paralelos (ver `BENCH_CONSUMERS`).
@@ -50,13 +56,14 @@ fn partitions() -> i32 {
         .unwrap_or(1)
 }
 /// Consumidores paralelos por topic (overridable con `BENCH_CONSUMERS`).
-/// Default: `min(partitions, 4)` (mismo default opinionated del runtime).
+/// Default: `partitions` (más consumidores que particiones no tiene sentido:
+/// una partición solo puede estar asignada a un consumidor).
 fn consumers() -> usize {
     std::env::var("BENCH_CONSUMERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| partitions().max(1) as usize)
-        .min(4)
+        .min(partitions().max(1) as usize)
         .max(1)
 }
 
@@ -92,25 +99,41 @@ fn rss_mb() -> f64 {
     0.0
 }
 
-/// Pinea el proceso a los `n` P-cores físicos (sin HT): 0, 2, 4, …, 14.
-/// (i9-12900K: P-cores 0-15 con HT, E-cores 16-23. Los físicos son los pares.)
+/// Pinea todos los hilos del proceso a los primeros `n` CPUs de la afinidad
+/// actual. `sched_setaffinity(0)` solo toca el hilo que llama; el runtime de
+/// Tokio ya está corriendo, así que hay que repetirlo por cada tid. Los hilos
+/// que se creen después heredan la máscara del que los spawnea.
 fn pin_to_cores(n: usize) {
-    let p_cores = [0u32, 2, 4, 6, 8, 10, 12, 14];
-    let take = n.min(p_cores.len());
+    let n = n.max(1);
     let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    for &c in p_cores.iter().take(take) {
-        unsafe { libc::CPU_SET(c as usize, &mut mask) };
+    for cpu in 0..n {
+        unsafe { libc::CPU_SET(cpu, &mut mask) };
     }
     let size = std::mem::size_of::<libc::cpu_set_t>();
-    let rc = unsafe { libc::sched_setaffinity(0, size, &mask) };
-    if rc != 0 {
-        eprintln!("sched_setaffinity falló: {}", std::io::Error::last_os_error());
-    } else {
-        println!(
-            "  pinned a {take} P-cores: {:?}",
-            p_cores.iter().take(take).collect::<Vec<_>>()
-        );
+    let mut pinned = 0usize;
+    let mut failed = 0usize;
+    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+        for entry in entries.flatten() {
+            let Ok(tid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
+                continue;
+            };
+            let rc = unsafe { libc::sched_setaffinity(tid, size, &mask) };
+            if rc == 0 {
+                pinned += 1;
+            } else {
+                failed += 1;
+            }
+        }
     }
+    if pinned == 0 {
+        let rc = unsafe { libc::sched_setaffinity(0, size, &mask) };
+        if rc != 0 {
+            eprintln!("sched_setaffinity falló: {}", std::io::Error::last_os_error());
+            return;
+        }
+        pinned = 1;
+    }
+    println!("  pinned a {n} CPUs ({pinned} hilos, {failed} fallos)");
 }
 
 /// Crea el topic (limpio) con `partitions()` particiones.
@@ -138,7 +161,7 @@ fn send_msg(producer: &BaseProducer, payload: &str, key: &str) -> bool {
     false
 }
 
-/// Pre-produce `EVENTS` eventos JSON al topic (producer síncrono, en lote).
+/// Pre-produce los eventos JSON al topic (producer síncrono, en lote).
 fn pre_produce() {
     let mut cc = ClientConfig::new();
     cc.set("bootstrap.servers", BROKER);
@@ -154,7 +177,8 @@ fn pre_produce() {
     let t0 = Instant::now();
     let mut ok = 0i64;
     let mut err = 0i64;
-    for i in 0..EVENTS {
+    let total_events = events();
+    for i in 0..total_events {
         let payload = format!(
             "{{\"order_id\":{},\"status\":\"paid\",\"source_version\":{},\"amount\":100.0}}",
             i, i
@@ -174,7 +198,7 @@ fn pre_produce() {
     let _ = producer.flush(Duration::from_secs(300));
     let dt = t0.elapsed().as_secs_f64();
     println!(
-        "  pre-producción: {ok}/{EVENTS} eventos en {dt:.1}s ({:.0} ev/s){}",
+        "  pre-producción: {ok}/{total_events} eventos en {dt:.1}s ({:.0} ev/s){}",
         ok as f64 / dt,
         if err > 0 { format!(" ({err} errores)") } else { String::new() }
     );
@@ -202,12 +226,11 @@ output:
   name: orders_lake
   table: {db}.{table}
   key: order_id
-  bucket: 1
+  bucket: {partitions}
   sequence_field: source_version
 deployment:
   partitions: {partitions}
-  consumers_per_topic: {consumers}
-  commit_interval: 2s
+{consumers_line}  commit_interval: 2s
   metrics:
     bind_addr: "127.0.0.1:0"
 "#,
@@ -216,12 +239,20 @@ deployment:
         db = DB,
         table = TABLE,
         partitions = partitions(),
-        consumers = consumers(),
+        consumers_line = if std::env::var("BENCH_DEFAULTS").is_ok() {
+            String::new()
+        } else {
+            format!("  consumers_per_topic: {}\n", consumers())
+        },
     ))
     .expect("config válida")
 }
 
-#[tokio::test]
+// multi_thread como el binario de producción (#[tokio::main]): con el default
+// (current_thread) TODO el async (run loop + recepción de lotes + dispatch de
+// decode + writer con write/commit de Paimon) comparte UN thread y se
+// serializa — el bench mediría un artefacto del harness, no el pipeline.
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark: cargo test --release -p tachyon-runtime --test bench_e2e -- --ignored"]
 async fn bench_e2e_sustained_drain() {
     let _ = tracing_subscriber::fmt()
@@ -231,7 +262,9 @@ async fn bench_e2e_sustained_drain() {
         )
         .try_init();
 
-    // Core pinning (opcional): `BENCH_PIN_CORES=N` pinea a N P-cores.
+    // Core pinning (opcional): `BENCH_PIN_CORES=N` pinea todos los hilos a
+    // los primeros N CPUs. `BENCH_DEFAULTS=1` no fija consumidores: los
+    // deriva el presupuesto a partir de ese pin.
     if let Some(n) = std::env::var("BENCH_PIN_CORES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -244,6 +277,9 @@ async fn bench_e2e_sustained_drain() {
     let _ = std::fs::remove_dir_all(&warehouse);
     std::fs::create_dir_all(&warehouse).expect("warehouse");
     let warehouse = warehouse.to_string_lossy().to_string();
+    // Invariante de alineación (DESIGN.md §3.3): buckets == particiones, así
+    // el writer de Paimon tiene un memtable por bucket y el flush del commit
+    // se paraleliza entre buckets.
     let table = create_test_table(
         &warehouse,
         DB,
@@ -255,7 +291,7 @@ async fn bench_e2e_sustained_drain() {
             ("amount", PDataType::Double(DoubleType::new())),
         ],
         &["order_id"],
-        1,
+        partitions(),
         Some("source_version"),
     )
     .await
@@ -267,6 +303,16 @@ async fn bench_e2e_sustained_drain() {
 
     // --- 2. Arranca el pipeline ---
     let config = Arc::new(config_yaml(&warehouse));
+    let budget = StatelessBudget::resolve(&config).expect("presupuesto");
+    println!(
+        "  budget: cpus={} batch={} consumers={} decode={} workers={} blocking={}",
+        budget.cpus,
+        budget.batch_size,
+        budget.consumers_per_topic,
+        budget.decode_parallelism,
+        budget.worker_threads(),
+        budget.max_blocking_threads()
+    );
     // `BENCH_COMMIT_INTERVAL` (segundos) permite aislar el commit de offsets:
     // un valor grande (p. ej. 3600) deshabilita el commit durante el drenado.
     let commit_secs = std::env::var("BENCH_COMMIT_INTERVAL")
@@ -277,8 +323,9 @@ async fn bench_e2e_sustained_drain() {
         commit_interval: Duration::from_secs(commit_secs),
         metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
         group_id: format!("tachyon-bench-e2e-{}", std::process::id()),
+        commit_user: format!("tachyon-bench-e2e-{}", std::process::id()),
     };
-    let sink = PaimonSink::from_table(table, "order_id", 1, Some("source_version"))
+    let sink = PaimonSink::from_table(table, "order_id", partitions(), Some("source_version"))
         .expect("sink");
     let input_schemas: HashMap<String, Arc<Schema>> =
         HashMap::from([("orders".to_string(), orders_schema())]);
@@ -292,12 +339,23 @@ async fn bench_e2e_sustained_drain() {
     // --- 3. Medición en estado estacionario ---
     // Espera a que el pipeline pase el arranque (20% del total consumido) y
     // muestrea; luego espera al 80% y calcula la tasa entre ambos puntos.
-    let total = EVENTS as u64;
+    let total = events() as u64;
     let read = |m: &tachyon_metrics::InstanceMetrics| m.rows_read.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Snapshot de los contadores de tiempo por etapa (ns acumulados).
+    fn stage_ns(m: &tachyon_metrics::InstanceMetrics) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            m.source_next_ns.load(Relaxed),
+            m.send_wait_ns.load(Relaxed),
+            m.write_ns.load(Relaxed),
+            m.commit_ns.load(Relaxed),
+        )
+    }
 
     // Punto 0: 20% consumido.
     let deadline = Instant::now() + Duration::from_secs(300);
-    let (t0, r0, cpu_t0) = loop {
+    let (t0, r0, cpu_t0, s0) = loop {
         if run_task.is_finished() {
             let result = run_task.await.expect("join del task del pipeline");
             match result {
@@ -306,15 +364,15 @@ async fn bench_e2e_sustained_drain() {
             }
         }
         if read(&metrics_read) >= total * 20 / 100 {
-            break (Instant::now(), read(&metrics_read), cpu_seconds());
+            break (Instant::now(), read(&metrics_read), cpu_seconds(), stage_ns(&metrics_read));
         }
         assert!(Instant::now() < deadline, "timeout esperando el 20%");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     // Punto 1: 80% consumido.
-    let (t1, r1, cpu_t1) = loop {
+    let (t1, r1, cpu_t1, s1) = loop {
         if read(&metrics_read) >= total * 80 / 100 {
-            break (Instant::now(), read(&metrics_read), cpu_seconds());
+            break (Instant::now(), read(&metrics_read), cpu_seconds(), stage_ns(&metrics_read));
         }
         assert!(Instant::now() < deadline, "timeout esperando el 80%");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -328,10 +386,19 @@ async fn bench_e2e_sustained_drain() {
     let rows_cpu_s = if cpu_dt > 0.0 { drows as f64 / cpu_dt } else { 0.0 };
     let rss = rss_mb();
 
+    // Breakdown de tiempo por etapa en la ventana (% del wall de la etapa
+    // medida; write+commit corren en el task del writer, en paralelo con
+    // source_next).
+    let (d_next, d_send, d_write, d_commit) = (
+        (s1.0 - s0.0) as f64 / 1e9,
+        (s1.1 - s0.1) as f64 / 1e9,
+        (s1.2 - s0.2) as f64 / 1e9,
+        (s1.3 - s0.3) as f64 / 1e9,
+    );
     println!(
-        "\n=== E2E sostenido ({p} particiones, {c} consumidores/topic) ===\n  ventana: {dt:.2}s (20%->80%)\n  filas: {drows}\n  throughput: {rows_s:.0} rows/s\n  CPU: {cpu_dt:.2}s ({cpu_pct:.0}% del wall)\n  por CPU-s: {rows_cpu_s:.0} rows/CPU-s\n  RSS: {rss:.0} MB\n  (total pre-producido: {total})",
+        "\n=== E2E sostenido ({p} particiones, {c} consumidores/topic) ===\n  ventana: {dt:.2}s (20%->80%)\n  filas: {drows}\n  throughput: {rows_s:.0} rows/s\n  CPU: {cpu_dt:.2}s ({cpu_pct:.0}% del wall)\n  por CPU-s: {rows_cpu_s:.0} rows/CPU-s\n  RSS: {rss:.0} MB\n  etapas (s en la ventana): source_next {d_next:.2} | send_wait {d_send:.2} | write {d_write:.2} | commit {d_commit:.2}\n  (total pre-producido: {total})",
         p = partitions(),
-        c = consumers()
+        c = budget.consumers_per_topic
     );
 
     // --- Limpieza ---

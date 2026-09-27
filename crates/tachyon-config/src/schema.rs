@@ -100,13 +100,24 @@ pub struct Deployment {
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
     /// Consumidores paralelos por topic (mismo consumer group). El protocolo de
-    /// grupo reparte las particiones entre ellos y cada instancia hace fetch en
-    /// paralelo. Un solo cliente librdkafka se satura en ~200K rows/s por
-    /// serialización de round trips de fetch, así que más clientes = más
-    /// throughput. Default: `min(partitions, 4)` (óptimo observado; más allá
-    /// hay retornos decrecientes).
+    /// grupo reparte las particiones entre ellos y cada uno hace fetch en
+    /// paralelo. Default: `min(partitions, cpus pineados)`. Un override queda
+    /// fijo y deja de seguir al pin.
     #[serde(default)]
     pub consumers_per_topic: Option<usize>,
+    /// Filas por batch decodificado (la unidad de flujo end-to-end: un lote
+    /// drenado del broker = un `RecordBatch`). Batches grandes amortizan el
+    /// overhead por batch del decoder, de DataFusion y del sink. Default:
+    /// 32768. No depende del pin: es el tamaño que minimiza el overhead por
+    /// fila sin inflar la latencia de un batch.
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    /// Lotes decodificados en paralelo dentro del stream. El orden de emisión
+    /// se preserva, así que el tracking de offsets (exactly-once) no cambia.
+    /// Default: un hilo por CPU pineado (el decode es la etapa que escala).
+    /// Un override queda fijo y deja de seguir al pin.
+    #[serde(default)]
+    pub decode_parallelism: Option<usize>,
 }
 
 fn default_commit_interval() -> String {
@@ -128,6 +139,10 @@ fn default_metrics_bind() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Resources {
+    /// CPUs del presupuesto. Cores (`"4"`, `"1.5"`) o millicores (`"2500m"`).
+    /// Tope del pin detectado (afinidad del proceso o quota del cgroup): el
+    /// runtime deriva consumidores y decode de `min(este valor, pin)`.
+    /// Ausente: se usa el pin entero.
     pub cpu: Option<String>,
     pub memory: Option<String>,
 }

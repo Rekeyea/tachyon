@@ -163,6 +163,7 @@ async fn live_end_to_end_redpanda_to_paimon() {
         commit_interval: Duration::from_secs(2),
         metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
         group_id: format!("tachyon-e2e-{}", std::process::id()),
+        commit_user: format!("tachyon-e2e-{}", std::process::id()),
     };
 
     // --- 3. Sink + schemas ---

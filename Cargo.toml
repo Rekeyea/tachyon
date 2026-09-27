@@ -38,7 +38,23 @@ arrow = "58"
 paimon = "0.3"
 paimon-datafusion = "0.3"
 
+# Debug con line-tables: los binarios de test de este workspace (datafusion +
+# paimon) con debuginfo completo superan el GB y linkear 2 en paralelo agota
+# 16GB de RAM. Line-tables conserva backtraces útiles con una fracción de la
+# memoria de link.
+[profile.dev]
+debug = 1
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# Iteración rápida de benchmarks: mismo opt-level que release pero con LTO
+# fino y más unidades de codegen (build ~2-4x más rápido). Los números
+# oficiales se miden con `release`; `benchfast` solo para iterar.
+[profile.benchfast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false

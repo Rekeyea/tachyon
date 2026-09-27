@@ -148,6 +148,7 @@ async fn start_instance(
         commit_interval: Duration::from_secs(2),
         metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
         group_id: group_id.to_string(),
+        commit_user: group_id.to_string(),
     };
     let sink =
         PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))

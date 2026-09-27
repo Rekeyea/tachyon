@@ -30,6 +30,17 @@ pub struct InstanceMetrics {
     pub consumer_lag: Arc<AtomicU64>,
     /// Errores de ejecución (acumulado).
     pub errors: Arc<AtomicU64>,
+    /// Tiempo dentro de `stream.next()` (ns, acumulado): consumo + decode +
+    /// transformación (la etapa "fuente" del pipeline).
+    pub source_next_ns: Arc<AtomicU64>,
+    /// Tiempo bloqueado enviando al writer (ns, acumulado): backpressure del
+    /// sink. Si domina, el cuello es el writer (write o commit).
+    pub send_wait_ns: Arc<AtomicU64>,
+    /// Tiempo dentro de `sink.write()` (ns, acumulado, task del writer).
+    pub write_ns: Arc<AtomicU64>,
+    /// Tiempo dentro del checkpoint del sink (ns, acumulado, task del writer).
+    /// Durante un checkpoint el writer no escribe: es tiempo muerto del sink.
+    pub commit_ns: Arc<AtomicU64>,
 }
 
 impl InstanceMetrics {
@@ -57,6 +68,22 @@ impl InstanceMetrics {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn add_source_next_ns(&self, ns: u64) {
+        self.source_next_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn add_send_wait_ns(&self, ns: u64) {
+        self.send_wait_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn add_write_ns(&self, ns: u64) {
+        self.write_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn add_commit_ns(&self, ns: u64) {
+        self.commit_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
     /// Serializa las métricas actuales en formato plano.
     pub fn render(&self) -> String {
         let now = std::time::SystemTime::now()
@@ -69,12 +96,20 @@ impl InstanceMetrics {
              tachyon_commits {}\n\
              tachyon_consumer_lag {}\n\
              tachyon_errors {}\n\
+             tachyon_source_next_ns {}\n\
+             tachyon_send_wait_ns {}\n\
+             tachyon_write_ns {}\n\
+             tachyon_commit_ns {}\n\
              tachyon_timestamp {}\n",
             self.rows_read.load(Ordering::Relaxed),
             self.rows_written.load(Ordering::Relaxed),
             self.commits.load(Ordering::Relaxed),
             self.consumer_lag.load(Ordering::Relaxed),
             self.errors.load(Ordering::Relaxed),
+            self.source_next_ns.load(Ordering::Relaxed),
+            self.send_wait_ns.load(Ordering::Relaxed),
+            self.write_ns.load(Ordering::Relaxed),
+            self.commit_ns.load(Ordering::Relaxed),
             now,
         )
     }

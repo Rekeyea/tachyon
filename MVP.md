@@ -18,7 +18,7 @@ El MVP es un **pipeline ETL stateless** de Redpanda → Paimon, escalable por pa
 - **Conector fuente Redpanda** (`StreamTableExec`): consumer group, particionado por clave, decodificación a Arrow (Avro y JSON).
 - **Transformación stateless** en SQL: filter, project, aggregate stateless, join stateless.
 - **Conector sink Paimon**: writer por bucket, sequence numbers, commit.
-- **Fault tolerance básico (stateless):** commit de offsets de Redpanda + commit de Paimon. At-least-once con escrituras idempotentes (Paimon deduplica por clave + sequence number) → efectivamente exactly-once en la salida.
+- **Fault tolerance (stateless): exactly-once por stream.** Los offsets de cada input se commitean en el mismo paso atómico que el snapshot de Paimon (`commit_identifier` monótono bajo un `commit_user` estable; offsets en `<tabla>/tachyon-offsets/<commit_user>/<id>.json`). Al reiniciar, cada fuente se re-posiciona en el último checkpoint (skip + seek), sin depender de los offsets del consumer group. Requiere un plan pass-through (filter/project/limit), validado al arrancar.
 - **Métricas básicas:** throughput (rows/s, MB/s), consumer lag, memoria, CPU.
 - **Escalado por particiones:** N instancias, cada una con un subconjunto de particiones, escribiendo a buckets disjuntos.
 
@@ -190,7 +190,7 @@ tachyon (bin)
 | Conector Redpanda en Rust (no existe off-the-shelf) | `rdkafka` es maduro; `StreamTableExec` es el patrón. Slice 2 es autocontenido y testeable. |
 | Decodificación Avro → Arrow | `apache-avro` + `arrow` son estables; la conversión es el trabajo. |
 | Escalado por particiones con writer por bucket | Alinear `partitions == buckets`; testear con N instancias en el Slice 5. |
-| Exactly-once stateless | At-least-once + idempotencia por sequence number (Paimon deduplica). Suficiente para el MVP. |
+| Exactly-once stateless | Offsets en el checkpoint de Paimon (atómico con el snapshot) + re-posicionamiento al recuperar. Límite: en un rebalance entre instancias, la partición que cambia de dueño arranca desde el offset del consumer group (at-least-once en esa ventana; la PK + sequence de Paimon deduplica). |
 
 **Gating:** el riesgo #1 (`paimon-rs` escritura) es el más importante. **Validarlo en el Slice 0.5** (un spike de 1 día: escribir a una tabla Paimon local con `paimon-rs`) antes de comprometer el resto del MVP.
 

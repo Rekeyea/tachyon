@@ -4,4 +4,4 @@ pub mod schema;
 pub mod validate;
 
 pub use schema::PipelineConfig;
-pub use validate::validate_config;
+pub use validate::{parse_cpu_cores, validate_config};

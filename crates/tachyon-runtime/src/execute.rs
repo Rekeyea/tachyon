@@ -15,7 +15,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::streaming::StreamingTable;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 /// Una tabla streaming (el esquema y el executor) para un input del pipeline.
@@ -40,6 +41,45 @@ pub struct InputSource {
     pub schema: SchemaRef,
 }
 
+/// Operadores que dejan pasar cada batch tal cual (sin buffering, sin tareas
+/// propias): el batch de salida que recibe el runtime deriva del último batch
+/// que emitió la fuente. Es la condición del tracking exacto de offsets
+/// (exactly-once, ver `run.rs`).
+const PASSTHROUGH_OPERATORS: &[&str] = &[
+    "StreamingTableExec",
+    "CooperativeExec",
+    "FilterExec",
+    "ProjectionExec",
+    "CoalesceBatchesExec",
+    "GlobalLimitExec",
+    "LocalLimitExec",
+];
+
+/// Verifica que el plan sea un pipeline de pass-through de una partición.
+///
+/// Agregaciones, joins, sorts o repartitions retienen filas entre batches:
+/// los offsets emitidos por la fuente ya no dicen qué filas llegaron al sink.
+pub fn ensure_passthrough(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
+    if !PASSTHROUGH_OPERATORS.contains(&plan.name()) {
+        anyhow::bail!(
+            "exactly-once solo soporta transformaciones por registro (filter/project/limit); \
+             el plan usa '{}', que retiene filas entre batches",
+            plan.name()
+        );
+    }
+    if plan.output_partitioning().partition_count() != 1 {
+        anyhow::bail!(
+            "exactly-once requiere un plan de 1 partición; '{}' tiene {}",
+            plan.name(),
+            plan.output_partitioning().partition_count()
+        );
+    }
+    for child in plan.children() {
+        ensure_passthrough(child)?;
+    }
+    Ok(())
+}
+
 /// Ejecuta la query stateless contra las tablas streaming.
 ///
 /// Registra cada input como una tabla en un `SessionContext` nuevo y corre la
@@ -50,6 +90,18 @@ pub async fn execute_query(
     inputs: &[InputSource],
     factory: &StreamTableFactory,
 ) -> Result<TransformOutput> {
+    let (plan, task_ctx) = plan_query(select_sql, inputs, factory).await?;
+    datafusion::physical_plan::execute_stream(plan, task_ctx)
+        .context("ejecutando la query de transformación")
+}
+
+/// Planifica la query (plan físico + contexto de ejecución) sin ejecutarla,
+/// para poder validar el plan antes (ver `ensure_passthrough`).
+pub async fn plan_query(
+    select_sql: &str,
+    inputs: &[InputSource],
+    factory: &StreamTableFactory,
+) -> Result<(Arc<dyn ExecutionPlan>, Arc<TaskContext>)> {
     // Tachyon no es distribuido: el paralelismo es por partición de Redpanda
     // entre instancias, no dentro de DataFusion. Usar `target_partitions=1`
     // evita un `RepartitionExec` que, sobre una fuente infinita de 1 partición,
@@ -83,15 +135,15 @@ pub async fn execute_query(
         .await
         .context("planificando la query de transformación")?;
 
-    // `execute_stream` devuelve el stream de batches sin materializarlo: es el
-    // camino hacia el sink (Slice 4). Para agregaciones/joins stateless el
-    // plan se resuelve y emite batches a medida que llegan los datos.
-    let stream = df
-        .execute_stream()
+    // `execute_stream` (en `execute_query`) devuelve el stream de batches sin
+    // materializarlo: es el camino hacia el sink (Slice 4).
+    let task_ctx = Arc::new(df.task_ctx());
+    let plan = df
+        .create_physical_plan()
         .await
-        .context("ejecutando la query de transformación")?;
+        .context("planificando el plan físico de la transformación")?;
 
-    Ok(stream)
+    Ok((plan, task_ctx))
 }
 
 #[cfg(test)]
@@ -336,5 +388,40 @@ mod tests {
         let batches = collect_all(stream).await;
         // orders 1 y 3 tienen items (1->2 items, 3->1 item) -> 3 filas.
         assert_eq!(total_rows(&batches), 3, "el join inner une por order_id");
+    }
+
+    async fn plan_for(sql: &str) -> Arc<dyn ExecutionPlan> {
+        let inputs = vec![InputSource {
+            name: "orders".into(),
+            schema: orders_schema(),
+        }];
+        let factory = in_memory_factory(&std::collections::HashMap::from([(
+            "orders".to_string(),
+            orders_batch(),
+        )]));
+        plan_query(sql, &inputs, &factory).await.expect("plan").0
+    }
+
+    #[tokio::test]
+    async fn passthrough_plans_admit_exactly_once() {
+        for sql in [
+            "SELECT order_id, amount FROM orders WHERE status <> 'cancelled'",
+            "SELECT order_id, amount * 2 AS doubled FROM orders",
+            "SELECT order_id FROM orders LIMIT 2",
+        ] {
+            let plan = plan_for(sql).await;
+            ensure_passthrough(&plan).unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn buffering_plans_are_rejected_for_exactly_once() {
+        for sql in [
+            "SELECT status, SUM(amount) FROM orders GROUP BY status",
+            "SELECT order_id FROM orders ORDER BY amount",
+        ] {
+            let plan = plan_for(sql).await;
+            assert!(ensure_passthrough(&plan).is_err(), "{sql} debe rechazarse");
+        }
     }
 }
