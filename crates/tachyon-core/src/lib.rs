@@ -11,6 +11,7 @@ pub mod types;
 
 pub use checkpoint::{
     parse_checkpoint, partition_tickets, Accumulators, AggKind, AggSpec, AggState, CheckpointBody,
+    JoinCell, JoinCheckpointV1, JoinColumnSpec, JoinEvent, JoinKeyState, JoinSpec, JoinState,
     KeyState, OperatorState, PartitionProgress, PartitionTicketV1, SessionState,
     WindowCheckpointV1, WindowKind, WindowSpecId, MAX_SIDECAR_BYTES,
 };

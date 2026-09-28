@@ -13,8 +13,10 @@
 //! reales. Aquí se valida la estructura y el binding lógico contra la config.
 
 use datafusion::sql::sqlparser::ast::{
-    DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
+    BinaryOperator, DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, JoinConstraint, JoinOperator, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableObject, Value,
+    WildcardAdditionalOptions,
 };
 use tachyon_core::{AggKind, WindowKind};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -38,6 +40,8 @@ pub struct ParsedSql {
     /// `Some` si el `GROUP BY` tiene `TUMBLE`, `HOP` o `SESSION`. El operador
     /// todavía no está cableado: el runtime rechaza el arranque.
     pub window: Option<WindowShape>,
+    /// `Some` si el `FROM` es un join por intervalo de dos streams.
+    pub join: Option<IntervalJoin>,
 }
 
 /// Ventana reconocida en el `GROUP BY`, antes de que DataFusion vea la SQL.
@@ -145,6 +149,12 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         }
         shape.source = source_tables[0].clone();
     }
+    let join = interval_join(source)?;
+    if join.is_some() && window.is_some() {
+        return Err(Error::Sql(
+            "una query no puede ser ventana y join a la vez".to_string(),
+        ));
+    }
 
     // La query SELECT ejecutable (sin el INSERT INTO <out>), serializada de
     // vuelta a string desde el AST. Esta es la que corre en DataFusion contra
@@ -158,7 +168,330 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         query: sql.to_string(),
         select_sql,
         window,
+        join,
     })
+}
+
+/// Join por intervalo de dos streams. `None` si el `FROM` no tiene join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntervalJoin {
+    pub left: String,
+    pub right: String,
+    pub left_key: String,
+    pub right_key: String,
+    pub left_time: String,
+    pub right_time: String,
+    pub lower_ms: i64,
+    pub upper_ms: i64,
+    /// El tiempo de la tabla izquierda es la base del `BETWEEN`.
+    pub base_is_left: bool,
+    pub columns: Vec<JoinSelect>,
+}
+
+/// Una columna del `SELECT`, tomada de uno de los dos lados.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSelect {
+    pub side_left: bool,
+    pub column: String,
+    pub alias: String,
+}
+
+fn interval_join(query: &Query) -> Result<Option<IntervalJoin>, Error> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.from.len() != 1 || select.from[0].joins.is_empty() {
+        return Ok(None);
+    }
+    if select.from[0].joins.len() != 1 {
+        return Err(Error::Sql(
+            "el join acepta dos tablas".to_string(),
+        ));
+    }
+    let from = &select.from[0];
+    let (left, left_alias) = table_ref(&from.relation)?;
+    let join = &from.joins[0];
+    let (right, right_alias) = table_ref(&join.relation)?;
+    let on = match &join.join_operator {
+        JoinOperator::Join(JoinConstraint::On(expr))
+        | JoinOperator::Inner(JoinConstraint::On(expr)) => expr,
+        _ => {
+            return Err(Error::Sql(
+                "el join tiene que ser INNER con ON".to_string(),
+            ))
+        }
+    };
+    let predicates = split_and(on);
+    if predicates.len() != 2 {
+        return Err(Error::Sql(
+            "el ON del join es la igualdad de la clave y un BETWEEN".to_string(),
+        ));
+    }
+    let mut equality = None;
+    let mut between = None;
+    for predicate in predicates {
+        if let Some(eq) = equality_of(predicate)? {
+            if equality.is_some() {
+                return Err(Error::Sql(
+                    "el ON tiene más de una igualdad".to_string(),
+                ));
+            }
+            equality = Some(eq);
+        } else if let Some(span) = between_of(predicate)? {
+            if between.is_some() {
+                return Err(Error::Sql(
+                    "el ON tiene más de un BETWEEN".to_string(),
+                ));
+            }
+            between = Some(span);
+        } else {
+            return Err(Error::Sql(format!(
+                "predicado de join no soportado: {predicate}"
+            )));
+        }
+    }
+    let (left_key, right_key) = equality.ok_or_else(|| {
+        Error::Sql("el ON no iguala las claves".to_string())
+    })?;
+    let span = between.ok_or_else(|| Error::Sql("el ON no tiene BETWEEN".to_string()))?;
+    if span.lower_ms > span.upper_ms {
+        return Err(Error::Sql(
+            "el límite bajo del intervalo es mayor que el alto".to_string(),
+        ));
+    }
+    let left_name = left_alias.as_deref().unwrap_or(left.as_str());
+    let right_name = right_alias.as_deref().unwrap_or(right.as_str());
+    let (left_key, right_key) = assign_pair(left_name, right_name, left_key, right_key)?;
+    let base_is_left = span.base_table == left_name;
+    let probe_is_right = span.probe_table == right_name;
+    let base_is_right = span.base_table == right_name;
+    let probe_is_left = span.probe_table == left_name;
+    if !((base_is_left && probe_is_right) || (base_is_right && probe_is_left)) {
+        return Err(Error::Sql(
+            "el BETWEEN tiene que comparar el tiempo de las dos tablas".to_string(),
+        ));
+    }
+    let (left_time, right_time) = if base_is_left {
+        (span.base_column, span.probe_column)
+    } else {
+        (span.probe_column, span.base_column)
+    };
+    let columns = join_select(&select.projection, left_name, right_name)?;
+    Ok(Some(IntervalJoin {
+        left,
+        right,
+        left_key,
+        right_key,
+        left_time,
+        right_time,
+        lower_ms: span.lower_ms,
+        upper_ms: span.upper_ms,
+        base_is_left,
+        columns,
+    }))
+}
+
+struct TimeSpan {
+    probe_table: String,
+    probe_column: String,
+    base_table: String,
+    base_column: String,
+    lower_ms: i64,
+    upper_ms: i64,
+}
+
+fn split_and(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Nested(inner) => split_and(inner),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut parts = split_and(left);
+            parts.extend(split_and(right));
+            parts
+        }
+        other => vec![other],
+    }
+}
+
+fn equality_of(expr: &Expr) -> Result<Option<(Qual, Qual)>, Error> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    Ok(Some((qualified(left)?, qualified(right)?)))
+}
+
+fn between_of(expr: &Expr) -> Result<Option<TimeSpan>, Error> {
+    let Expr::Between {
+        expr,
+        negated,
+        low,
+        high,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if *negated {
+        return Err(Error::Sql(
+            "el intervalo no acepta NOT BETWEEN".to_string(),
+        ));
+    }
+    let (probe_table, probe_column) = require_table(qualified(expr)?)?;
+    let (low_table, low_column, lower_ms) = time_point(low)?;
+    let (high_table, high_column, upper_ms) = time_point(high)?;
+    if low_table != high_table || low_column != high_column {
+        return Err(Error::Sql(
+            "los dos extremos del BETWEEN tienen que ser la misma columna de tiempo".to_string(),
+        ));
+    }
+    Ok(Some(TimeSpan {
+        probe_table,
+        probe_column,
+        base_table: low_table,
+        base_column: low_column,
+        lower_ms,
+        upper_ms,
+    }))
+}
+
+fn time_point(expr: &Expr) -> Result<(String, String, i64), Error> {
+    match expr {
+        Expr::Nested(inner) => time_point(inner),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Plus,
+            right,
+        } => {
+            let (table, column) = require_table(qualified(left)?)?;
+            Ok((table, column, interval_ms(right)?))
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Minus,
+            right,
+        } => {
+            let (table, column) = require_table(qualified(left)?)?;
+            Ok((table, column, -interval_ms(right)?))
+        }
+        other => {
+            let (table, column) = require_table(qualified(other)?)?;
+            Ok((table, column, 0))
+        }
+    }
+}
+
+struct Qual {
+    table: String,
+    column: String,
+}
+
+fn qualified(expr: &Expr) -> Result<Qual, Error> {
+    match expr {
+        Expr::Nested(inner) => qualified(inner),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Ok(Qual {
+            table: parts[0].value.clone(),
+            column: parts[1].value.clone(),
+        }),
+        _ => Err(Error::Sql(format!(
+            "se esperaba alias.columna, llegó {expr}"
+        ))),
+    }
+}
+
+fn require_table(qual: Qual) -> Result<(String, String), Error> {
+    Ok((qual.table, qual.column))
+}
+
+fn assign_pair(
+    left: &str,
+    right: &str,
+    a: Qual,
+    b: Qual,
+) -> Result<(String, String), Error> {
+    let left_col = if a.table == left {
+        Some(a.column.clone())
+    } else if b.table == left {
+        Some(b.column.clone())
+    } else {
+        None
+    };
+    let right_col = if a.table == right {
+        Some(a.column.clone())
+    } else if b.table == right {
+        Some(b.column.clone())
+    } else {
+        None
+    };
+    match (left_col, right_col) {
+        (Some(left_col), Some(right_col)) => Ok((left_col, right_col)),
+        _ => Err(Error::Sql(
+            "la igualdad tiene que ser la clave de las dos tablas".to_string(),
+        )),
+    }
+}
+
+fn join_select(
+    items: &[SelectItem],
+    left: &str,
+    right: &str,
+) -> Result<Vec<JoinSelect>, Error> {
+    if items.is_empty() {
+        return Err(Error::Sql("el SELECT del join está vacío".to_string()));
+    }
+    let mut columns = Vec::new();
+    for item in items {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+            _ => {
+                return Err(Error::Sql(
+                    "el join no acepta SELECT *".to_string(),
+                ))
+            }
+        };
+        let qual = qualified(expr)?;
+        let side_left = if qual.table == left {
+            true
+        } else if qual.table == right {
+            false
+        } else {
+            return Err(Error::Sql(format!(
+                "la columna {}.{} no es de las dos tablas del join",
+                qual.table, qual.column
+            )));
+        };
+        let alias = alias.unwrap_or_else(|| qual.column.clone());
+        if columns.iter().any(|col: &JoinSelect| col.alias == alias) {
+            return Err(Error::Sql(format!(
+                "la columna de salida '{alias}' está repetida; hace falta un alias"
+            )));
+        }
+        columns.push(JoinSelect {
+            side_left,
+            column: qual.column,
+            alias,
+        });
+    }
+    Ok(columns)
+}
+
+fn table_ref(factor: &TableFactor) -> Result<(String, Option<String>), Error> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => Ok((
+            table_name(name),
+            alias.as_ref().map(|alias| alias.name.value.clone()),
+        )),
+        _ => Err(Error::Sql(
+            "el join solo acepta tablas, no subqueries".to_string(),
+        )),
+    }
 }
 
 /// Una sola llamada de ventana en el `GROUP BY`. Cero llamadas es pass-through.
@@ -434,6 +767,200 @@ fn literal_i64(expr: &Expr) -> Result<i64, Error> {
     }
 }
 
+/// Columnas que un `SELECT` plano pide de una tabla.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableColumns {
+    /// `SELECT *` o `SELECT tabla.*`.
+    Star,
+    /// Nombres de columna, en el orden del `SELECT`.
+    Names(Vec<String>),
+}
+
+/// Un `SELECT` que solo nombra columnas de una tabla.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSelect {
+    pub source: String,
+    pub columns: TableColumns,
+}
+
+/// Acepta `SELECT col, ... FROM tabla` o `SELECT * FROM tabla`.
+///
+/// Un `WHERE`, un join o un agregado se rechazan: el cursor de snapshots
+/// no puede avanzar dentro de un filtro que tire del lote siguiente.
+pub fn table_select(sql: &str) -> Result<TableSelect, Error> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql)
+        .map_err(|e| Error::Sql(format!("error de sintaxis: {e}")))?;
+    if statements.len() != 1 {
+        return Err(Error::Sql(format!(
+            "se esperaba exactamente 1 sentencia, hay {}",
+            statements.len()
+        )));
+    }
+    let Statement::Query(query) = &statements[0] else {
+        return Err(Error::Sql(
+            "leer una tabla es un SELECT de columnas".to_string(),
+        ));
+    };
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return Err(Error::Sql(
+            "leer una tabla es un SELECT de columnas, sin orden ni límite".to_string(),
+        ));
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(Error::Sql(
+            "leer una tabla es un SELECT de columnas".to_string(),
+        ));
+    };
+    plain_select(select)?;
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Err(Error::Sql(
+            "leer una tabla no acepta JOIN".to_string(),
+        ));
+    }
+    let (source, alias) = table_ref(&select.from[0].relation)?;
+    let columns = plain_projection(&select.projection, &source, alias.as_deref())?;
+    Ok(TableSelect { source, columns })
+}
+
+fn plain_select(select: &Select) -> Result<(), Error> {
+    if select.selection.is_some() || select.prewhere.is_some() {
+        return Err(Error::Sql(
+            "leer una tabla no acepta WHERE".to_string(),
+        ));
+    }
+    if select.having.is_some() || !group_is_empty(&select.group_by) {
+        return Err(Error::Sql(
+            "leer una tabla no acepta GROUP BY".to_string(),
+        ));
+    }
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || !select.lateral_views.is_empty()
+        || !select.connect_by.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+    {
+        return Err(Error::Sql(
+            "leer una tabla es un SELECT de columnas".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn group_is_empty(group: &GroupByExpr) -> bool {
+    match group {
+        GroupByExpr::Expressions(exprs, modifiers) => exprs.is_empty() && modifiers.is_empty(),
+        GroupByExpr::All(_) => false,
+    }
+}
+
+fn plain_projection(
+    items: &[SelectItem],
+    table: &str,
+    alias: Option<&str>,
+) -> Result<TableColumns, Error> {
+    if items.is_empty() {
+        return Err(Error::Sql("el SELECT está vacío".to_string()));
+    }
+    if items.len() == 1 {
+        match &items[0] {
+            SelectItem::Wildcard(options) => {
+                plain_star(options)?;
+                return Ok(TableColumns::Star);
+            }
+            SelectItem::QualifiedWildcard(kind, options) => {
+                plain_star(options)?;
+                let SelectItemQualifiedWildcardKind::ObjectName(name) = kind else {
+                    return Err(Error::Sql(
+                        "el asterisco tiene que ser de la tabla".to_string(),
+                    ));
+                };
+                let qualifier = table_name(name);
+                if qualifier != table && Some(qualifier.as_str()) != alias {
+                    return Err(Error::Sql(format!(
+                        "el asterisco de '{qualifier}' no es de '{table}'"
+                    )));
+                }
+                return Ok(TableColumns::Star);
+            }
+            _ => {}
+        }
+    }
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) => expr,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                return Err(Error::Sql(
+                    "el asterisco va solo en el SELECT".to_string(),
+                ));
+            }
+            _ => {
+                return Err(Error::Sql(
+                    "el SELECT de una tabla nombra columnas, sin alias".to_string(),
+                ));
+            }
+        };
+        let name = plain_column(expr, table, alias)?;
+        if names.iter().any(|have| have == &name) {
+            return Err(Error::Sql(format!(
+                "la columna '{name}' está repetida"
+            )));
+        }
+        names.push(name);
+    }
+    Ok(TableColumns::Names(names))
+}
+
+fn plain_star(options: &WildcardAdditionalOptions) -> Result<(), Error> {
+    if options.opt_exclude.is_some()
+        || options.opt_except.is_some()
+        || options.opt_ilike.is_some()
+        || options.opt_rename.is_some()
+        || options.opt_replace.is_some()
+        || options.opt_alias.is_some()
+    {
+        return Err(Error::Sql(
+            "el SELECT de una tabla no filtra el asterisco".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn plain_column(expr: &Expr, table: &str, alias: Option<&str>) -> Result<String, Error> {
+    match expr {
+        Expr::Nested(inner) => plain_column(inner, table, alias),
+        Expr::Identifier(ident) => Ok(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let qualifier = parts[0].value.as_str();
+            if qualifier != table && Some(qualifier) != alias {
+                return Err(Error::Sql(format!(
+                    "la columna {qualifier}.{} no es de '{table}'",
+                    parts[1].value
+                )));
+            }
+            Ok(parts[1].value.clone())
+        }
+        other => Err(Error::Sql(format!(
+            "el SELECT de una tabla nombra columnas, llegó {other}"
+        ))),
+    }
+}
+
 /// Extrae los nombres lógicos de las tablas del `FROM` de una query.
 ///
 /// Maneja `SELECT`, uniones (`UNION`/`EXCEPT`/`INTERSECT`) y subqueries anidadas.
@@ -503,6 +1030,29 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_select_keeps_the_columns() {
+        let parsed = table_select("SELECT order_id, paid.amount FROM paid").unwrap();
+        assert_eq!(parsed.source, "paid");
+        assert_eq!(
+            parsed.columns,
+            TableColumns::Names(vec!["order_id".to_string(), "amount".to_string()])
+        );
+        let star = table_select("SELECT * FROM paid").unwrap();
+        assert_eq!(star.columns, TableColumns::Star);
+    }
+
+    #[test]
+    fn a_filtered_select_is_not_a_table_tail() {
+        let err = table_select("SELECT order_id FROM paid WHERE amount > 0").unwrap_err();
+        assert!(err.to_string().contains("WHERE"), "{err}");
+        let err = table_select("SELECT order_id AS id FROM paid").unwrap_err();
+        assert!(err.to_string().contains("alias"), "{err}");
+        let err = table_select("SELECT a.order_id FROM a JOIN b ON a.order_id = b.order_id")
+            .unwrap_err();
+        assert!(err.to_string().contains("JOIN"), "{err}");
+    }
+
+    #[test]
     fn extracts_executable_select_sql() {
         let sql = "INSERT INTO orders_lake \
                    SELECT order_id, SUM(amount) AS total \
@@ -557,10 +1107,38 @@ mod tests {
     }
 
     #[test]
-    fn extracts_multiple_source_tables_from_join() {
-        let sql = "INSERT INTO out SELECT a.x FROM a JOIN b ON a.id = b.id";
+    fn an_interval_join_keeps_the_bounds_and_the_select() {
+        let sql = "INSERT INTO paid_orders \
+            SELECT o.order_id, o.amount, p.payment_id \
+            FROM orders AS o \
+            JOIN payments AS p \
+              ON o.order_id = p.order_id \
+             AND p.event_time BETWEEN o.event_time AND o.event_time + INTERVAL '1' HOUR";
         let parsed = parse_sql(sql).unwrap();
-        assert_eq!(parsed.source_tables, vec!["a", "b"]);
+        let join = parsed.join.expect("join");
+        assert_eq!(join.left, "orders");
+        assert_eq!(join.right, "payments");
+        assert_eq!(join.left_key, "order_id");
+        assert_eq!(join.right_key, "order_id");
+        assert_eq!(join.left_time, "event_time");
+        assert_eq!(join.right_time, "event_time");
+        assert!(join.base_is_left);
+        assert_eq!(join.lower_ms, 0);
+        assert_eq!(join.upper_ms, 3_600_000);
+        assert_eq!(
+            join.columns
+                .iter()
+                .map(|col| col.alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["order_id", "amount", "payment_id"]
+        );
+    }
+
+    #[test]
+    fn a_join_without_an_interval_does_not_parse() {
+        let sql = "INSERT INTO out SELECT a.x FROM a JOIN b ON a.id = b.id";
+        let err = parse_sql(sql).unwrap_err();
+        assert!(err.to_string().contains("BETWEEN"), "{err}");
     }
 
     #[test]

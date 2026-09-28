@@ -95,11 +95,46 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
         }
     }
 
+    let mut table_inputs = 0;
     for input in &cfg.inputs {
         if input.key != cfg.output.key {
             return Err(Error::KeyMismatch(format!(
                 "input '{}' key '{}' != output key '{}'",
                 input.name, input.key, cfg.output.key
+            )));
+        }
+        if input.paimon_table().is_some() {
+            table_inputs += 1;
+            if input.kafka_topic().is_ok() {
+                return Err(Error::Config(format!(
+                    "input '{}' tiene table y topic; hace falta uno solo",
+                    input.name
+                )));
+            }
+            if input.schema.is_some() || input.avro_schema.is_some() {
+                return Err(Error::Config(format!(
+                    "input '{}': la tabla trae su schema",
+                    input.name
+                )));
+            }
+            if input.format != crate::schema::PayloadFormat::Json {
+                return Err(Error::Config(format!(
+                    "input '{}': la tabla no se decodifica con format",
+                    input.name
+                )));
+            }
+            if input.watermark.is_some() {
+                return Err(Error::Config(format!(
+                    "input '{}': una tabla no declara watermark",
+                    input.name
+                )));
+            }
+            continue;
+        }
+        if input.kafka_topic().is_err() {
+            return Err(Error::Config(format!(
+                "input '{}' necesita topic o table",
+                input.name
             )));
         }
         match input.format {
@@ -136,6 +171,39 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
                     )));
                 }
             }
+        }
+    }
+
+    if table_inputs > 0 {
+        if cfg.inputs.len() != 1 {
+            return Err(Error::Config(
+                "leer una tabla Paimon es el único input".to_string(),
+            ));
+        }
+        if cfg.output.topic.is_none() {
+            return Err(Error::Config(
+                "leer una tabla Paimon publica un topic".to_string(),
+            ));
+        }
+        if cfg
+            .deployment
+            .consumers_per_topic
+            .is_some_and(|count| count != 1)
+        {
+            return Err(Error::Config(
+                "leer una tabla usa un cursor, no varios consumidores".to_string(),
+            ));
+        }
+        let warehouse = cfg
+            .connectors
+            .paimon
+            .as_ref()
+            .map(|paimon| paimon.warehouse.trim())
+            .unwrap_or("");
+        if warehouse.is_empty() {
+            return Err(Error::Config(
+                "leer una tabla requiere connectors.paimon.warehouse".to_string(),
+            ));
         }
     }
 
@@ -372,5 +440,87 @@ deployment:
         cfg.output.topic = Some("orders-by-customer".to_string());
         let err = validate_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("table y topic"), "{err}");
+    }
+
+    #[test]
+    fn a_paimon_input_publishes_a_topic() {
+        let cfg: PipelineConfig = serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  redpanda:
+    brokers: ["localhost:9092"]
+  paimon:
+    warehouse: ./w
+inputs:
+  - name: paid
+    table: default.paid_orders
+    key: order_id
+output:
+  name: paid_out
+  topic: paid-topic
+  key: order_id
+deployment:
+  partitions: 1
+"#,
+        )
+        .expect("yaml");
+        assert!(validate_config(&cfg).is_ok(), "{cfg:?}");
+    }
+
+    #[test]
+    fn a_paimon_input_rejects_a_schema_file_and_a_table_output() {
+        let err = validate_config(&serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  redpanda:
+    brokers: ["localhost:9092"]
+  paimon:
+    warehouse: ./w
+inputs:
+  - name: paid
+    table: default.paid_orders
+    key: order_id
+    schema: paid.json
+output:
+  name: paid_out
+  topic: paid-topic
+  key: order_id
+deployment:
+  partitions: 1
+"#,
+        )
+        .expect("yaml"))
+        .unwrap_err();
+        assert!(err.to_string().contains("schema"), "{err}");
+
+        let err = validate_config(&serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  redpanda:
+    brokers: ["localhost:9092"]
+  paimon:
+    warehouse: ./w
+inputs:
+  - name: paid
+    table: default.paid_orders
+    key: order_id
+output:
+  name: paid_out
+  table: default.out
+  key: order_id
+  bucket: 1
+deployment:
+  partitions: 1
+"#,
+        )
+        .expect("yaml"))
+        .unwrap_err();
+        assert!(err.to_string().contains("publica un topic"), "{err}");
     }
 }

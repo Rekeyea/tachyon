@@ -5,12 +5,15 @@
 
 pub mod budget;
 pub mod execute;
+pub mod join;
 pub mod run;
 pub mod runtime;
+pub mod table_stream;
 pub mod window;
 
 pub use budget::StatelessBudget;
 pub use execute::{execute_query, InputSource, StreamTable, StreamTableFactory, TransformOutput};
 pub use run::{run_pipeline, run_topic_pipeline, PipelineHandle, PreparedInput, RunOptions};
+pub use table_stream::run_table_stream;
 pub use runtime::Pipeline;
 pub use window::{ClosedWindow, Num, WindowFault, WindowInput, WindowOperator};

@@ -108,6 +108,10 @@ fn main() -> Result<()> {
     // topic es Avro, el .avsc solo sirve para decodificar el mensaje una vez.
     let mut input_codecs: HashMap<String, PreparedInput> = HashMap::new();
     for input in &config.inputs {
+        if input.paimon_table().is_some() {
+            continue;
+        }
+        let topic = input.kafka_topic()?;
         let prepared = match input.format {
             PayloadFormat::Json => {
                 let spec = input.schema.as_deref().ok_or_else(|| {
@@ -142,7 +146,7 @@ fn main() -> Result<()> {
                             input.name
                         )
                     })?;
-                PreparedInput::from_registry(url, &input.topic).with_context(|| {
+                PreparedInput::from_registry(url, topic).with_context(|| {
                     format!("leyendo el schema de '{}'", input.name)
                 })?
             }

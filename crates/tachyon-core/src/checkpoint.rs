@@ -20,6 +20,8 @@ pub enum CheckpointBody {
     Offsets(SourceOffsets),
     /// JSON v1. Ventana.
     Window(WindowCheckpointV1),
+    /// JSON v2. Join por intervalo.
+    Join(JoinCheckpointV1),
 }
 
 /// Sidecar v1. Un documento, un rename.
@@ -204,11 +206,100 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
     }
 }
 
-/// Distingue v0 de v1. Otra forma, con el snapshot presente, es corrupción.
+/// Sidecar v2. Los eventos que todavía pueden matchear, más los offsets aplicados.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinCheckpointV1 {
+    pub v: u32,
+    pub commit_identifier: i64,
+    pub applied: SourceOffsets,
+    pub spec: JoinSpec,
+    /// `topic → partición → max event time` ya visto. El watermark sale de acá.
+    pub progress: BTreeMap<String, BTreeMap<i32, i64>>,
+    pub state: JoinState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinSpec {
+    pub left: String,
+    pub right: String,
+    pub left_time: String,
+    pub right_time: String,
+    pub lower_ms: i64,
+    pub upper_ms: i64,
+    /// El tiempo de la izquierda es la base del `BETWEEN`.
+    pub base_is_left: bool,
+    pub columns: Vec<JoinColumnSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinColumnSpec {
+    pub side_left: bool,
+    pub column: String,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinState {
+    #[serde(serialize_with = "ser_join_keys", deserialize_with = "de_join_keys")]
+    pub keys: BTreeMap<Vec<u8>, JoinKeyState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct JoinKeyState {
+    pub left: Vec<JoinEvent>,
+    pub right: Vec<JoinEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinEvent {
+    pub time_ms: i64,
+    pub values: Vec<JoinCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum JoinCell {
+    I64(i64),
+    F64(f64),
+    Text(String),
+    Null,
+}
+
+fn ser_join_keys<S: serde::Serializer>(
+    keys: &BTreeMap<Vec<u8>, JoinKeyState>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let pairs: Vec<(String, &JoinKeyState)> = keys
+        .iter()
+        .map(|(k, v)| (hex_encode(k), v))
+        .collect();
+    pairs.serialize(s)
+}
+
+fn de_join_keys<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<Vec<u8>, JoinKeyState>, D::Error> {
+    let pairs = Vec::<(String, JoinKeyState)>::deserialize(d)?;
+    let mut keys = BTreeMap::new();
+    for (hex, state) in pairs {
+        let bytes = hex_decode(&hex).map_err(serde::de::Error::custom)?;
+        keys.insert(bytes, state);
+    }
+    Ok(keys)
+}
+
+/// Distingue v0, v1 y v2. Otra forma, con el snapshot presente, es corrupción.
 pub fn parse_checkpoint(bytes: &[u8]) -> Result<CheckpointBody, String> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("sidecar no es JSON: {e}"))?;
     if let Some(version) = value.get("v").and_then(|v| v.as_u64()) {
+        if version == 2 {
+            let checkpoint: JoinCheckpointV1 = serde_json::from_value(value)
+                .map_err(|e| format!("sidecar v2 corrupto: {e}"))?;
+            if checkpoint.v != 2 {
+                return Err(format!("versión de sidecar desconocida: {}", checkpoint.v));
+            }
+            return Ok(CheckpointBody::Join(checkpoint));
+        }
         if version != 1 {
             return Err(format!("versión de sidecar desconocida: {version}"));
         }
@@ -305,6 +396,11 @@ impl CheckpointBody {
                 owned.v = 1;
                 serde_json::to_vec(&owned).map_err(|e| e.to_string())
             }
+            CheckpointBody::Join(checkpoint) => {
+                let mut owned = checkpoint.clone();
+                owned.v = 2;
+                serde_json::to_vec(&owned).map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -312,6 +408,7 @@ impl CheckpointBody {
         match self {
             CheckpointBody::Offsets(offsets) => offsets,
             CheckpointBody::Window(checkpoint) => &checkpoint.applied,
+            CheckpointBody::Join(checkpoint) => &checkpoint.applied,
         }
     }
 }

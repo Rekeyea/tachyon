@@ -83,17 +83,24 @@ impl RedpandaSink {
         self.write_records(&records).await
     }
 
-    /// Publica pares `(clave, payload)` ya codificados. Lo usa el camino Avro,
-    /// que arma el envelope antes de llegar acá.
+    /// Publica pares `(clave, payload)` ya codificados en el topic de salida.
+    /// Lo usa el camino Avro, que arma el envelope antes de llegar acá.
     pub async fn write_records(&self, records: &[(String, Vec<u8>)]) -> Result<usize> {
+        self.write_to(&self.topic, records).await
+    }
+
+    /// Publica en otro topic de la misma transacción. El cursor de una tabla
+    /// va acá, después de las filas y antes del commit.
+    pub async fn write_to(&self, topic: &str, records: &[(String, Vec<u8>)]) -> Result<usize> {
+        let topic = topic.to_string();
         for (key, payload) in records {
             self.producer
                 .send(
-                    FutureRecord::to(&self.topic).key(key).payload(payload),
+                    FutureRecord::to(&topic).key(key).payload(payload),
                     Duration::from_secs(30),
                 )
                 .await
-                .map_err(|(e, _)| anyhow::anyhow!("publicando en '{}': {e}", self.topic))?;
+                .map_err(|(e, _)| anyhow::anyhow!("publicando en '{topic}': {e}"))?;
         }
         Ok(records.len())
     }

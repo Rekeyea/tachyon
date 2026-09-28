@@ -33,6 +33,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
 use paimon::catalog::Identifier;
+use paimon::spec::CommitKind;
+use paimon::table::IncrementalScanMode;
 use paimon::{CatalogFactory, Options};
 use tachyon_core::{
     parse_checkpoint, partition_tickets, CheckpointBody, PartitionTicketV1, SourceOffsets,
@@ -197,6 +199,18 @@ impl PaimonSink {
                     );
                 }
                 Ok(Recovered::Window {
+                    identifier,
+                    checkpoint,
+                })
+            }
+            CheckpointBody::Join(checkpoint) => {
+                if checkpoint.commit_identifier != identifier {
+                    anyhow::bail!(
+                        "checkpoint {identifier}: el sidecar dice identifier {}, no coinciden",
+                        checkpoint.commit_identifier
+                    );
+                }
+                Ok(Recovered::Join {
                     identifier,
                     checkpoint,
                 })
@@ -449,6 +463,10 @@ pub enum Recovered {
         identifier: i64,
         checkpoint: tachyon_core::WindowCheckpointV1,
     },
+    Join {
+        identifier: i64,
+        checkpoint: tachyon_core::JoinCheckpointV1,
+    },
 }
 
 /// Sidecar primero, snapshot después. Sin archivos no se llama: el caller ya
@@ -468,6 +486,12 @@ async fn publish_checkpoint(
             owned.commit_identifier = identifier;
             owned.v = 1;
             CheckpointBody::Window(owned)
+        }
+        CheckpointBody::Join(checkpoint) => {
+            let mut owned = checkpoint.clone();
+            owned.commit_identifier = identifier;
+            owned.v = 2;
+            CheckpointBody::Join(owned)
         }
     };
     let bytes = stamped
@@ -731,4 +755,298 @@ pub async fn read_table_rows(
         .await
         .context("leyendo batches")?;
     Ok(batches)
+}
+
+/// Abre una tabla existente para leerla. No crea un writer.
+pub async fn open_table(
+    warehouse: &str,
+    database: &str,
+    table: &str,
+) -> Result<paimon::table::Table> {
+    let options = Options::from_map(
+        [(String::from("warehouse"), warehouse.to_string())]
+            .into_iter()
+            .collect(),
+    );
+    let catalog = CatalogFactory::create(options)
+        .await
+        .context("creando catalog Paimon")?;
+    catalog
+        .get_table(&Identifier::new(database, table))
+        .await
+        .with_context(|| format!("abriendo {database}.{table}"))
+}
+
+/// Schema Arrow de `columns`, en ese orden.
+pub fn projection_schema(
+    table: &paimon::table::Table,
+    columns: &[String],
+) -> Result<arrow::datatypes::Schema> {
+    let fields = table.schema().fields();
+    let mut out = Vec::with_capacity(columns.len());
+    for name in columns {
+        let field = fields
+            .iter()
+            .find(|field| field.name() == name)
+            .with_context(|| format!("la tabla no tiene la columna '{name}'"))?;
+        let data_type = paimon::arrow::paimon_type_to_arrow(field.data_type())
+            .map_err(|err| anyhow::anyhow!("tipo de '{name}': {err}"))?;
+        out.push(arrow::datatypes::Field::new(
+            name,
+            data_type,
+            field.data_type().is_nullable(),
+        ));
+    }
+    Ok(arrow::datatypes::Schema::new(out))
+}
+
+/// Snapshots nuevos de una cola. `through` es el id hasta el que se puede
+/// avanzar el cursor. `blocked_at` es un OVERWRITE que quedó afuera: sus
+/// archivos reescriben el bucket y no son filas nuevas.
+pub struct AppendTail {
+    pub through: i64,
+    pub batches: Vec<RecordBatch>,
+    pub blocked_at: Option<i64>,
+}
+
+/// Lee los APPEND en `(after, último]`. COMPACT y ANALYZE no traen filas y
+/// el cursor igual puede avanzar. Un OVERWRITE corta el rango: publicarlo
+/// como delta repetiría las filas del archivo reescrito.
+pub async fn tail_appends(
+    table: &paimon::table::Table,
+    after: i64,
+    columns: &[String],
+) -> Result<AppendTail> {
+    if columns.is_empty() {
+        anyhow::bail!("la proyección de la tabla está vacía");
+    }
+    let manager = table.snapshot_manager();
+    let Some(latest) = manager
+        .get_latest_snapshot_id()
+        .await
+        .context("leyendo el último snapshot")?
+    else {
+        return Ok(AppendTail {
+            through: after,
+            batches: Vec::new(),
+            blocked_at: None,
+        });
+    };
+    if latest < after {
+        anyhow::bail!("el cursor {after} está adelante del snapshot {latest}");
+    }
+    if latest == after {
+        return Ok(AppendTail {
+            through: after,
+            batches: Vec::new(),
+            blocked_at: None,
+        });
+    }
+    let earliest = manager
+        .earliest_snapshot_id()
+        .await
+        .context("leyendo el snapshot más viejo")?
+        .unwrap_or(latest);
+    if after < earliest - 1 {
+        anyhow::bail!(
+            "el cursor {after} quedó atrás del snapshot {earliest}; no se puede reanudar sin releer la tabla"
+        );
+    }
+
+    let mut through = after;
+    let mut blocked_at = None;
+    for id in (after + 1)..=latest {
+        let snapshot = manager
+            .get_snapshot(id)
+            .await
+            .with_context(|| format!("leyendo snapshot {id}"))?;
+        match snapshot.commit_kind() {
+            CommitKind::APPEND | CommitKind::COMPACT | CommitKind::ANALYZE => {
+                tracing::info!(
+                    snapshot = id,
+                    kind = %snapshot.commit_kind(),
+                    "snapshot de la cola"
+                );
+                through = id;
+            }
+            CommitKind::OVERWRITE => {
+                tracing::info!(snapshot = id, "snapshot OVERWRITE; la cola se detiene antes");
+                blocked_at = Some(id);
+                break;
+            }
+        }
+    }
+    if through == after {
+        return Ok(AppendTail {
+            through,
+            batches: Vec::new(),
+            blocked_at,
+        });
+    }
+
+    let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+    let mut builder = table.new_read_builder();
+    builder
+        .with_projection(&refs)
+        .map_err(|err| anyhow::anyhow!("proyección: {err}"))?;
+    let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, after, through);
+    let plan = scan
+        .plan()
+        .await
+        .with_context(|| format!("plan incremental ({after}, {through}]"))?;
+    if plan.data_splits().is_empty() {
+        return Ok(AppendTail {
+            through,
+            batches: Vec::new(),
+            blocked_at,
+        });
+    }
+    let read = builder
+        .new_read()
+        .map_err(|err| anyhow::anyhow!("new_read: {err}"))?;
+    let stream = read
+        .to_incremental_arrow(&plan)
+        .map_err(|err| anyhow::anyhow!("leyendo el delta: {err}"))?;
+    use futures::TryStreamExt;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|err| anyhow::anyhow!("leyendo batches del delta: {err}"))?;
+    Ok(AppendTail {
+        through,
+        batches,
+        blocked_at,
+    })
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use paimon::spec::{BigIntType, DataType as PDataType, VarCharType};
+    use std::sync::Arc;
+
+    async fn kinds(table: &paimon::table::Table) -> String {
+        let snapshots = table.snapshot_manager().list_all().await.expect("snapshots");
+        snapshots
+            .iter()
+            .map(|snapshot| format!("{}={}", snapshot.id(), snapshot.commit_kind()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn batch(rows: &[(i64, i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("order_id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+                Field::new("note", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| Some(row.2)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch")
+    }
+
+    fn pairs(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+        let mut out = Vec::new();
+        for batch in batches {
+            assert_eq!(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>(),
+                vec!["order_id", "amount"]
+            );
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("order_id");
+            let amounts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("amount");
+            for row in 0..batch.num_rows() {
+                out.push((ids.value(row), amounts.value(row)));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_second_append_returns_only_the_new_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-tail-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("reloj")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("warehouse");
+        let warehouse = dir.to_string_lossy().to_string();
+        let table = create_test_table(
+            &warehouse,
+            "default",
+            "paid_orders",
+            &[
+                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+                ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+                ("note", PDataType::VarChar(VarCharType::string_type())),
+            ],
+            &["order_id"],
+            1,
+            None,
+        )
+        .await
+        .expect("tabla");
+        let columns = vec!["order_id".to_string(), "amount".to_string()];
+
+        let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None).expect("sink");
+        sink.write(&batch(&[(1, 10, "a"), (2, 20, "b")]))
+            .await
+            .expect("write");
+        sink.commit().await.expect("commit");
+        let first = tail_appends(&table, 0, &columns).await.expect("cola");
+        let first_kinds = kinds(&table).await;
+        assert!(first.blocked_at.is_none(), "{first_kinds}");
+        assert_eq!(pairs(&first.batches), vec![(1, 10), (2, 20)], "{first_kinds}");
+
+        let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None).expect("sink");
+        sink.write(&batch(&[(3, 30, "c")])).await.expect("write");
+        sink.commit().await.expect("commit");
+        let second = tail_appends(&table, first.through, &columns)
+            .await
+            .expect("cola");
+        let second_kinds = kinds(&table).await;
+        assert!(second.blocked_at.is_none(), "{second_kinds}");
+        assert_eq!(
+            pairs(&second.batches),
+            vec![(3, 30)],
+            "kinds={second_kinds} through={}",
+            second.through
+        );
+        let again = tail_appends(&table, second.through, &columns)
+            .await
+            .expect("cola");
+        assert_eq!(again.through, second.through);
+        assert!(again.batches.iter().all(|batch| batch.num_rows() == 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

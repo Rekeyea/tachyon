@@ -56,7 +56,7 @@ use crate::window::{
 
 /// Fusiona `update` en `offsets` (máximo por partición: el progreso nunca
 /// retrocede).
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -95,7 +95,7 @@ fn release_lost_partitions(
     }
 }
 
-fn merge_offsets(offsets: &mut SourceOffsets, update: &SourceOffsets) {
+pub(crate) fn merge_offsets(offsets: &mut SourceOffsets, update: &SourceOffsets) {
     for (topic, partitions) in update {
         let entry = offsets.entry(topic.clone()).or_default();
         for (&partition, &next) in partitions {
@@ -226,7 +226,7 @@ fn commit_user_from(group_id: &str, instance: &str) -> String {
 
 /// Construye el `ClientConfig` rdkafka para un input, a partir de la config
 /// del pipeline.
-fn source_client_config(
+pub(crate) fn source_client_config(
     config: &PipelineConfig,
     group_id: &str,
     budget: &StatelessBudget,
@@ -382,6 +382,11 @@ pub async fn run_pipeline(
                 "checkpoint {identifier} tiene estado de ventana y el plan es pass-through; se rechaza"
             );
         }
+        (Recovered::Join { identifier, .. }, _) => {
+            anyhow::bail!(
+                "checkpoint {identifier} es de un join y el plan no lo es; se rechaza"
+            );
+        }
         (Recovered::Window { checkpoint, .. }, Some(shape)) => {
             if checkpoint.spec.kind != shape.kind
                 || checkpoint.spec.size_ms != shape.size_ms
@@ -449,6 +454,7 @@ pub async fn run_pipeline(
             format = ?input_def.format,
             "codec del input"
         );
+        let topic = input_def.kafka_topic()?.to_string();
         let schema = if window.is_some() {
             if prepared.schema.field_with_name(PARTITION_COLUMN).is_ok() {
                 anyhow::bail!("'{PARTITION_COLUMN}' está reservado");
@@ -465,20 +471,20 @@ pub async fn run_pipeline(
             source_cc.set("session.timeout.ms", session_timeout_ms.to_string());
             let topic_applied = restored_window
                 .as_ref()
-                .and_then(|checkpoint| checkpoint.applied.get(&input_def.topic))
+                .and_then(|checkpoint| checkpoint.applied.get(&topic))
                 .cloned()
                 .unwrap_or_default();
             let gate = match &restored_window {
                 Some(checkpoint) => Arc::new(WindowHandoff::restored(
                     &source_group,
-                    &input_def.topic,
+                    &topic,
                     &options.commit_user,
                     checkpoint.commit_identifier,
                     topic_applied,
                 )),
                 None => Arc::new(WindowHandoff::starting(
                     &source_group,
-                    &input_def.topic,
+                    &topic,
                     &options.commit_user,
                 )),
             };
@@ -505,7 +511,7 @@ pub async fn run_pipeline(
         // resume ignora las particiones que no le asigna el grupo.
         let topic_resume = resume
             .as_ref()
-            .and_then(|r| r.get(&input_def.topic))
+            .and_then(|r| r.get(&topic))
             .cloned()
             .unwrap_or_default();
         let input_sources: Vec<Arc<RdkafkaSource>> = (0..n_consumers)
@@ -520,7 +526,7 @@ pub async fn run_pipeline(
                         format!("{}-{index}", options.commit_user),
                     );
                 }
-                let mut source = RdkafkaSource::new(&consumer_cc, &input_def.topic)
+                let mut source = RdkafkaSource::new(&consumer_cc, &topic)
                     .with_context(|| format!("creando source para '{}'", input_def.name))?
                     .with_max_batch(budget.batch_size)
                     .with_resume_offsets(topic_resume.clone());
@@ -531,8 +537,8 @@ pub async fn run_pipeline(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let tracker = OffsetTracker::new();
-        commit_sources.push((input_def.topic.clone(), input_sources[0].clone()));
-        trackers.push((input_def.topic.clone(), tracker.clone()));
+        commit_sources.push((topic.clone(), input_sources[0].clone()));
+        trackers.push((topic.clone(), tracker.clone()));
         name_to_sources.insert(
             input_def.name.clone(),
             (input_sources, tracker, prepared.format),
@@ -864,8 +870,9 @@ pub async fn run_topic_pipeline(
     let source_group = format!("{}-{}", options.group_id, input_def.name);
     let mut source_cc = source_client_config(config, &options.group_id, &budget);
     source_cc.set("group.id", &source_group);
+    let input_topic = input_def.kafka_topic()?.to_string();
     let source = Arc::new(
-        RdkafkaSource::new(&source_cc, &input_def.topic)
+        RdkafkaSource::new(&source_cc, &input_topic)
             .with_context(|| format!("creando source para '{}'", input_def.name))?
             .with_max_batch(budget.batch_size),
     );
@@ -944,7 +951,6 @@ pub async fn run_topic_pipeline(
         }
     };
     let sink = RedpandaSink::open(&brokers, topic, key, &options.commit_user, timeout_ms).await?;
-    let input_topic = input_def.topic.clone();
 
     // El snapshot se toma cuando `next()` vuelve, antes de tirar del siguiente
     // lote: en un pass-through ese mapa es exactamente lo que esta salida cubre.
@@ -1043,7 +1049,7 @@ async fn commit_topic_epoch(
     Ok(())
 }
 
-async fn ensure_topic_partitions(brokers: &str, topic: &str, expected: usize) -> Result<()> {
+pub(crate) async fn ensure_topic_partitions(brokers: &str, topic: &str, expected: usize) -> Result<()> {
     let probe: rdkafka::consumer::BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()

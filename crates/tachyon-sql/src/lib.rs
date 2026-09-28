@@ -6,4 +6,7 @@
 
 pub mod parse;
 
-pub use parse::{parse_sql, WindowAgg, WindowShape};
+pub use parse::{
+    parse_sql, table_select, IntervalJoin, JoinSelect, TableColumns, TableSelect, WindowAgg,
+    WindowShape,
+};

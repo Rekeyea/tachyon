@@ -11,7 +11,9 @@ use tachyon_metrics::InstanceMetrics;
 use tachyon_sink::writer::PaimonSink;
 use tachyon_sql::{parse_sql, WindowShape};
 
+use crate::join::run_join_pipeline;
 use crate::run::{run_pipeline, run_topic_pipeline, PipelineHandle, PreparedInput, RunOptions};
+use crate::table_stream::run_table_stream;
 
 /// Un pipeline de Tachyon (una instancia).
 #[derive(Debug)]
@@ -22,6 +24,7 @@ pub struct Pipeline {
     /// `Some` hasta que el operador de ventanas esté en el loop: el arranque
     /// se rechaza en vez de mandar `TUMBLE` a DataFusion.
     window: Option<WindowShape>,
+    join: Option<tachyon_sql::IntervalJoin>,
 }
 
 impl Pipeline {
@@ -69,6 +72,7 @@ impl Pipeline {
             config: config.clone(),
             select_sql: parsed.select_sql.clone(),
             window: parsed.window,
+            join: parsed.join,
         })
     }
 
@@ -83,10 +87,34 @@ impl Pipeline {
         &self,
         input_codecs: &std::collections::HashMap<String, PreparedInput>,
     ) -> Result<PipelineHandle> {
+        if self
+            .config
+            .inputs
+            .iter()
+            .any(|input| input.paimon_table().is_some())
+        {
+            let topic = self
+                .config
+                .output
+                .topic
+                .as_deref()
+                .context("leer una tabla publica un topic")?;
+            let options = RunOptions::from_config(&self.config);
+            let metrics = Arc::new(InstanceMetrics::new());
+            return run_table_stream(
+                &self.config,
+                &self.select_sql,
+                &options,
+                topic,
+                &self.config.output.key,
+                &metrics,
+            )
+            .await;
+        }
         if let Some(topic) = &self.config.output.topic {
-            if self.window.is_some() {
+            if self.window.is_some() || self.join.is_some() {
                 anyhow::bail!(
-                    "una ventana escribe en Paimon: el topic no conserva las ventanas abiertas"
+                    "una ventana o un join escriben en Paimon: el topic no guarda el estado abierto"
                 );
             }
             let options = RunOptions::from_config(&self.config);
@@ -137,6 +165,17 @@ impl Pipeline {
 
         let options = RunOptions::from_config(&self.config);
         let metrics = Arc::new(InstanceMetrics::new());
+        if let Some(join) = &self.join {
+            return run_join_pipeline(
+                &self.config,
+                &options,
+                sink,
+                join,
+                input_codecs,
+                &metrics,
+            )
+            .await;
+        }
         run_pipeline(
             &self.config,
             &self.select_sql,

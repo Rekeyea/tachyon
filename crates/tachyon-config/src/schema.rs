@@ -1,6 +1,7 @@
 //! Schema de `pipeline.yaml` (ver DESIGN.md §3.2).
 
 use serde::Deserialize;
+use tachyon_core::Error;
 
 /// La configuración completa de un pipeline.
 #[derive(Debug, Clone, Deserialize)]
@@ -79,11 +80,16 @@ pub enum PayloadFormat {
     Avro,
 }
 
-/// Un stream de entrada (vincula nombre lógico -> topic físico).
+/// Un stream de entrada. Un topic de Redpanda o una tabla Paimon, no los dos.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InputDef {
     pub name: String,
-    pub topic: String,
+    /// Topic físico. Excluyente con `table`.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// `db.tabla` de Paimon. Tachyon sigue los snapshots nuevos.
+    #[serde(default)]
+    pub table: Option<String>,
     /// Clave de particionado (== state key == bucket key).
     pub key: String,
     /// Ruta al schema Arrow de las columnas que ve el SQL. Ausente cuando
@@ -100,6 +106,25 @@ pub struct InputDef {
     pub avro_schema: Option<String>,
     #[serde(default)]
     pub watermark: Option<WatermarkConfig>,
+}
+
+impl InputDef {
+    /// Topic de Kafka. Los caminos que consumen Redpanda ya validaron que existe.
+    pub fn kafka_topic(&self) -> Result<&str, Error> {
+        self.topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty())
+            .ok_or_else(|| Error::Config(format!("input '{}' no tiene topic", self.name)))
+    }
+
+    /// Tabla Paimon, si este input es una cola de snapshots.
+    pub fn paimon_table(&self) -> Option<&str> {
+        self.table
+            .as_deref()
+            .map(str::trim)
+            .filter(|table| !table.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
