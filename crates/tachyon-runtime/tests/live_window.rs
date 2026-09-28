@@ -419,3 +419,193 @@ async fn run_until(
     run_task.abort();
     got
 }
+
+#[tokio::test]
+#[ignore = "requiere Redpanda local en localhost:9092"]
+async fn live_two_consumers_count_each_partition_once() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
+    let topic = format!("tachyon-window-two-{}", std::process::id());
+    let warehouse = std::env::temp_dir().join(format!("tachyon-window-two-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&warehouse);
+    std::fs::create_dir_all(&warehouse).expect("warehouse");
+    let warehouse = warehouse.to_string_lossy().to_string();
+    let table = create_test_table(
+        &warehouse,
+        "default",
+        "orders_two",
+        &[
+            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            ("window_start", PDataType::BigInt(BigIntType::with_nullable(false))),
+            ("window_end", PDataType::BigInt(BigIntType::new())),
+            ("n", PDataType::BigInt(BigIntType::new())),
+            ("amount", PDataType::BigInt(BigIntType::new())),
+        ],
+        &["order_id", "window_start"],
+        1,
+        Some("window_end"),
+    )
+    .await
+    .expect("tabla");
+
+    let mut cc = ClientConfig::new();
+    cc.set("bootstrap.servers", BROKER);
+    let admin: AdminClient<DefaultClientContext> = cc.create().expect("admin");
+    let _ = admin.delete_topics(&[&topic], &Default::default()).await;
+    admin
+        .create_topics(
+            &[NewTopic::new(&topic, 2, TopicReplication::Fixed(1))],
+            &Default::default(),
+        )
+        .await
+        .expect("topic");
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", BROKER)
+        .create()
+        .expect("producer");
+    // Primero solo lo que cae adentro del minuto. El cierre se produce
+    // después, cuando las dos particiones ya entraron al operador: si el
+    // de 70s llegara antes, el watermark dejaría tarde al otro.
+    for (partition, order_id, t, amount) in [(0, 1, 10_000, 10), (1, 2, 20_000, 7)] {
+        let payload = format!(
+            "{{\"order_id\":{order_id},\"event_time\":{t},\"amount\":{amount}}}"
+        );
+        producer
+            .send(
+                FutureRecord::to(&topic)
+                    .partition(partition)
+                    .key(&order_id.to_string())
+                    .payload(&payload),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("produce");
+    }
+
+    let sql = "INSERT INTO orders_lake \
+               SELECT order_id, window_start, window_end, COUNT(*) AS n, SUM(amount) AS amount \
+               FROM orders \
+               GROUP BY order_id, TUMBLE(event_time, INTERVAL '1' MINUTE)";
+    let parsed = parse_sql(sql).expect("sql");
+    let config = Arc::new(
+        serde_yaml::from_str::<PipelineConfig>(&format!(
+            r#"
+pipeline:
+  name: window-two
+  version: 1
+connectors:
+  redpanda:
+    brokers: [localhost:9092]
+  paimon:
+    warehouse: {warehouse}
+    catalog: local
+inputs:
+  - name: orders
+    topic: {topic}
+    key: order_id
+    schema: json/orders
+    watermark:
+      column: event_time
+      lag: 1ms
+output:
+  name: orders_lake
+  table: default.orders_two
+  key: order_id
+  bucket: 1
+  sequence_field: window_end
+deployment:
+  partitions: 2
+  consumers_per_topic: 2
+  commit_interval: 2s
+"#
+        ))
+        .expect("config"),
+    );
+    let options = RunOptions {
+        commit_interval: Duration::from_secs(2),
+        metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
+        group_id: format!("tachyon-two-{}", std::process::id()),
+        commit_user: format!("tachyon-two-{}", std::process::id()),
+    };
+    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
+    let codecs = HashMap::from([("orders".to_string(), PreparedInput::json(input_schema()))]);
+    let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
+    let watch = metrics.clone();
+    let window = parsed.window.expect("ventana");
+    let select_sql = parsed.select_sql;
+    let run_task = tokio::spawn(async move {
+        run_pipeline(
+            &config,
+            &select_sql,
+            &options,
+            sink,
+            &codecs,
+            &metrics,
+            Some(&window),
+        )
+        .await
+    });
+    let opened = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < opened {
+        if run_task.is_finished() {
+            match run_task.await {
+                Ok(Ok(_)) => panic!("el pipeline terminó"),
+                Ok(Err(e)) => panic!("el pipeline falló: {e:#}"),
+                Err(e) => panic!("tarea abortada: {e}"),
+            }
+        }
+        if watch.rows_read.load(std::sync::atomic::Ordering::Relaxed) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        watch.rows_read.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+        "no llegaron los dos eventos abiertos"
+    );
+    for (partition, order_id, t, amount) in [(0, 1, 70_000, 1), (1, 2, 70_000, 1)] {
+        let payload = format!(
+            "{{\"order_id\":{order_id},\"event_time\":{t},\"amount\":{amount}}}"
+        );
+        producer
+            .send(
+                FutureRecord::to(&topic)
+                    .partition(partition)
+                    .key(&order_id.to_string())
+                    .payload(&payload),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("produce cierre");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut got = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if run_task.is_finished() {
+            match run_task.await {
+                Ok(Ok(_)) => panic!("el pipeline terminó"),
+                Ok(Err(e)) => panic!("el pipeline falló: {e:#}"),
+                Err(e) => panic!("tarea abortada: {e}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Ok(batches) = read_table_rows(&table).await {
+            got = read_windows(&batches);
+            if got.len() >= 2 {
+                break;
+            }
+        }
+    }
+    run_task.abort();
+    assert_eq!(
+        got,
+        vec![(1, 0, 60_000, 1, 10), (2, 0, 60_000, 1, 7)],
+        "cada partición se agrega una vez con dos consumidores"
+    );
+    let _ = std::fs::remove_dir_all(&warehouse);
+}

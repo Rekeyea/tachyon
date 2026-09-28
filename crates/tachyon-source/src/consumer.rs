@@ -21,6 +21,7 @@ use futures::stream;
 use rdkafka::ClientConfig;
 use rdkafka_sys as rdsys;
 
+use crate::handoff::{CommittedObs, PartitionAction, WindowHandoff};
 use crate::record::SourceRecord;
 
 /// Un stream de **lotes** de registros crudos (la abstracción que decoupla el
@@ -55,6 +56,9 @@ pub struct RdkafkaSource {
     /// Tope de registros por envío al canal. Igual al `batch_size` del
     /// decoder: un lote del broker = un `RecordBatch`.
     max_batch: usize,
+    /// Handoff de ventana. `None` en el pass-through: el rebalance sigue
+    /// asignando en el momento. El `u64` es el id de este consumidor.
+    handoff: Mutex<Option<(Arc<WindowHandoff>, u64)>>,
 }
 
 /// Comando de commit de offsets: el task de poll lo ejecuta sobre el
@@ -125,6 +129,13 @@ impl NativeConsumer {
             batch: Vec::new(),
             max_batch: usize::MAX,
             fatal: None,
+            handoff: None,
+            consumer_id: 0,
+            assigned: Vec::new(),
+            assign_gen: 0,
+            serviced_gen: 0,
+            live: HashSet::new(),
+            local_admitted: BTreeMap::new(),
         });
         unsafe {
             rdsys::rd_kafka_conf_set_rebalance_cb(conf.ptr(), Some(native_rebalance_cb));
@@ -267,6 +278,170 @@ fn ffi_seek(
     Ok(())
 }
 
+/// `Ok(false)` si el fetch de la partición todavía no arrancó (típico justo
+/// después de un assign). El caller reintenta en el próximo poll.
+fn ffi_seek_or_wait(
+    rkt: *mut rdsys::rd_kafka_topic_t,
+    partition: i32,
+    offset: i64,
+) -> Result<bool, String> {
+    let err = unsafe { rdsys::rd_kafka_seek(rkt, partition, offset, 10_000) };
+    if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
+        return Ok(true);
+    }
+    if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__STATE
+        || err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__PREV_IN_PROGRESS
+    {
+        return Ok(false);
+    }
+    Err(format!(
+        "seek (partición {partition}, offset {offset}): {}",
+        err_str(err)
+    ))
+}
+
+/// Offset commiteado en el grupo, o `None` si el broker no tiene uno.
+/// Bloquea. Solo se llama entre polls.
+fn ffi_committed_offset(
+    rk: *mut rdsys::rd_kafka_t,
+    topic: &CStr,
+    partition: i32,
+) -> Result<Option<i64>, String> {
+    unsafe {
+        let tpl = rdsys::rd_kafka_topic_partition_list_new(1);
+        if tpl.is_null() {
+            return Err("rd_kafka_topic_partition_list_new devolvió null".into());
+        }
+        let elem = rdsys::rd_kafka_topic_partition_list_add(tpl, topic.as_ptr(), partition);
+        if elem.is_null() {
+            rdsys::rd_kafka_topic_partition_list_destroy(tpl);
+            return Err("rd_kafka_topic_partition_list_add devolvió null".into());
+        }
+        (*elem).offset = rdsys::RD_KAFKA_OFFSET_INVALID as i64;
+        let err = rdsys::rd_kafka_committed(rk, tpl, 10_000);
+        if err != rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
+            let msg = err_str(err);
+            rdsys::rd_kafka_topic_partition_list_destroy(tpl);
+            return Err(format!("committed (partición {partition}): {msg}"));
+        }
+        let stored = (*(*tpl).elems).offset;
+        let perr = (*(*tpl).elems).err;
+        rdsys::rd_kafka_topic_partition_list_destroy(tpl);
+        if perr != rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR && stored < 0 {
+            return Ok(None);
+        }
+        if stored >= 0 {
+            Ok(Some(stored))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Pausa o reanuda fetch. Es local: no va al broker.
+fn ffi_set_paused(
+    rk: *mut rdsys::rd_kafka_t,
+    topic: &CStr,
+    partitions: &[i32],
+    pause: bool,
+) -> Result<(), String> {
+    if partitions.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let tpl = rdsys::rd_kafka_topic_partition_list_new(partitions.len() as i32);
+        if tpl.is_null() {
+            return Err("rd_kafka_topic_partition_list_new devolvió null".into());
+        }
+        for &partition in partitions {
+            if rdsys::rd_kafka_topic_partition_list_add(tpl, topic.as_ptr(), partition).is_null() {
+                rdsys::rd_kafka_topic_partition_list_destroy(tpl);
+                return Err("rd_kafka_topic_partition_list_add devolvió null".into());
+            }
+        }
+        let err = if pause {
+            rdsys::rd_kafka_pause_partitions(rk, tpl)
+        } else {
+            rdsys::rd_kafka_resume_partitions(rk, tpl)
+        };
+        rdsys::rd_kafka_topic_partition_list_destroy(tpl);
+        if err != rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
+            return Err(format!(
+                "{} particiones: {}",
+                if pause { "pausar" } else { "reanudar" },
+                err_str(err)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Consulta de arranque y seek del handoff. `Some` es un error fatal: el
+/// poll sale sin seguir admitiendo. `None` si no hay handoff o si esta
+/// vuelta no cambió nada.
+fn service_handoff(rk: *mut rdsys::rd_kafka_t, drain: &mut DrainState) -> Option<String> {
+    if drain.handoff.is_none() {
+        return None;
+    }
+    drain.flush_local_admitted();
+    if drain.assign_gen != drain.serviced_gen {
+        drain.live.clear();
+        drain.serviced_gen = drain.assign_gen;
+    }
+    let assigned = drain.assigned.clone();
+    for partition in assigned {
+        if drain.live.contains(&partition) {
+            continue;
+        }
+        let handoff = drain.handoff.clone().expect("handoff presente");
+        let action = match handoff.classify(drain.consumer_id, partition) {
+            Ok(action) => action,
+            Err(fatal) => return Some(fatal),
+        };
+        let offset = match action {
+            PartitionAction::Hold => continue,
+            PartitionAction::Query => match startup_query(rk, drain, &handoff, partition) {
+                Ok(Some(offset)) => Some(offset),
+                Ok(None) => continue,
+                Err(fatal) => return Some(fatal),
+            },
+            PartitionAction::Ready(offset) => offset,
+        };
+        if let Some(offset) = offset {
+            drain.resume.arm(partition, offset);
+            match ffi_seek_or_wait(drain.rkt, partition, offset) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(fatal) => return Some(fatal),
+            }
+        }
+        if let Err(fatal) = ffi_set_paused(rk, &drain.topic, &[partition], false) {
+            return Some(fatal);
+        }
+        tracing::info!(partition, ?offset, "handoff: la partición vuelve a leer");
+        drain.live.insert(partition);
+    }
+    None
+}
+
+/// `Ok(None)` si hay que seguir esperando (el fatal ya quedó en el gate, o
+/// la consulta no sembró). `Ok(Some)` es el offset de resume.
+fn startup_query(
+    rk: *mut rdsys::rd_kafka_t,
+    drain: &DrainState,
+    handoff: &WindowHandoff,
+    partition: i32,
+) -> Result<Option<i64>, String> {
+    let committed = ffi_committed_offset(rk, &drain.topic, partition)?;
+    match handoff.observe_committed(partition, committed)? {
+        CommittedObs::Ready(offset) => Ok(Some(offset)),
+        CommittedObs::NeedLow => {
+            let (low, _) = ffi_watermarks(rk, &drain.topic, partition, 10_000)?;
+            Ok(Some(handoff.seed_low(partition, low)))
+        }
+    }
+}
+
 impl Drop for NativeConsumer {
     fn drop(&mut self) {
         unsafe {
@@ -284,23 +459,65 @@ impl Drop for NativeConsumer {
     }
 }
 
-/// Callback de rebalance (eager): asigna las particiones del protocolo de
-/// grupo o desasigna todo en revoke/error. Equivalente al comportamiento por
-/// defecto documentado de librdkafka cuando se registra un callback.
+/// Callback de rebalance (eager). En el pass-through asigna o desasigna y
+/// nada más. En la ventana copia solo los ids: el offset de la lista no es
+/// el commit del grupo. No llama a `rd_kafka_committed` ni a watermarks.
 unsafe extern "C" fn native_rebalance_cb(
     rk: *mut rdsys::rd_kafka_t,
     err: rdsys::rd_kafka_resp_err_t,
     partitions: *mut rdsys::rd_kafka_topic_partition_list_t,
-    _opaque: *mut std::ffi::c_void,
+    opaque: *mut std::ffi::c_void,
 ) {
+    let state = &mut *(opaque as *mut DrainState);
+    if state.handoff.is_none() {
+        if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS {
+            let n = if partitions.is_null() { 0 } else { (*partitions).cnt };
+            tracing::info!(partitions = n, "rebalance: asignación de particiones");
+            rdsys::rd_kafka_assign(rk, partitions);
+        } else {
+            tracing::info!("rebalance: revocación de particiones");
+            rdsys::rd_kafka_assign(rk, std::ptr::null_mut());
+        }
+        return;
+    }
+    let ids = partition_ids(partitions);
     if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS {
-        let n = if partitions.is_null() { 0 } else { (*partitions).cnt };
-        tracing::info!(partitions = n, "rebalance: asignación de particiones");
+        tracing::info!(partitions = ids.len(), "rebalance: asignación de particiones");
         rdsys::rd_kafka_assign(rk, partitions);
+        // Pausa local hasta que el poll, entre llamadas, decida el seek.
+        // Los fetches de esta asignación todavía no están en la cola.
+        let _ = ffi_set_paused(rk, &state.topic, &ids, true);
+        state.assigned = ids;
+        state.live.clear();
+        state.assign_gen = state.assign_gen.wrapping_add(1);
     } else {
-        tracing::info!("rebalance: revocación de particiones");
+        tracing::info!(partitions = ids.len(), "rebalance: revocación de particiones");
+        // Publica lo ya copiado en este poll antes de soltar el dueño.
+        state.flush_local_admitted();
+        if let Some(handoff) = &state.handoff {
+            handoff.note_revoke(&ids);
+        }
+        state.assigned.clear();
+        state.live.clear();
+        state.assign_gen = state.assign_gen.wrapping_add(1);
         rdsys::rd_kafka_assign(rk, std::ptr::null_mut());
     }
+}
+
+/// Ids de la lista de assign/revoke. El campo `offset` no se lee.
+unsafe fn partition_ids(partitions: *const rdsys::rd_kafka_topic_partition_list_t) -> Vec<i32> {
+    if partitions.is_null() {
+        return Vec::new();
+    }
+    let list = &*partitions;
+    if list.cnt <= 0 || list.elems.is_null() {
+        return Vec::new();
+    }
+    let mut ids = Vec::with_capacity(list.cnt as usize);
+    for i in 0..list.cnt {
+        ids.push((*list.elems.add(i as usize)).partition);
+    }
+    ids
 }
 
 /// Callback de reply de commits async: los commits son fire-and-forget; solo
@@ -361,7 +578,16 @@ impl RdkafkaSource {
             commit_tx,
             commit_rx: Mutex::new(Some(commit_rx)),
             max_batch: 32_768,
+            handoff: Mutex::new(None),
         })
+    }
+
+    /// Comparte el handoff de ventana con los otros consumidores del input
+    /// y con el operador. Hay que llamarlo antes de `record_stream`.
+    pub fn with_window_handoff(self, handoff: Arc<WindowHandoff>) -> Self {
+        let id = handoff.register_consumer();
+        *self.handoff.lock().expect("lock del handoff") = Some((handoff, id));
+        self
     }
 
     /// Tope de registros por lote del poll. Debe coincidir con el `batch_size`
@@ -448,6 +674,7 @@ impl RdkafkaSource {
         let resume = ResumeFilter::new(
             self.resume.lock().expect("lock de resume").take().unwrap_or_default(),
         );
+        let handoff = self.handoff.lock().expect("lock del handoff").take();
 
         tokio::spawn(async move {
             // El consumer vive dentro del task de poll: se toma una sola vez
@@ -479,6 +706,10 @@ impl RdkafkaSource {
                     drain.resume = resume;
                     drain.max_batch = max_batch;
                     drain.batch = Vec::with_capacity(max_batch);
+                    if let Some((handoff, id)) = handoff {
+                        drain.handoff = Some(handoff);
+                        drain.consumer_id = id;
+                    }
                 }
 
                 // Consumo por lotes con UN FFI por lote: `rd_kafka_poll` sirve
@@ -539,6 +770,16 @@ impl RdkafkaSource {
                                 let _ = cmd.reply.send(result);
                             }
                             Err(_) => break, // Empty o Disconnected
+                        }
+                    }
+                    // Entre polls: la consulta de arranque y el seek del
+                    // handoff. Dentro del callback de rebalance deadlockearían.
+                    {
+                        let rk = consumer.rk;
+                        let drain = &mut *consumer.drain;
+                        if let Some(fatal) = service_handoff(rk, drain) {
+                            let _ = tx.blocking_send(Err(fatal));
+                            break;
                         }
                     }
                     // Una llamada = un lote: espera datos (hasta
@@ -672,6 +913,13 @@ impl ResumeFilter {
         self.pending.insert(partition, target);
         Ok(false)
     }
+
+    /// Fija el próximo offset a entregar. El seek anterior, si lo hubo, no
+    /// cuenta: el handoff puede mover la partición después del arranque.
+    fn arm(&mut self, partition: i32, next: i64) {
+        self.pending.insert(partition, next);
+        self.seeked.remove(&partition);
+    }
 }
 
 /// Stream de lotes de `SourceRecord` desde el canal mpsc del task de poll.
@@ -768,6 +1016,35 @@ struct DrainState {
     max_batch: usize,
     /// Error fatal pendiente de entregar al stream.
     fatal: Option<String>,
+    /// `None` en el pass-through.
+    handoff: Option<Arc<WindowHandoff>>,
+    consumer_id: u64,
+    /// Particiones de la última asignación. Vacía después de un revoke.
+    assigned: Vec<i32>,
+    assign_gen: u64,
+    serviced_gen: u64,
+    /// Particiones que este poll ya puede copiar sin consultar el gate.
+    live: HashSet<i32>,
+    /// High-water copiado en este poll, todavía no publicado al gate.
+    local_admitted: BTreeMap<i32, i64>,
+}
+
+impl DrainState {
+    fn note_local(&mut self, partition: i32, next: i64) {
+        let slot = self.local_admitted.entry(partition).or_insert(next);
+        *slot = (*slot).max(next);
+    }
+
+    fn flush_local_admitted(&mut self) {
+        let Some(handoff) = &self.handoff else {
+            return;
+        };
+        if self.local_admitted.is_empty() {
+            return;
+        }
+        let local = std::mem::take(&mut self.local_admitted);
+        handoff.flush_admitted(self.consumer_id, &local);
+    }
 }
 
 /// Callback nativo de consumo (`rd_kafka_conf_set_consume_cb`). librdkafka lo
@@ -789,10 +1066,36 @@ unsafe extern "C" fn native_consume_cb(
     }
     match rkm_extract(rkm) {
         Ok(Some((partition, offset, value))) => {
+            if state.handoff.is_some() {
+                // Después del revoke esta partición ya no es nuestra. Copiarla
+                // y además dejar que el consumidor nuevo arranque en el
+                // `applied` viejo la aplicaría dos veces. El mensaje se
+                // destruye; el seek del dueño nuevo lo vuelve a leer.
+                if state.assign_gen > 0 && !state.assigned.contains(&partition) {
+                    return;
+                }
+                if !state.live.contains(&partition) {
+                    let handoff = state.handoff.clone().expect("handoff presente");
+                    match handoff.classify(state.consumer_id, partition) {
+                        Ok(PartitionAction::Ready(_)) => {}
+                        Ok(_) => return,
+                        Err(e) => {
+                            state.fatal = Some(e);
+                            rdsys::rd_kafka_yield(state.rk);
+                            return;
+                        }
+                    }
+                }
+            }
             match state.resume.admit(state.rk, state.rkt, &state.topic, partition, offset) {
-                Ok(true) => state
-                    .batch
-                    .push(SourceRecord::new(partition, offset, None, value)),
+                Ok(true) => {
+                    if state.handoff.is_some() {
+                        state.note_local(partition, offset + 1);
+                    }
+                    state
+                        .batch
+                        .push(SourceRecord::new(partition, offset, None, value));
+                }
                 Ok(false) => {}
                 Err(e) => {
                     state.fatal = Some(e);

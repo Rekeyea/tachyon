@@ -36,6 +36,7 @@ use tachyon_core::{CheckpointBody, SourceOffsets};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
 use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, Recovered};
 use tachyon_source::consumer::RdkafkaSource;
+use tachyon_source::WindowHandoff;
 use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
 use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
 use tachyon_sql::WindowShape;
@@ -97,15 +98,7 @@ impl RunOptions {
         // una necesita su propio `commit_user` (sus checkpoints son propios)
         // y el mismo valor después de reiniciar. En Kubernetes `HOSTNAME` es
         // el nombre del pod, estable entre reinicios del contenedor.
-        let instance = ["TACHYON_INSTANCE_ID", "POD_NAME", "HOSTNAME"]
-            .into_iter()
-            .find_map(|key| {
-                std::env::var(key)
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-            })
-            .unwrap_or_else(|| "local".to_string());
+        let instance = instance_name();
         let commit_user = commit_user_from(&group_id, &instance);
         RunOptions {
             commit_interval,
@@ -128,6 +121,38 @@ fn parse_duration(s: &str) -> Duration {
     } else {
         Duration::from_secs(s.parse().unwrap_or(10))
     }
+}
+
+/// `TACHYON_INSTANCE_ID`, si no `POD_NAME`, si no `HOSTNAME`.
+fn instance_name() -> String {
+    ["TACHYON_INSTANCE_ID", "POD_NAME", "HOSTNAME"]
+        .into_iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// El broker tiene que aceptar este timeout (`group.max.session.timeout.ms`).
+/// Solo el camino de ventana lo setea: el miembro estático no debe caerse
+/// del grupo en un commit largo.
+fn window_session_timeout_ms(commit_interval: Duration) -> u64 {
+    (commit_interval.as_millis() as u64)
+        .saturating_add(30_000)
+        .max(45_000)
+}
+
+/// Un count distinto cambia los `group.instance.id` y la asignación.
+fn ensure_window_consumers(stored: u32, now: usize) -> Result<()> {
+    if stored as usize != now {
+        anyhow::bail!(
+            "consumers_per_topic cambió ({stored} → {now}); los group.instance.id cambian y la asignación también"
+        );
+    }
+    Ok(())
 }
 
 /// `{group}-{instance}` apto para el `commit_user` de Paimon: estable por
@@ -325,15 +350,17 @@ pub async fn run_pipeline(
         String,
         (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat),
     > = std::collections::HashMap::new();
+    let mut window_handoff: Option<Arc<WindowHandoff>> = None;
     let cc = source_client_config(config, &options.group_id, &budget);
-    // Una query de ventana usa un solo consumidor. Dos consumers del mismo
-    // proceso se pasan particiones a mitad de un batch y el operador las
-    // aplicaría dos veces. El handoff de ese caso queda para después.
-    let n_consumers = if window.is_some() {
-        1
-    } else {
-        budget.consumers_per_topic
-    };
+    // Ventana y pass-through usan el mismo presupuesto: min(particiones, CPUs)
+    // salvo override. El handoff evita aplicar dos veces una partición que
+    // cambia de consumidor dentro del proceso.
+    let n_consumers = budget.consumers_per_topic;
+    if let Some(checkpoint) = &restored_window {
+        ensure_window_consumers(checkpoint.consumers_per_topic, n_consumers)?;
+    }
+    let instance = instance_name();
+    let session_timeout_ms = window_session_timeout_ms(options.commit_interval);
     let planned_sql = match window {
         Some(shape) => shape.rewrite_sql(),
         None => select_sql.to_string(),
@@ -368,6 +395,42 @@ pub async fn run_pipeline(
         let source_group = format!("{}-{}", options.group_id, input_def.name);
         let mut source_cc = cc.clone();
         source_cc.set("group.id", &source_group);
+        let handoff = if window.is_some() {
+            source_cc.set("session.timeout.ms", session_timeout_ms.to_string());
+            let topic_applied = restored_window
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.applied.get(&input_def.topic))
+                .cloned()
+                .unwrap_or_default();
+            let gate = match &restored_window {
+                Some(checkpoint) => Arc::new(WindowHandoff::restored(
+                    &source_group,
+                    &input_def.topic,
+                    &options.commit_user,
+                    checkpoint.commit_identifier,
+                    topic_applied,
+                )),
+                None => Arc::new(WindowHandoff::starting(
+                    &source_group,
+                    &input_def.topic,
+                    &options.commit_user,
+                )),
+            };
+            window_handoff = Some(gate.clone());
+            let ids: Vec<String> = (0..n_consumers)
+                .map(|index| format!("{instance}-{index}"))
+                .collect();
+            tracing::info!(
+                input = %input_def.name,
+                group = %source_group,
+                session_timeout_ms,
+                instances = ?ids,
+                "ventana: un operador y N consumidores"
+            );
+            Some(gate)
+        } else {
+            None
+        };
         // Cada consumidor recibe el mapa completo del checkpoint: el filtro de
         // resume ignora las particiones que no le asigna el grupo.
         let topic_resume = resume
@@ -376,13 +439,22 @@ pub async fn run_pipeline(
             .cloned()
             .unwrap_or_default();
         let input_sources: Vec<Arc<RdkafkaSource>> = (0..n_consumers)
-            .map(|_| -> Result<Arc<RdkafkaSource>> {
-                Ok(Arc::new(
-                    RdkafkaSource::new(&source_cc, &input_def.topic)
-                        .with_context(|| format!("creando source para '{}'", input_def.name))?
-                        .with_max_batch(budget.batch_size)
-                        .with_resume_offsets(topic_resume.clone()),
-                ))
+            .map(|index| -> Result<Arc<RdkafkaSource>> {
+                let mut consumer_cc = source_cc.clone();
+                if window.is_some() {
+                    // KIP-345: un id distinto por miembro. No va en el config
+                    // compartido, porque el segundo join con el mismo id echa
+                    // al primero.
+                    consumer_cc.set("group.instance.id", format!("{instance}-{index}"));
+                }
+                let mut source = RdkafkaSource::new(&consumer_cc, &input_def.topic)
+                    .with_context(|| format!("creando source para '{}'", input_def.name))?
+                    .with_max_batch(budget.batch_size)
+                    .with_resume_offsets(topic_resume.clone());
+                if let Some(gate) = &handoff {
+                    source = source.with_window_handoff(gate.clone());
+                }
+                Ok(Arc::new(source))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let tracker = OffsetTracker::new();
@@ -476,6 +548,8 @@ pub async fn run_pipeline(
             options.commit_interval,
             restored_window,
             metrics_addr,
+            window_handoff,
+            n_consumers,
         )
         .await;
     }
@@ -734,6 +808,8 @@ async fn drive_window(
     commit_interval: std::time::Duration,
     restored: Option<tachyon_core::WindowCheckpointV1>,
     metrics_addr: Option<std::net::SocketAddr>,
+    handoff: Option<Arc<WindowHandoff>>,
+    n_consumers: usize,
 ) -> Result<PipelineHandle> {
     let spec = spec_from_shape(shape);
     let mut operator = match &restored {
@@ -768,6 +844,7 @@ async fn drive_window(
     let (mut sink_writer, mut sink_committer) = sink.split();
     let (epoch_tx, mut epoch_rx) = tokio::sync::mpsc::channel::<CheckpointEpoch>(1);
     let commit_metrics = metrics.clone();
+    let commit_handoff = handoff.clone();
     let commit_task = tokio::spawn(async move {
         while let Some(epoch) = epoch_rx.recv().await {
             let kafka_offsets = epoch.body.applied_offsets().clone();
@@ -777,6 +854,9 @@ async fn drive_window(
             let Some(identifier) = result.context("checkpoint de ventana")? else {
                 continue;
             };
+            if let Some(handoff) = &commit_handoff {
+                handoff.mark_snapshot_committed();
+            }
             commit_metrics.inc_commits();
             tracing::info!(identifier, "checkpoint de ventana commiteado");
             for (topic, source) in &commit_sources {
@@ -864,9 +944,14 @@ async fn drive_window(
                 for (topic, tracker) in &trackers {
                     let snap = tracker.snapshot();
                     let entry = applied.entry(topic.clone()).or_default();
-                    for (partition, next) in snap {
-                        let slot = entry.entry(partition).or_insert(next);
-                        *slot = (*slot).max(next);
+                    for (partition, next) in &snap {
+                        let slot = entry.entry(*partition).or_insert(*next);
+                        *slot = (*slot).max(*next);
+                    }
+                    if let Some(handoff) = &handoff {
+                        if handoff.topic() == topic {
+                            handoff.publish_applied(&snap);
+                        }
                     }
                 }
                 metrics.inc_rows_read(record.num_rows() as u64);
@@ -905,10 +990,22 @@ async fn drive_window(
                         .collect(),
                 );
             }
+            if let Some(handoff) = &handoff {
+                // El seed del low watermark vive en el gate. El primer
+                // sidecar nombra la partición aunque ese lote no haya emitido.
+                let seeded = handoff.applied_map();
+                if let Some((topic, _)) = trackers.first() {
+                    let entry = applied.entry(topic.clone()).or_default();
+                    for (partition, next) in seeded {
+                        let slot = entry.entry(partition).or_insert(next);
+                        *slot = (*slot).max(next);
+                    }
+                }
+            }
             tx.send(WindowMsg::Barrier(tachyon_core::WindowCheckpointV1 {
                 v: 1,
                 commit_identifier: 0,
-                consumers_per_topic: 1,
+                consumers_per_topic: n_consumers as u32,
                 applied: applied.clone(),
                 progress,
                 instance_watermark_ms: operator.instance_watermark_ms(),
@@ -930,7 +1027,8 @@ async fn drive_window(
 
 #[cfg(test)]
 mod tests {
-    use super::commit_user_from;
+    use super::{commit_user_from, ensure_window_consumers, window_session_timeout_ms};
+    use std::time::Duration;
 
     #[test]
     fn commit_user_is_stable_and_sanitized() {
@@ -944,5 +1042,18 @@ mod tests {
         );
         let long = "x".repeat(200);
         assert!(commit_user_from("g", &long).len() <= 128);
+    }
+
+    #[test]
+    fn a_different_consumer_count_does_not_start() {
+        assert!(ensure_window_consumers(1, 1).is_ok());
+        let err = ensure_window_consumers(1, 2).unwrap_err().to_string();
+        assert!(err.contains("cambió (1 → 2)"), "{err}");
+    }
+
+    #[test]
+    fn window_session_timeout_covers_the_commit() {
+        assert_eq!(window_session_timeout_ms(Duration::from_secs(2)), 45_000);
+        assert_eq!(window_session_timeout_ms(Duration::from_secs(20)), 50_000);
     }
 }
