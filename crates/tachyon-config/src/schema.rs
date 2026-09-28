@@ -93,6 +93,10 @@ pub struct InputDef {
 pub struct WatermarkConfig {
     pub column: String,
     pub lag: String,
+    /// Si la partición no trae un evento a tiempo durante este plazo, deja de
+    /// frenar el watermark. Ausente: el mismo valor que `lag`.
+    #[serde(default)]
+    pub idle: Option<String>,
 }
 
 /// La salida (vincula nombre lógico -> tabla Paimon).

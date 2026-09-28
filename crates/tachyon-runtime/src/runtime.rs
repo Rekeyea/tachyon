@@ -82,12 +82,6 @@ impl Pipeline {
         &self,
         input_codecs: &std::collections::HashMap<String, PreparedInput>,
     ) -> Result<PipelineHandle> {
-        if let Some(window) = &self.window {
-            anyhow::bail!(
-                "la query usa {:?} y el operador de ventanas todavía no está cableado",
-                window.kind
-            );
-        }
         // Abrir el sink Paimon desde el warehouse de la config.
         let (db, table) = split_table_identifier(&self.config.output.table);
         let sink = PaimonSink::open(
@@ -110,6 +104,7 @@ impl Pipeline {
             sink,
             input_codecs,
             &metrics,
+            self.window.as_ref(),
         )
         .await
     }

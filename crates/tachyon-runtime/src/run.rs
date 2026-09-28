@@ -23,6 +23,7 @@
 //!   checkpoint y cada fuente se re-posiciona ahí (skip de lo ya escrito +
 //!   seek si el consumer group quedó adelante).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,16 +31,21 @@ use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use rdkafka::ClientConfig;
-use tachyon_config::{PayloadFormat, PipelineConfig};
+use tachyon_config::{parse_fixed_duration, PayloadFormat, PipelineConfig};
 use tachyon_core::{CheckpointBody, SourceOffsets};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
 use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, Recovered};
 use tachyon_source::consumer::RdkafkaSource;
 use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
 use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
+use tachyon_sql::WindowShape;
 
 use crate::budget::StatelessBudget;
 use crate::execute::{ensure_passthrough, plan_query, InputSource, StreamTableFactory};
+use crate::window::{
+    batch_from_closed, inputs_from_batch, output_field_names, schema_with_partition,
+    spec_from_shape, user_schema_without_partition, WindowOperator, PARTITION_COLUMN,
+};
 
 /// Fusiona `update` en `offsets` (máximo por partición: el progreso nunca
 /// retrocede).
@@ -244,6 +250,7 @@ pub async fn run_pipeline(
     input_codecs: &std::collections::HashMap<String, PreparedInput>,
     // Métricas de la instancia (pre-creadas por el caller).
     metrics: &Arc<InstanceMetrics>,
+    window: Option<&WindowShape>,
 ) -> Result<PipelineHandle> {
     // Exactly-once no se desactiva: los offsets se commitean con el snapshot
     // de Paimon y un plan que retiene filas entre batches se rechaza abajo.
@@ -270,15 +277,37 @@ pub async fn run_pipeline(
     let mut sink = sink
         .with_commit_user(&options.commit_user)
         .context("fijando el commit_user del sink")?;
-    let resume = match sink.recover().await.context("recuperando el último checkpoint")? {
-        Recovered::None => None,
-        Recovered::PassThrough { offsets, .. } => Some(offsets),
-        Recovered::Window { identifier, .. } => {
+    let recovered = sink.recover().await.context("recuperando el último checkpoint")?;
+    let (resume, restored_window) = match (&recovered, window) {
+        (Recovered::None, _) => (None, None),
+        (Recovered::PassThrough { offsets, .. }, None) => (Some(offsets.clone()), None),
+        (Recovered::PassThrough { identifier, .. }, Some(_)) => {
+            anyhow::bail!(
+                "checkpoint {identifier} de '{}' es pass-through y el plan es de ventana; se rechaza",
+                options.commit_user
+            );
+        }
+        (Recovered::Window { identifier, .. }, None) => {
             anyhow::bail!(
                 "checkpoint {identifier} tiene estado de ventana y el plan es pass-through; se rechaza"
             );
         }
+        (Recovered::Window { checkpoint, .. }, Some(shape)) => {
+            if checkpoint.spec.kind != shape.kind
+                || checkpoint.spec.size_ms != shape.size_ms
+                || checkpoint.spec.slide_ms != shape.slide_ms
+                || checkpoint.spec.gap_ms != shape.gap_ms
+                || checkpoint.spec.group_columns != shape.group_columns
+            {
+                anyhow::bail!(
+                    "el checkpoint de '{}' no coincide con la ventana de esta query",
+                    options.commit_user
+                );
+            }
+            (Some(checkpoint.applied.clone()), Some(checkpoint.clone()))
+        }
     };
+    let resume = resume;
     if let Some(offsets) = &resume {
         tracing::info!(?offsets, "reanudando desde el último checkpoint");
     }
@@ -297,7 +326,18 @@ pub async fn run_pipeline(
         (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat),
     > = std::collections::HashMap::new();
     let cc = source_client_config(config, &options.group_id, &budget);
-    let n_consumers = budget.consumers_per_topic;
+    // Una query de ventana usa un solo consumidor. Dos consumers del mismo
+    // proceso se pasan particiones a mitad de un batch y el operador las
+    // aplicaría dos veces. El handoff de ese caso queda para después.
+    let n_consumers = if window.is_some() {
+        1
+    } else {
+        budget.consumers_per_topic
+    };
+    let planned_sql = match window {
+        Some(shape) => shape.rewrite_sql(),
+        None => select_sql.to_string(),
+    };
 
     for input_def in &config.inputs {
         let prepared = input_codecs
@@ -316,7 +356,14 @@ pub async fn run_pipeline(
             format = ?input_def.format,
             "codec del input"
         );
-        let schema = prepared.schema.clone();
+        let schema = if window.is_some() {
+            if prepared.schema.field_with_name(PARTITION_COLUMN).is_ok() {
+                anyhow::bail!("'{PARTITION_COLUMN}' está reservado");
+            }
+            schema_with_partition(prepared.schema.clone())
+        } else {
+            prepared.schema.clone()
+        };
 
         let source_group = format!("{}-{}", options.group_id, input_def.name);
         let mut source_cc = cc.clone();
@@ -362,7 +409,16 @@ pub async fn run_pipeline(
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("source no encontrado para '{name}'"))?;
-        let decoder = Decoder::new(schema.clone(), format);
+        let (decode_schema, row_partitions) = if schema
+            .fields()
+            .last()
+            .is_some_and(|field| field.name() == PARTITION_COLUMN)
+        {
+            (user_schema_without_partition(&schema), true)
+        } else {
+            (schema.clone(), false)
+        };
+        let decoder = Decoder::new(decode_schema, format);
         // Un `record_stream()` por consumidor, fusionados con `select_all`:
         // el grupo reparte las particiones entre ellos y cada instancia
         // drena su propio buffer de fetch en paralelo. La factory se invoca
@@ -381,7 +437,8 @@ pub async fn run_pipeline(
         let ps = Arc::new(
             RedpandaPartitionStream::new(0, schema.clone(), decoder.clone(), batch_size, make_stream)
                 .with_offset_tracker(tracker)
-                .with_decode_parallelism(decode_parallelism),
+                .with_decode_parallelism(decode_parallelism)
+                .with_row_partitions(row_partitions),
         );
         let table = datafusion::catalog::streaming::StreamingTable::try_new(
             schema,
@@ -392,12 +449,36 @@ pub async fn run_pipeline(
     });
 
     // --- Ejecuta la transformación (validada como pass-through) ---
-    let (plan, task_ctx) = plan_query(select_sql, &inputs, &factory)
+    let (plan, task_ctx) = plan_query(&planned_sql, &inputs, &factory)
         .await
         .context("planificando la transformación")?;
     ensure_passthrough(&plan).context("la transformación no admite exactly-once")?;
     let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
         .context("ejecutando la transformación")?;
+
+    if let Some(shape) = window {
+        let user_schema = input_codecs
+            .get(&shape.source)
+            .with_context(|| format!("sin schema para '{}'", shape.source))?
+            .schema
+            .clone();
+        let (lag_ms, idle_ms) = validate_window(config, shape, user_schema.as_ref(), &sink.field_names())?;
+        return drive_window(
+            shape,
+            lag_ms,
+            idle_ms,
+            user_schema,
+            stream,
+            sink,
+            trackers,
+            commit_sources,
+            metrics,
+            options.commit_interval,
+            restored_window,
+            metrics_addr,
+        )
+        .await;
+    }
 
     // --- Writer task + commit task: decoupla el write y el commit de Paimon ---
     // El checkpoint de Paimon tiene dos fases con costos muy distintos
@@ -561,6 +642,286 @@ pub async fn run_pipeline(
     drop(batch_tx);
     writer.await.context("task del writer")??;
 
+    Ok(PipelineHandle {
+        metrics_addr,
+        metrics: metrics.clone(),
+    })
+}
+
+fn validate_window(
+    config: &PipelineConfig,
+    shape: &WindowShape,
+    schema: &arrow::datatypes::Schema,
+    table_fields: &[String],
+) -> Result<(i64, i64)> {
+    if config.inputs.len() != 1 {
+        anyhow::bail!("una query de ventana tiene un solo input");
+    }
+    let input = &config.inputs[0];
+    if !shape.group_columns.iter().any(|col| col == &input.key) {
+        anyhow::bail!(
+            "GROUP BY de ventana no incluye la clave de particionado '{}'; v1 no tiene agregado parcial",
+            input.key
+        );
+    }
+    let watermark = input.watermark.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "el input '{}' alimenta una ventana y no declara watermark (column, lag)",
+            input.name
+        )
+    })?;
+    if watermark.column != shape.event_time {
+        anyhow::bail!(
+            "watermark.column '{}' no es la columna de la ventana '{}'",
+            watermark.column,
+            shape.event_time
+        );
+    }
+    let lag_ms = parse_fixed_duration(&watermark.lag)
+        .map_err(|e| anyhow::anyhow!("watermark.lag: {e}"))?;
+    let idle_ms = match &watermark.idle {
+        Some(idle) => parse_fixed_duration(idle).map_err(|e| anyhow::anyhow!("watermark.idle: {e}"))?,
+        None => lag_ms,
+    };
+    let time = schema
+        .field_with_name(&shape.event_time)
+        .map_err(|_| anyhow::anyhow!("falta la columna de tiempo '{}'", shape.event_time))?;
+    match time.data_type() {
+        arrow::datatypes::DataType::Int64 | arrow::datatypes::DataType::Timestamp(_, _) => {}
+        other => anyhow::bail!("event time {other} no es Int64 ni Timestamp"),
+    }
+    for col in &shape.group_columns {
+        let field = schema
+            .field_with_name(col)
+            .map_err(|_| anyhow::anyhow!("falta la clave '{col}'"))?;
+        if field.is_nullable() {
+            anyhow::bail!("la clave '{col}' de la ventana no puede ser nullable");
+        }
+        match field.data_type() {
+            arrow::datatypes::DataType::Int64 | arrow::datatypes::DataType::Utf8 => {}
+            other => anyhow::bail!("la clave '{col}' es {other}; hace falta Int64 o Utf8"),
+        }
+    }
+    if table_fields.iter().any(|name| name == PARTITION_COLUMN)
+        || schema.field_with_name(PARTITION_COLUMN).is_ok()
+    {
+        anyhow::bail!("'{PARTITION_COLUMN}' está reservado");
+    }
+    let expected = output_field_names(shape);
+    if table_fields != expected.as_slice() {
+        anyhow::bail!(
+            "la tabla tiene campos {table_fields:?} y la ventana escribe {expected:?}"
+        );
+    }
+    Ok((lag_ms, idle_ms))
+}
+
+enum WindowMsg {
+    Rows(arrow::array::RecordBatch),
+    Barrier(tachyon_core::WindowCheckpointV1),
+}
+
+async fn drive_window(
+    shape: &WindowShape,
+    lag_ms: i64,
+    idle_ms: i64,
+    user_schema: arrow::datatypes::SchemaRef,
+    mut stream: crate::execute::TransformOutput,
+    sink: PaimonSink,
+    trackers: Vec<(String, OffsetTracker)>,
+    commit_sources: Vec<(String, Arc<RdkafkaSource>)>,
+    metrics: &Arc<InstanceMetrics>,
+    commit_interval: std::time::Duration,
+    restored: Option<tachyon_core::WindowCheckpointV1>,
+    metrics_addr: Option<std::net::SocketAddr>,
+) -> Result<PipelineHandle> {
+    let spec = spec_from_shape(shape);
+    let mut operator = match &restored {
+        Some(checkpoint) => {
+            let mut op = WindowOperator::restore(
+                spec,
+                lag_ms,
+                idle_ms,
+                checkpoint.state.clone(),
+                checkpoint.instance_watermark_ms,
+            );
+            let topic = trackers.first().map(|(topic, _)| topic.clone());
+            if let Some(topic) = topic {
+                if let Some(parts) = checkpoint.progress.get(&topic) {
+                    let maxes = parts
+                        .iter()
+                        .map(|(id, progress)| (*id, progress.max_event_time_ms))
+                        .collect();
+                    op.activate_restored(&maxes, Instant::now());
+                }
+            }
+            op
+        }
+        None => WindowOperator::new(spec, lag_ms, idle_ms),
+    };
+    let mut applied = restored
+        .as_ref()
+        .map(|checkpoint| checkpoint.applied.clone())
+        .unwrap_or_default();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WindowMsg>(8);
+    let (mut sink_writer, mut sink_committer) = sink.split();
+    let (epoch_tx, mut epoch_rx) = tokio::sync::mpsc::channel::<CheckpointEpoch>(1);
+    let commit_metrics = metrics.clone();
+    let commit_task = tokio::spawn(async move {
+        while let Some(epoch) = epoch_rx.recv().await {
+            let kafka_offsets = epoch.body.applied_offsets().clone();
+            let result = sink_committer
+                .commit_epoch(epoch.writer, epoch.identifier, &epoch.body)
+                .await;
+            let Some(identifier) = result.context("checkpoint de ventana")? else {
+                continue;
+            };
+            commit_metrics.inc_commits();
+            tracing::info!(identifier, "checkpoint de ventana commiteado");
+            for (topic, source) in &commit_sources {
+                if let Some(partitions) = kafka_offsets.get(topic) {
+                    if let Err(e) = source.commit_offsets(partitions).await {
+                        tracing::warn!(error = %e, topic, "commit de offsets en Kafka");
+                    }
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let writer_metrics = metrics.clone();
+    let writer = tokio::spawn(async move {
+        let mut dirty = false;
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                WindowMsg::Rows(batch) => {
+                    let t_write = Instant::now();
+                    sink_writer.write(&batch).await.context("escribiendo ventana")?;
+                    writer_metrics.add_write_ns(t_write.elapsed().as_nanos() as u64);
+                    writer_metrics.inc_rows_written(batch.num_rows() as u64);
+                    dirty = true;
+                }
+                WindowMsg::Barrier(checkpoint) => {
+                    if !dirty {
+                        continue;
+                    }
+                    let (identifier, full_writer) = sink_writer.rotate().context("rotando el writer")?;
+                    if epoch_tx
+                        .send(CheckpointEpoch {
+                            writer: full_writer,
+                            identifier,
+                            body: CheckpointBody::Window(checkpoint),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        anyhow::bail!("el task de commit terminó inesperadamente");
+                    }
+                    dirty = false;
+                }
+            }
+        }
+        drop(epoch_tx);
+        commit_task.await.context("task de commit")??;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // El futuro de `stream.next()` vive en otro task. El select de acá
+    // espera un canal, así que un tick no cancela el batch de DataFusion.
+    let (batch_in_tx, mut batch_in_rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        while let Some(item) = stream.next().await {
+            if batch_in_tx.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    let mut last_commit = Instant::now();
+    loop {
+        enum Wake {
+            Batch(arrow::array::RecordBatch),
+            Tick,
+            End,
+        }
+        let wake = tokio::select! {
+            result = batch_in_rx.recv() => match result {
+                Some(batch) => Wake::Batch(batch.context("batch de la ventana")?),
+                None => Wake::End,
+            },
+            _ = tick.tick() => Wake::Tick,
+        };
+        match wake {
+            Wake::End => break,
+            Wake::Batch(record) => {
+                let rows = inputs_from_batch(&record, shape).context("leyendo el batch de ventana")?;
+                let closed = operator
+                    .apply(&rows, Instant::now())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                for (topic, tracker) in &trackers {
+                    let snap = tracker.snapshot();
+                    let entry = applied.entry(topic.clone()).or_default();
+                    for (partition, next) in snap {
+                        let slot = entry.entry(partition).or_insert(next);
+                        *slot = (*slot).max(next);
+                    }
+                }
+                metrics.inc_rows_read(record.num_rows() as u64);
+                if !closed.is_empty() {
+                    let out = batch_from_closed(&closed, shape, user_schema.as_ref())
+                        .context("armando la salida de la ventana")?;
+                    tx.send(WindowMsg::Rows(out))
+                        .await
+                        .context("enviando filas de ventana")?;
+                }
+            }
+            Wake::Tick => {
+                let closed = operator.on_tick(Instant::now());
+                if !closed.is_empty() {
+                    let out = batch_from_closed(&closed, shape, user_schema.as_ref())?;
+                    tx.send(WindowMsg::Rows(out)).await.context("enviando filas de ventana")?;
+                }
+            }
+        }
+        if last_commit.elapsed() >= commit_interval {
+            let mut progress = BTreeMap::new();
+            if let Some((topic, _)) = trackers.first() {
+                progress.insert(
+                    topic.clone(),
+                    operator
+                        .partition_progress()
+                        .into_iter()
+                        .map(|(id, max)| {
+                            (
+                                id,
+                                tachyon_core::PartitionProgress {
+                                    max_event_time_ms: max,
+                                },
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            tx.send(WindowMsg::Barrier(tachyon_core::WindowCheckpointV1 {
+                v: 1,
+                commit_identifier: 0,
+                consumers_per_topic: 1,
+                applied: applied.clone(),
+                progress,
+                instance_watermark_ms: operator.instance_watermark_ms(),
+                spec: spec_from_shape(shape),
+                state: operator.freeze_state(),
+            }))
+            .await
+            .context("enviando la barrera de ventana")?;
+            last_commit = Instant::now();
+        }
+    }
+    drop(tx);
+    writer.await.context("task de escritura de ventana")??;
     Ok(PipelineHandle {
         metrics_addr,
         metrics: metrics.clone(),

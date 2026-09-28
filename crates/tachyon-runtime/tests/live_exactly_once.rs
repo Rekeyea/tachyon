@@ -148,6 +148,7 @@ fn start_instance(config: &PipelineConfig, table: &paimon::table::Table, group_i
                 sink,
                 &schemas,
                 &metrics,
+                None,
             )
             .await
         }

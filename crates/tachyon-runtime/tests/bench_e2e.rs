@@ -335,7 +335,7 @@ async fn bench_e2e_sustained_drain() {
     let select_sql = "SELECT order_id, status, source_version, amount FROM orders";
     let metrics_read = metrics.clone();
     let run_task = tokio::spawn(async move {
-        run_pipeline(&config, select_sql, &options, sink, &input_schemas, &metrics).await
+        run_pipeline(&config, select_sql, &options, sink, &input_schemas, &metrics, None).await
     });
 
     // --- 3. Medición en estado estacionario ---

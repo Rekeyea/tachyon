@@ -162,7 +162,7 @@ async fn start_instance(
     let task = tokio::spawn({
         let metrics = metrics.clone();
         async move {
-            run_pipeline(&config, &select_sql, &options, sink, &input_schemas, &metrics).await
+            run_pipeline(&config, &select_sql, &options, sink, &input_schemas, &metrics, None).await
         }
     });
     (task, metrics)

@@ -187,6 +187,7 @@ async fn live_end_to_end_redpanda_to_paimon() {
             sink,
             &input_schemas,
             &metrics,
+            None,
         )
         .await
     });

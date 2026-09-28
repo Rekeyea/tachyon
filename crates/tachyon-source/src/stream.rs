@@ -76,6 +76,9 @@ pub struct RedpandaPartitionStream {
     /// tracking de offsets (exactly-once) es idéntico al decode inline.
     /// Default: 1 (sin paralelismo; lo deriva el runtime).
     decode_parallelism: usize,
+    /// Si el schema de la tabla termina en `_tachyon_partition`, cada fila
+    /// lleva la partición de Kafka. El decoder no ve esa columna.
+    row_partitions: bool,
 }
 
 impl RedpandaPartitionStream {
@@ -95,7 +98,13 @@ impl RedpandaPartitionStream {
             make_stream,
             tracker: None,
             decode_parallelism: 1,
+            row_partitions: false,
         }
+    }
+
+    pub fn with_row_partitions(mut self, enabled: bool) -> Self {
+        self.row_partitions = enabled;
+        self
     }
 
     /// Lotes a decodificar en paralelo (ver `decode_parallelism`).
@@ -139,11 +148,13 @@ impl PartitionStream for RedpandaPartitionStream {
 
     fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let schema = self.schema.clone();
+        let yielded_schema = schema.clone();
         let decoder = self.decoder.clone();
         let batch_size = self.batch_size;
         let max_batch_delay = self.max_batch_delay;
         let tracker = self.tracker.clone();
         let decode_parallelism = self.decode_parallelism;
+        let row_partitions = self.row_partitions;
         let records = (self.make_stream)();
 
         // Batching por tamaño O tiempo: un lote se despacha a decodificar
@@ -163,7 +174,7 @@ impl PartitionStream for RedpandaPartitionStream {
         // offset de los registros acumulados. Se publica al emitir el batch.
         let batches = async_stream::stream! {
             let mut records = records;
-            let mut acc: Vec<Vec<u8>> = Vec::new();
+            let mut acc: Vec<(i32, Vec<u8>)> = Vec::new();
             let mut offsets = BTreeMap::<i32, i64>::new();
             let mut since_first: Option<Instant> = None;
             let mut in_flight = FuturesOrdered::<
@@ -175,7 +186,7 @@ impl PartitionStream for RedpandaPartitionStream {
                 if acc.len() >= batch_size {
                     // (a) Lote lleno: despachar. Con el pool lleno, drenar el
                     // más viejo antes de seguir acumulando.
-                    spawn_decode(&decoder, &mut acc, &mut offsets, &mut in_flight);
+                    spawn_decode(&decoder, &schema.clone(), row_partitions, &mut acc, &mut offsets, &mut in_flight);
                     since_first = None;
                     emit = in_flight.len() >= decode_parallelism;
                 } else if !acc.is_empty()
@@ -184,7 +195,7 @@ impl PartitionStream for RedpandaPartitionStream {
                     // (b) Límite de tiempo agotado: despachar el parcial y
                     // drenar ya (latencia acotada por `max_batch_delay`).
                     tracing::debug!(rows = acc.len(), "emitiendo batch parcial (flush time-based)");
-                    spawn_decode(&decoder, &mut acc, &mut offsets, &mut in_flight);
+                    spawn_decode(&decoder, &schema.clone(), row_partitions, &mut acc, &mut offsets, &mut in_flight);
                     since_first = None;
                     emit = true;
                 } else {
@@ -198,7 +209,7 @@ impl PartitionStream for RedpandaPartitionStream {
                             for record in lot {
                                 let next = offsets.entry(record.partition).or_insert(0);
                                 *next = (*next).max(record.offset + 1);
-                                acc.push(record.value);
+                                acc.push((record.partition, record.value));
                             }
                         }
                         Ok(Some(Err(e))) => {
@@ -207,7 +218,7 @@ impl PartitionStream for RedpandaPartitionStream {
                         Ok(None) => {
                             // (c) Stream terminado: flush de cola y drenado.
                             if !acc.is_empty() {
-                                spawn_decode(&decoder, &mut acc, &mut offsets, &mut in_flight);
+                                spawn_decode(&decoder, &schema.clone(), row_partitions, &mut acc, &mut offsets, &mut in_flight);
                             }
                             if in_flight.is_empty() {
                                 return;
@@ -244,7 +255,7 @@ impl PartitionStream for RedpandaPartitionStream {
             }
         };
 
-        Box::pin(RecordBatchStreamAdapter::new(schema, batches))
+        Box::pin(RecordBatchStreamAdapter::new(yielded_schema, batches))
     }
 }
 
@@ -256,19 +267,43 @@ type DecodedLot = Result<RecordBatch, DataFusionError>;
 /// tracker cuando el batch decodificado se emite (en orden de despacho).
 fn spawn_decode(
     decoder: &Decoder,
-    acc: &mut Vec<Vec<u8>>,
+    schema: &SchemaRef,
+    row_partitions: bool,
+    acc: &mut Vec<(i32, Vec<u8>)>,
     offsets: &mut BTreeMap<i32, i64>,
     in_flight: &mut FuturesOrdered<tokio::task::JoinHandle<(BTreeMap<i32, i64>, DecodedLot)>>,
 ) {
-    let mut values = std::mem::take(acc);
+    let staged = std::mem::take(acc);
     let offs = std::mem::take(offsets);
     let decoder = decoder.clone();
+    let schema = schema.clone();
     in_flight.push_back(tokio::task::spawn_blocking(move || {
+        let partitions: Vec<i32> = staged.iter().map(|(p, _)| *p).collect();
+        let mut values: Vec<Vec<u8>> = staged.into_iter().map(|(_, v)| v).collect();
         let result = decoder
             .decode(&mut values)
-            .map_err(|e| DataFusionError::Execution(e.to_string()));
+            .map_err(|e| DataFusionError::Execution(e.to_string()))
+            .and_then(|batch| {
+                if row_partitions {
+                    append_partition_column(batch, &partitions, schema)
+                } else {
+                    Ok(batch)
+                }
+            });
         (offs, result)
     }));
+}
+
+fn append_partition_column(
+    batch: RecordBatch,
+    partitions: &[i32],
+    schema: SchemaRef,
+) -> Result<RecordBatch, DataFusionError> {
+    let mut columns = batch.columns().to_vec();
+    columns.push(std::sync::Arc::new(arrow::array::Int32Array::from(
+        partitions.to_vec(),
+    )));
+    RecordBatch::try_new(schema, columns).map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
 #[cfg(test)]

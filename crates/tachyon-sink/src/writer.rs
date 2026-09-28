@@ -295,6 +295,16 @@ impl PaimonSink {
     pub fn commit_user(&self) -> &str {
         &self.commit_user
     }
+
+    /// Nombres de campo de la tabla, en el orden en que hay que escribir el batch.
+    pub fn field_names(&self) -> Vec<String> {
+        self.table
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect()
+    }
 }
 
 /// Commit de Paimon con reintentos: un error de I/O tras el prepare deja el

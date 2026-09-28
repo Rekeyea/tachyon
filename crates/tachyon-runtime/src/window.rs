@@ -9,7 +9,13 @@
 //! mueve cuando el intervalo se estira o se fusiona.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
+
+use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray, StringBuilder};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use tachyon_sql::{WindowAgg, WindowShape};
 
 use tachyon_core::{
     Accumulators, AggKind, AggSpec, AggState, KeyState, OperatorState, SessionState, WindowKind,
@@ -98,7 +104,348 @@ struct PartitionClock {
     last_on_time: Option<Instant>,
 }
 
-/// Estado vivo de una query de ventana.
+pub const PARTITION_COLUMN: &str = "_tachyon_partition";
+
+/// Schema que ve DataFusion: columnas del usuario más la partición de Kafka.
+pub fn schema_with_partition(schema: SchemaRef) -> SchemaRef {
+    let mut fields = schema.fields().to_vec();
+    fields.push(Arc::new(Field::new(PARTITION_COLUMN, DataType::Int32, false)));
+    Arc::new(Schema::new(fields))
+}
+
+pub fn user_schema_without_partition(schema: &SchemaRef) -> SchemaRef {
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != PARTITION_COLUMN)
+        .cloned()
+        .collect();
+    Arc::new(Schema::new(fields))
+}
+
+type SchemaRef = Arc<Schema>;
+
+/// Nombres de columna que tiene que tener la tabla, en ese orden.
+pub fn output_field_names(shape: &WindowShape) -> Vec<String> {
+    let mut names = shape.group_columns.clone();
+    names.push("window_start".into());
+    names.push("window_end".into());
+    names.extend(shape.aggs.iter().map(|agg| agg.alias.clone()));
+    names
+}
+
+pub fn spec_from_shape(shape: &WindowShape) -> WindowSpecId {
+    WindowSpecId {
+        input: shape.source.clone(),
+        event_time: shape.event_time.clone(),
+        kind: shape.kind,
+        size_ms: shape.size_ms,
+        slide_ms: shape.slide_ms,
+        gap_ms: shape.gap_ms,
+        group_columns: shape.group_columns.clone(),
+        partial: false,
+        aggs: shape
+            .aggs
+            .iter()
+            .map(|agg| tachyon_core::AggSpec {
+                kind: agg.kind,
+                input: agg.input.clone(),
+                alias: agg.alias.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Filas del batch reescrito. La última columna es `_tachyon_partition`.
+pub fn inputs_from_batch(batch: &RecordBatch, shape: &WindowShape) -> anyhow::Result<Vec<WindowInput>> {
+    let schema = batch.schema();
+    let partition_idx = schema
+        .index_of(PARTITION_COLUMN)
+        .map_err(|_| anyhow::anyhow!("el batch de ventana no trae {PARTITION_COLUMN}"))?;
+    let partitions = batch
+        .column(partition_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| anyhow::anyhow!("{PARTITION_COLUMN} no es Int32"))?;
+    let time_idx = schema
+        .index_of(&shape.event_time)
+        .map_err(|_| anyhow::anyhow!("falta la columna de tiempo '{}'", shape.event_time))?;
+    let mut group_idx = Vec::new();
+    for name in &shape.group_columns {
+        group_idx.push(
+            schema
+                .index_of(name)
+                .map_err(|_| anyhow::anyhow!("falta la clave '{name}'"))?,
+        );
+    }
+    let mut measure_idx = Vec::new();
+    for agg in &shape.aggs {
+        measure_idx.push(match &agg.input {
+            Some(name) => Some(
+                schema
+                    .index_of(name)
+                    .map_err(|_| anyhow::anyhow!("falta la medida '{name}'"))?,
+            ),
+            None => None,
+        });
+    }
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let key = encode_group_key(batch, &group_idx, row)?;
+        let event_time_ms = event_time_at(batch.column(time_idx).as_ref(), row)?;
+        let mut values = Vec::with_capacity(shape.aggs.len());
+        for (agg, idx) in shape.aggs.iter().zip(&measure_idx) {
+            values.push(match idx {
+                Some(i) => measure_at(batch.column(*i).as_ref(), row, agg)?,
+                None => None,
+            });
+        }
+        rows.push(WindowInput {
+            key,
+            event_time_ms,
+            partition: partitions.value(row),
+            offset: 0,
+            values,
+        });
+    }
+    Ok(rows)
+}
+
+pub fn batch_from_closed(
+    closed: &[ClosedWindow],
+    shape: &WindowShape,
+    input: &Schema,
+) -> anyhow::Result<RecordBatch> {
+    let mut fields = Vec::new();
+    let mut columns: Vec<Arc<dyn Array>> = Vec::new();
+    for name in &shape.group_columns {
+        let field = input
+            .field_with_name(name)
+            .map_err(|_| anyhow::anyhow!("la clave '{name}' no está en el schema"))?;
+        fields.push(field.clone());
+        columns.push(group_column(closed, name, shape, field.data_type())?);
+    }
+    fields.push(Field::new("window_start", DataType::Int64, false));
+    columns.push(Arc::new(Int64Array::from(
+        closed.iter().map(|w| w.window_start).collect::<Vec<_>>(),
+    )));
+    fields.push(Field::new("window_end", DataType::Int64, false));
+    columns.push(Arc::new(Int64Array::from(
+        closed.iter().map(|w| w.window_end).collect::<Vec<_>>(),
+    )));
+    for (i, agg) in shape.aggs.iter().enumerate() {
+        let (field, column) = agg_column(closed, i, agg)?;
+        fields.push(field);
+        columns.push(column);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, columns).map_err(|e| anyhow::anyhow!("batch de ventana: {e}"))
+}
+
+fn encode_group_key(
+    batch: &RecordBatch,
+    indexes: &[usize],
+    row: usize,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut key = Vec::new();
+    for &idx in indexes {
+        let column = batch.column(idx);
+        if column.is_null(row) {
+            return Ok(None);
+        }
+        match column.data_type() {
+            DataType::Int64 => {
+                let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                key.extend_from_slice(&values.value(row).to_le_bytes());
+            }
+            DataType::Utf8 => {
+                let values = column.as_any().downcast_ref::<StringArray>().unwrap();
+                let text = values.value(row);
+                key.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                key.extend_from_slice(text.as_bytes());
+            }
+            other => anyhow::bail!("clave de ventana con tipo {other}, hace falta Int64 o Utf8"),
+        }
+    }
+    Ok(Some(key))
+}
+
+fn event_time_at(column: &dyn Array, row: usize) -> anyhow::Result<Option<i64>> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    let ms = match column.data_type() {
+        DataType::Int64 => column.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            column.as_any().downcast_ref::<arrow::array::TimestampSecondArray>().unwrap().value(row)
+                * 1_000
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => column
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap()
+            .value(row),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            column
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                .unwrap()
+                .value(row)
+                / 1_000
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            column
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .unwrap()
+                .value(row)
+                / 1_000_000
+        }
+        other => anyhow::bail!("event time {other} no es Int64 ni Timestamp"),
+    };
+    Ok(Some(ms))
+}
+
+fn measure_at(column: &dyn Array, row: usize, agg: &WindowAgg) -> anyhow::Result<Option<Num>> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    let _ = agg;
+    match column.data_type() {
+        DataType::Int64 => Ok(Some(Num::I64(
+            column.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
+        ))),
+        DataType::Float64 => Ok(Some(Num::F64(
+            column.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
+        ))),
+        _ => Ok(Some(Num::I64(1))),
+    }
+}
+
+fn group_column(
+    closed: &[ClosedWindow],
+    name: &str,
+    shape: &WindowShape,
+    dtype: &DataType,
+) -> anyhow::Result<Arc<dyn Array>> {
+    let index = shape
+        .group_columns
+        .iter()
+        .position(|col| col == name)
+        .ok_or_else(|| anyhow::anyhow!("columna de grupo '{name}'"))?;
+    match dtype {
+        DataType::Int64 => {
+            let mut values = Vec::with_capacity(closed.len());
+            for window in closed {
+                values.push(decode_i64_key(&window.key, index, &shape.group_columns)?);
+            }
+            Ok(Arc::new(Int64Array::from(values)))
+        }
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for window in closed {
+                builder.append_value(decode_utf8_key(&window.key, index, &shape.group_columns)?);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        other => anyhow::bail!("salida de clave {other}"),
+    }
+}
+
+fn decode_i64_key(key: &[u8], index: usize, columns: &[String]) -> anyhow::Result<i64> {
+    let start = index * 8;
+    let bytes: [u8; 8] = key
+        .get(start..start + 8)
+        .ok_or_else(|| anyhow::anyhow!("clave corta para {}", columns[index]))?
+        .try_into()
+        .unwrap();
+    let _ = columns;
+    Ok(i64::from_le_bytes(bytes))
+}
+
+fn decode_utf8_key(key: &[u8], index: usize, _columns: &[String]) -> anyhow::Result<String> {
+    // v1 de una sola columna utf8 al inicio. Compuestas utf8 se leen en orden.
+    let mut offset = 0;
+    for _ in 0..index {
+        if offset + 4 > key.len() {
+            anyhow::bail!("clave utf8 corta");
+        }
+        let len = u32::from_le_bytes(key[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4 + len;
+    }
+    let len = u32::from_le_bytes(key[offset..offset + 4].try_into().unwrap()) as usize;
+    let text = std::str::from_utf8(&key[offset + 4..offset + 4 + len])
+        .map_err(|e| anyhow::anyhow!("clave utf8: {e}"))?;
+    Ok(text.to_string())
+}
+
+fn agg_column(
+    closed: &[ClosedWindow],
+    index: usize,
+    agg: &WindowAgg,
+) -> anyhow::Result<(Field, Arc<dyn Array>)> {
+    let slot = closed.first().map(|w| &w.acc.slots[index]);
+    match (agg.kind, slot) {
+        (AggKind::Count, _) => Ok((
+            Field::new(&agg.alias, DataType::Int64, false),
+            Arc::new(Int64Array::from(
+                closed
+                    .iter()
+                    .map(|w| match w.acc.slots[index] {
+                        AggState::Count(n) => n,
+                        _ => 0,
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+        )),
+        (AggKind::Avg, _) | (_, Some(AggState::SumF64(_)) | Some(AggState::MinF64(_)) | Some(AggState::MaxF64(_))) => {
+            let values = closed
+                .iter()
+                .map(|w| float_slot(&w.acc, index))
+                .collect::<Vec<_>>();
+            Ok((
+                Field::new(&agg.alias, DataType::Float64, true),
+                Arc::new(Float64Array::from(values)),
+            ))
+        }
+        _ => {
+            let values = closed
+                .iter()
+                .map(|w| int_slot(&w.acc, index))
+                .collect::<Vec<_>>();
+            Ok((
+                Field::new(&agg.alias, DataType::Int64, true),
+                Arc::new(Int64Array::from(values)),
+            ))
+        }
+    }
+}
+
+fn int_slot(acc: &Accumulators, index: usize) -> Option<i64> {
+    if acc.present.get(index) == Some(&false) {
+        return None;
+    }
+    match acc.slots.get(index)? {
+        AggState::SumI64(n) => i64::try_from(*n).ok(),
+        AggState::MinI64(n) | AggState::MaxI64(n) => Some(*n),
+        AggState::Count(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn float_slot(acc: &Accumulators, index: usize) -> Option<f64> {
+    if acc.present.get(index) == Some(&false) {
+        return None;
+    }
+    match acc.slots.get(index)? {
+        AggState::SumF64(n) | AggState::MinF64(n) | AggState::MaxF64(n) => Some(*n),
+        AggState::Avg { sum, count } if *count > 0 => Some(*sum / *count as f64),
+        AggState::Avg { .. } => None,
+        AggState::SumI64(n) => Some(*n as f64),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WindowOperator {
     spec: WindowSpecId,
@@ -172,6 +519,28 @@ impl WindowOperator {
     /// No cierra por el paso del tiempo de pared cuando todas están idle.
     pub fn on_tick(&mut self, now: Instant) -> Vec<ClosedWindow> {
         self.raise_and_close(now)
+    }
+
+    /// Máximo event time por partición, para el sidecar.
+    pub fn partition_progress(&self) -> BTreeMap<i32, Option<i64>> {
+        self.partitions
+            .iter()
+            .map(|(id, clock)| (*id, clock.max_event_time_ms))
+            .collect()
+    }
+
+    /// Tras un restore las particiones del sidecar vuelven a contar como
+    /// activas hasta que pase `idle` sin un evento a tiempo.
+    pub fn activate_restored(&mut self, progress: &BTreeMap<i32, Option<i64>>, now: Instant) {
+        for (id, max) in progress {
+            self.partitions.insert(
+                *id,
+                PartitionClock {
+                    max_event_time_ms: *max,
+                    last_on_time: Some(now),
+                },
+            );
+        }
     }
 
     /// El mapa por clave, listo para el sidecar. `by_end` no entra.

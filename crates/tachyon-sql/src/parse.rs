@@ -14,9 +14,9 @@
 
 use datafusion::sql::sqlparser::ast::{
     DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Query, SetExpr, Statement, TableFactor, TableObject, Value,
+    Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
 };
-use tachyon_core::WindowKind;
+use tachyon_core::{AggKind, WindowKind};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use tachyon_core::Error;
@@ -50,6 +50,52 @@ pub struct WindowShape {
     pub gap_ms: Option<i64>,
     /// Columnas del `GROUP BY` que no son la llamada de ventana.
     pub group_columns: Vec<String>,
+    pub aggs: Vec<WindowAgg>,
+    /// `WHERE` original, si hay. El rewrite lo conserva.
+    pub filter_sql: Option<String>,
+    /// Tabla del `FROM`. Una sola, en una query de ventana.
+    pub source: String,
+}
+
+/// Agregado del `SELECT` de una query de ventana.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowAgg {
+    pub kind: AggKind,
+    pub input: Option<String>,
+    pub alias: String,
+}
+
+impl WindowShape {
+    /// SQL que entra a DataFusion: filter/project, sin la ventana.
+    /// La columna `_tachyon_partition` la agrega el stream.
+    pub fn rewrite_sql(&self) -> String {
+        let mut cols: Vec<&str> = Vec::new();
+        for col in &self.group_columns {
+            if !cols.contains(&col.as_str()) {
+                cols.push(col);
+            }
+        }
+        if !cols.contains(&self.event_time.as_str()) {
+            cols.push(&self.event_time);
+        }
+        for agg in &self.aggs {
+            if let Some(input) = &agg.input {
+                if !cols.contains(&input.as_str()) {
+                    cols.push(input);
+                }
+            }
+        }
+        let list = cols.join(", ");
+        let mut sql = format!(
+            "SELECT {list}, _tachyon_partition FROM {}",
+            self.source
+        );
+        if let Some(filter) = &self.filter_sql {
+            sql.push_str(" WHERE ");
+            sql.push_str(filter);
+        }
+        sql
+    }
 }
 
 /// Parsea `pipeline.sql` y valida que sea un `INSERT INTO <out> SELECT ...`.
@@ -90,7 +136,15 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         .as_ref()
         .ok_or_else(|| Error::Sql("el INSERT no tiene una query SELECT".to_string()))?;
     let source_tables = extract_source_tables(source);
-    let window = window_shape(source)?;
+    let mut window = window_shape(source)?;
+    if let Some(shape) = window.as_mut() {
+        if source_tables.len() != 1 {
+            return Err(Error::Sql(
+                "una query de ventana tiene un solo FROM".to_string(),
+            ));
+        }
+        shape.source = source_tables[0].clone();
+    }
 
     // La query SELECT ejecutable (sin el INSERT INTO <out>), serializada de
     // vuelta a string desde el AST. Esta es la que corre en DataFusion contra
@@ -131,8 +185,91 @@ fn window_shape(query: &Query) -> Result<Option<WindowShape>, Error> {
     }
     if let Some(shape) = window.as_mut() {
         shape.group_columns = group_columns;
+        shape.aggs = select_aggs(&select.projection)?;
+        shape.filter_sql = select.selection.as_ref().map(|expr| expr.to_string());
+        if shape.aggs.is_empty() {
+            return Err(Error::Sql(
+                "la query de ventana no tiene agregados".to_string(),
+            ));
+        }
     }
     Ok(window)
+}
+
+fn select_aggs(items: &[SelectItem]) -> Result<Vec<WindowAgg>, Error> {
+    let mut aggs = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if let Some((kind, input)) = agg_call(expr)? {
+                    aggs.push(WindowAgg {
+                        kind,
+                        input,
+                        alias: alias.value.clone(),
+                    });
+                }
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                if agg_call(expr)?.is_some() {
+                    return Err(Error::Sql(
+                        "el agregado de una ventana necesita alias".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::Sql(
+                    "la query de ventana no acepta SELECT *".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(aggs)
+}
+
+fn agg_call(expr: &Expr) -> Result<Option<(AggKind, Option<String>)>, Error> {
+    let Expr::Function(fun) = expr else {
+        return Ok(None);
+    };
+    let name = fun.name.to_string().to_ascii_uppercase();
+    let kind = match name.as_str() {
+        "COUNT" => AggKind::Count,
+        "SUM" => AggKind::Sum,
+        "MIN" => AggKind::Min,
+        "MAX" => AggKind::Max,
+        "AVG" => AggKind::Avg,
+        _ => return Ok(None),
+    };
+    if let FunctionArguments::List(list) = &fun.args {
+        if list.duplicate_treatment.is_some() {
+            return Err(Error::Sql(format!(
+                "agregado no soportado en ventanas exactly-once: {name} DISTINCT"
+            )));
+        }
+    }
+    let input = match &fun.args {
+        FunctionArguments::List(list) if list.args.is_empty() => None,
+        FunctionArguments::List(list) if list.args.len() == 1 => match &list.args[0] {
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(column_name(expr)?),
+            _ => {
+                return Err(Error::Sql(format!(
+                    "agregado no soportado en ventanas exactly-once: {name}"
+                )))
+            }
+        },
+        FunctionArguments::None => None,
+        _ => {
+            return Err(Error::Sql(format!(
+                "agregado no soportado en ventanas exactly-once: {name}"
+            )))
+        }
+    };
+    if kind != AggKind::Count && input.is_none() {
+        return Err(Error::Sql(format!(
+            "{name} necesita una columna"
+        )));
+    }
+    Ok(Some((kind, input)))
 }
 
 fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
@@ -159,6 +296,9 @@ fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
                 slide_ms: None,
                 gap_ms: None,
                 group_columns: vec![],
+                aggs: vec![],
+                filter_sql: None,
+                source: String::new(),
             }
         }
         "HOP" => {
@@ -182,6 +322,9 @@ fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
                 slide_ms: Some(slide_ms),
                 gap_ms: None,
                 group_columns: vec![],
+                aggs: vec![],
+                filter_sql: None,
+                source: String::new(),
             }
         }
         "SESSION" => {
@@ -197,6 +340,9 @@ fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
                 slide_ms: None,
                 gap_ms: Some(interval_ms(args[1])?),
                 group_columns: vec![],
+                aggs: vec![],
+                filter_sql: None,
+                source: String::new(),
             }
         }
         _ => unreachable!("nombre ya filtrado"),
@@ -374,8 +520,9 @@ mod tests {
     #[test]
     fn tumble_and_hop_come_from_the_ast() {
         let tumble = parse_sql(
-            "INSERT INTO out SELECT order_id, COUNT(*) \
-             FROM orders GROUP BY order_id, TUMBLE(event_time, INTERVAL '1' MINUTE)",
+            "INSERT INTO out SELECT order_id, COUNT(*) AS event_count \
+             FROM orders WHERE status <> 'cancelled' \
+             GROUP BY order_id, TUMBLE(event_time, INTERVAL '1' MINUTE)",
         )
         .unwrap();
         let shape = tumble.window.expect("tumble");
@@ -383,9 +530,13 @@ mod tests {
         assert_eq!(shape.kind, tachyon_core::WindowKind::Tumble);
         assert_eq!(shape.size_ms, 60_000);
         assert_eq!(shape.group_columns, vec!["order_id"]);
+        assert_eq!(shape.aggs.len(), 1);
+        assert_eq!(shape.aggs[0].alias, "event_count");
+        assert!(shape.rewrite_sql().contains("_tachyon_partition"));
+        assert!(shape.rewrite_sql().contains("status <> 'cancelled'"));
 
         let hop = parse_sql(
-            "INSERT INTO out SELECT order_id \
+            "INSERT INTO out SELECT order_id, COUNT(*) AS n \
              FROM orders GROUP BY order_id, HOP(event_time, INTERVAL '5' SECOND, INTERVAL '10' SECOND)",
         )
         .unwrap();
@@ -398,7 +549,7 @@ mod tests {
     #[test]
     fn hop_slide_must_divide_the_size() {
         let err = parse_sql(
-            "INSERT INTO out SELECT order_id FROM orders \
+            "INSERT INTO out SELECT order_id, COUNT(*) AS n FROM orders \
              GROUP BY order_id, HOP(event_time, INTERVAL '3' SECOND, INTERVAL '10' SECOND)",
         )
         .unwrap_err();
