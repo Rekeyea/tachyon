@@ -10,6 +10,7 @@ tachyon-core = { path = "../tachyon-core" }
 arrow.workspace = true
 datafusion.workspace = true
 anyhow.workspace = true
+serde_json = "1"
 # rdkafka con cmake-build: compila librdkafka desde fuente (necesita cmake,
 # que sí está disponible). Sin SSL/SASL (llega si el broker lo exige).
 rdkafka = { version = "0.39", features = ["cmake-build"] }
@@ -17,6 +18,7 @@ rdkafka = { version = "0.39", features = ["cmake-build"] }
 # elimina el overhead por mensaje del poll individual (~3µs/msg).
 rdkafka-sys = "4.10"
 apache-avro = "0.21"
+ureq = { version = "2", default-features = false, features = ["json"] }
 arrow-json = "58"
 # Parseo JSON SIMD in-place para el fast path del decoder (schemas planos).
 simd-json = "0.18"

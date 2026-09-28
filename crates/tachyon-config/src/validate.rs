@@ -11,12 +11,88 @@ use tachyon_core::Error;
 /// Y que los knobs opcionales de despliegue, si están, sean usables. El
 /// presupuesto de CPUs (consumidores, decode) lo deriva el runtime; acá solo
 /// se rechaza lo que no se puede interpretar.
+fn blank(value: Option<&str>) -> bool {
+    value.map(str::trim).unwrap_or("").is_empty()
+}
+
+fn registry_url(cfg: &PipelineConfig) -> Option<&str> {
+    cfg.connectors
+        .schema_registry
+        .as_ref()
+        .map(|registry| registry.url.trim())
+        .filter(|url| !url.is_empty())
+}
+
 pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
-    if cfg.deployment.partitions != cfg.output.bucket {
-        return Err(Error::Alignment {
-            expected: cfg.deployment.partitions,
-            found: cfg.output.bucket,
-        });
+    match (&cfg.output.table, &cfg.output.topic) {
+        (Some(table), None) => {
+            if table.trim().is_empty() {
+                return Err(Error::Config(
+                    "output.table está vacío".to_string(),
+                ));
+            }
+            let Some(bucket) = cfg.output.bucket else {
+                return Err(Error::Config(
+                    "output.bucket es obligatorio cuando la salida es una tabla".to_string(),
+                ));
+            };
+            if cfg.deployment.partitions != bucket {
+                return Err(Error::Alignment {
+                    expected: cfg.deployment.partitions,
+                    found: bucket,
+                });
+            }
+            let warehouse = cfg
+                .connectors
+                .paimon
+                .as_ref()
+                .map(|p| p.warehouse.trim())
+                .unwrap_or("");
+            if warehouse.is_empty() {
+                return Err(Error::Config(
+                    "una salida a tabla requiere connectors.paimon.warehouse".to_string(),
+                ));
+            }
+        }
+        (None, Some(topic)) => {
+            if topic.trim().is_empty() {
+                return Err(Error::Config("output.topic está vacío".to_string()));
+            }
+            if cfg.output.bucket.is_some() {
+                return Err(Error::Config(
+                    "output.bucket pertenece a la tabla; un topic no lo usa".to_string(),
+                ));
+            }
+            if cfg.output.sequence_field.is_some() || cfg.output.rowkind_field.is_some() {
+                return Err(Error::Config(
+                    "sequence_field y rowkind_field pertenecen a la tabla Paimon"
+                        .to_string(),
+                ));
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(Error::Config(
+                "la salida tiene table y topic; hace falta uno solo".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(Error::Config(
+                "la salida necesita output.table o output.topic".to_string(),
+            ));
+        }
+    }
+
+    if cfg.output.format == crate::schema::PayloadFormat::Avro {
+        if cfg.output.topic.is_none() {
+            return Err(Error::Config(
+                "format avro de la salida publica un topic".to_string(),
+            ));
+        }
+        if registry_url(cfg).is_none() {
+            return Err(Error::Config(
+                "format avro requiere connectors.schema_registry.url".to_string(),
+            ));
+        }
     }
 
     for input in &cfg.inputs {
@@ -34,17 +110,28 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
                         input.name
                     )));
                 }
+                if blank(input.schema.as_deref()) {
+                    return Err(Error::Config(format!(
+                        "input '{}': format json requiere schema",
+                        input.name
+                    )));
+                }
             }
             crate::schema::PayloadFormat::Avro => {
-                let missing = input
-                    .avro_schema
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or("")
-                    .is_empty();
-                if missing {
+                let file = !blank(input.avro_schema.as_deref());
+                let arrow = !blank(input.schema.as_deref());
+                if file && arrow {
+                    continue;
+                }
+                if file || arrow {
                     return Err(Error::Config(format!(
-                        "input '{}': format avro requiere avro_schema",
+                        "input '{}': el avro de archivo usa schema y avro_schema juntos",
+                        input.name
+                    )));
+                }
+                if registry_url(cfg).is_none() {
+                    return Err(Error::Config(format!(
+                        "input '{}': format avro sin archivo requiere connectors.schema_registry.url",
                         input.name
                     )));
                 }
@@ -217,11 +304,73 @@ deployment:
     }
 
     #[test]
-    fn avro_requires_its_schema_file() {
+    fn avro_from_a_file_uses_both_schemas() {
         let err = validate_config(&pipeline("    format: avro\n")).unwrap_err();
         assert!(err.to_string().contains("avro_schema"), "{err}");
 
         let ok = pipeline("    format: avro\n    avro_schema: orders.avsc\n");
         assert!(validate_config(&ok).is_ok());
+    }
+
+    #[test]
+    fn avro_from_the_registry_needs_no_schema_file() {
+        let cfg: PipelineConfig = serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  redpanda:
+    brokers: ["localhost:9092"]
+  schema_registry:
+    url: http://localhost:8081
+inputs:
+  - name: orders
+    topic: orders-by-customer
+    key: order_id
+    format: avro
+output:
+  name: orders_json
+  topic: orders-json
+  key: order_id
+deployment:
+  partitions: 1
+"#,
+        )
+        .expect("yaml");
+        assert!(validate_config(&cfg).is_ok(), "{cfg:?}");
+    }
+
+    #[test]
+    fn a_topic_output_does_not_need_a_warehouse() {
+        let cfg: PipelineConfig = serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  redpanda:
+    brokers: ["localhost:9092"]
+inputs:
+  - name: orders
+    topic: orders
+    key: order_id
+    schema: orders.json
+output:
+  name: orders_keyed
+  topic: orders-by-customer
+  key: order_id
+deployment:
+  partitions: 4
+"#,
+        )
+        .expect("yaml");
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn table_and_topic_together_are_rejected() {
+        let mut cfg = pipeline("");
+        cfg.output.topic = Some("orders-by-customer".to_string());
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("table y topic"), "{err}");
     }
 }

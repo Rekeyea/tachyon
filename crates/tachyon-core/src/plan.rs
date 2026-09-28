@@ -24,24 +24,27 @@ pub struct PipelinePlan {
     pub sql_source_tables: Vec<String>,
 }
 
-/// La definición de salida (vinculada a una tabla Paimon).
+/// La definición de salida. Una tabla Paimon o un topic de Redpanda.
 #[derive(Debug)]
 pub struct OutputDef {
     pub name: String,
-    pub table: String,
-    pub bucket: usize,
+    pub table: Option<String>,
+    pub topic: Option<String>,
+    pub bucket: Option<usize>,
     pub sequence_field: Option<String>,
 }
 
 impl PipelinePlan {
     /// Valida el invariante de alineación de conteos (ver DESIGN.md §3.3):
-    /// `partitions == output.bucket`.
+    /// `partitions == output.bucket` cuando la salida es una tabla.
     pub fn validate_alignment(&self) -> Result<(), crate::Error> {
-        if self.partitions != self.output.bucket {
-            return Err(crate::Error::Alignment {
-                expected: self.partitions,
-                found: self.output.bucket,
-            });
+        if let Some(bucket) = self.output.bucket {
+            if self.partitions != bucket {
+                return Err(crate::Error::Alignment {
+                    expected: self.partitions,
+                    found: bucket,
+                });
+            }
         }
         Ok(())
     }

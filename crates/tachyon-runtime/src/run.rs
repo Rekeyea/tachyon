@@ -30,14 +30,20 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
+use rdkafka::consumer::Consumer;
 use rdkafka::ClientConfig;
 use tachyon_config::{parse_fixed_duration, PayloadFormat, PipelineConfig};
 use tachyon_core::{CheckpointBody, SourceOffsets};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
+use tachyon_sink::redpanda::RedpandaSink;
 use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, PartitionTickets, Recovered};
 use tachyon_source::consumer::RdkafkaSource;
 use tachyon_source::{StateRequest, WindowHandoff};
 use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
+use tachyon_source::{
+    arrow_from_avro, avro_json_from_arrow, encode_envelopes, latest_topic_schema,
+    register_topic_schema, SchemaCache,
+};
 use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
 use tachyon_sql::WindowShape;
 
@@ -230,6 +236,9 @@ fn source_client_config(
     cc.set("group.id", group_id);
     cc.set("auto.offset.reset", "earliest");
     cc.set("enable.auto.commit", "false");
+    // Un topic escrito con transacción esconde el lote hasta el commit. Los
+    // mensajes sin transacción siguen llegando.
+    cc.set("isolation.level", "read_committed");
     cc.set("session.timeout.ms", "10000");
     // El broker acumula hasta `fetch.min.bytes` antes de responder. Con el
     // default de 1 byte cada round trip trae poquísimas filas y el throughput
@@ -286,12 +295,29 @@ impl PreparedInput {
             format: DecodeFormat::Avro(parse_avro_schema(avsc)?),
         })
     }
+
+    /// El Arrow y el decoder salen del último schema de `{topic}-value`.
+    pub fn from_registry(url: &str, topic: &str) -> Result<Self> {
+        let (id, avsc) = latest_topic_schema(url, topic)?;
+        let avro = parse_avro_schema(&avsc)?;
+        let arrow = arrow_from_avro(&avro)?;
+        Ok(Self {
+            schema: arrow,
+            format: DecodeFormat::Registry(Arc::new(SchemaCache::new(
+                url.to_string(),
+                id,
+                avro,
+            ))),
+        })
+    }
 }
 
 fn format_matches(declared: PayloadFormat, format: &DecodeFormat) -> bool {
     matches!(
         (declared, format),
-        (PayloadFormat::Json, DecodeFormat::Json) | (PayloadFormat::Avro, DecodeFormat::Avro(_))
+        (PayloadFormat::Json, DecodeFormat::Json)
+            | (PayloadFormat::Avro, DecodeFormat::Avro(_))
+            | (PayloadFormat::Avro, DecodeFormat::Registry(_))
     )
 }
 
@@ -773,6 +799,273 @@ pub async fn run_pipeline(
         metrics_addr,
         metrics: metrics.clone(),
     })
+}
+
+/// Publica la salida en un topic. El commit es una transacción de Redpanda:
+/// los registros y los offsets de entrada aparecen juntos. Un consumidor con
+/// `read_committed` no ve un lote cuyo commit no terminó.
+///
+/// Un solo input y un solo consumidor: la transacción commitea el grupo de
+/// ese miembro. Una ventana no entra por acá: su estado vive en el warehouse.
+pub async fn run_topic_pipeline(
+    config: &PipelineConfig,
+    select_sql: &str,
+    options: &RunOptions,
+    topic: &str,
+    key: &str,
+    input_codecs: &std::collections::HashMap<String, PreparedInput>,
+    metrics: &Arc<InstanceMetrics>,
+) -> Result<PipelineHandle> {
+    if config.inputs.len() != 1 {
+        anyhow::bail!(
+            "el sink a un topic tiene un solo input: la transacción commitea un consumer group"
+        );
+    }
+    if config
+        .deployment
+        .consumers_per_topic
+        .is_some_and(|count| count != 1)
+    {
+        anyhow::bail!(
+            "el sink a un topic usa un consumidor: la transacción commitea los offsets de ese miembro"
+        );
+    }
+    let budget = StatelessBudget::resolve(config).context("presupuesto del pipeline")?;
+    tracing::info!(
+        cpus = budget.cpus,
+        batch_size = budget.batch_size,
+        topic,
+        transactional_id = %options.commit_user,
+        "exactly-once activo (topic); el commit es la transacción de Redpanda"
+    );
+
+    let metrics_addr = if let Some(bind) = options.metrics_bind {
+        let server = MetricsServer::new(bind, metrics.clone());
+        Some(server.start().await.context("arrancando métricas")?)
+    } else {
+        None
+    };
+
+    let brokers = config.connectors.redpanda.brokers.join(",");
+    ensure_topic_partitions(&brokers, topic, config.deployment.partitions).await?;
+
+    let input_def = &config.inputs[0];
+    let prepared = input_codecs
+        .get(&input_def.name)
+        .cloned()
+        .with_context(|| format!("sin schema para el input '{}'", input_def.name))?;
+    if !format_matches(input_def.format, &prepared.format) {
+        anyhow::bail!(
+            "el input '{}' declara format {:?} pero el codec cargado no coincide",
+            input_def.name,
+            input_def.format
+        );
+    }
+    let source_group = format!("{}-{}", options.group_id, input_def.name);
+    let mut source_cc = source_client_config(config, &options.group_id, &budget);
+    source_cc.set("group.id", &source_group);
+    let source = Arc::new(
+        RdkafkaSource::new(&source_cc, &input_def.topic)
+            .with_context(|| format!("creando source para '{}'", input_def.name))?
+            .with_max_batch(budget.batch_size),
+    );
+    let tracker = OffsetTracker::new();
+    let stream_tracker = tracker.clone();
+    let input_sources = vec![source.clone()];
+    let decoder_format = prepared.format.clone();
+    let batch_size = budget.batch_size;
+    let decode_parallelism = budget.decode_parallelism;
+    let input_name = input_def.name.clone();
+    let input_schema = prepared.schema.clone();
+    let factory: Box<StreamTableFactory> = Box::new(move |name, schema| {
+        if name != input_name {
+            anyhow::bail!("source no encontrado para '{name}'");
+        }
+        let decoder = Decoder::new(schema.clone(), decoder_format.clone());
+        let sources = input_sources.clone();
+        let make_stream = Arc::new(move || {
+            let merged: tachyon_source::consumer::RecordStream =
+                Box::pin(futures::stream::select_all(
+                    sources.iter().map(|s| s.record_stream()),
+                ));
+            merged
+        });
+        let ps = Arc::new(
+            RedpandaPartitionStream::new(0, schema.clone(), decoder, batch_size, make_stream)
+                .with_offset_tracker(stream_tracker.clone())
+                .with_decode_parallelism(decode_parallelism),
+        );
+        let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, vec![ps])
+            .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+        Ok(Arc::new(table.with_infinite_table(true)))
+    });
+    let inputs = vec![InputSource {
+        name: input_def.name.clone(),
+        schema: input_schema,
+    }];
+    let (plan, task_ctx) = plan_query(select_sql, &inputs, &factory)
+        .await
+        .context("planificando la transformación")?;
+    ensure_passthrough(&plan).context("la transformación no admite exactly-once")?;
+    let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
+        .context("ejecutando la transformación")?;
+    let out_schema = stream.schema();
+    let key_field = out_schema
+        .field_with_name(key)
+        .map_err(|_| anyhow::anyhow!("la salida no tiene la clave '{key}'"))?;
+    match key_field.data_type() {
+        arrow::datatypes::DataType::Int64
+        | arrow::datatypes::DataType::Int32
+        | arrow::datatypes::DataType::Utf8 => {}
+        other => anyhow::bail!(
+            "la clave '{key}' es {other}; el topic la publica como Int64, Int32 o Utf8"
+        ),
+    }
+
+    let timeout_ms = (options.commit_interval.as_millis() as u64)
+        .saturating_mul(4)
+        .max(120_000);
+    let wire = match config.output.format {
+        PayloadFormat::Json => TopicWire::Json,
+        PayloadFormat::Avro => {
+            let url = config
+                .connectors
+                .schema_registry
+                .as_ref()
+                .context("format avro requiere connectors.schema_registry.url")?
+                .url
+                .clone();
+            let avsc = avro_json_from_arrow(out_schema.as_ref())?;
+            let schema = parse_avro_schema(&avsc)?;
+            let id = register_topic_schema(&url, topic, &avsc)
+                .context("registrando el schema de la salida")?;
+            tracing::info!(topic, schema_id = id, "schema de salida registrado");
+            TopicWire::Avro { schema, id }
+        }
+    };
+    let sink = RedpandaSink::open(&brokers, topic, key, &options.commit_user, timeout_ms).await?;
+    let input_topic = input_def.topic.clone();
+
+    // El snapshot se toma cuando `next()` vuelve, antes de tirar del siguiente
+    // lote: en un pass-through ese mapa es exactamente lo que esta salida cubre.
+    let snap_tracker = tracker;
+    let (batch_tx, mut batch_rx) =
+        tokio::sync::mpsc::channel::<(Result<arrow::array::RecordBatch, datafusion::error::DataFusionError>, BTreeMap<i32, i64>)>(1);
+    let stream_task = tokio::spawn(async move {
+        while let Some(item) = stream.next().await {
+            let snap = snap_tracker.snapshot();
+            if batch_tx.send((item, snap)).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _stop_stream = AbortOnDrop(stream_task);
+
+    let mut tick = tokio::time::interval(options.commit_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    let mut offsets = SourceOffsets::new();
+    let mut in_txn = false;
+    loop {
+        tokio::select! {
+            batch = batch_rx.recv() => {
+                match batch {
+                    Some((batch, snap)) => {
+                        let batch = batch.context("batch de salida")?;
+                        if !in_txn {
+                            sink.begin().await?;
+                            in_txn = true;
+                        }
+                        let rows = match &wire {
+                            TopicWire::Json => sink.write(&batch).await.context("publicando el batch")?,
+                            TopicWire::Avro { schema, id } => {
+                                let records = encode_envelopes(&batch, key, schema, *id)
+                                    .context("codificando Avro")?;
+                                sink.write_records(&records)
+                                    .await
+                                    .context("publicando el batch")?
+                            }
+                        };
+                        let mut covered = SourceOffsets::new();
+                        covered.insert(input_topic.clone(), snap);
+                        merge_offsets(&mut offsets, &covered);
+                        metrics.inc_rows_read(rows as u64);
+                        metrics.inc_rows_written(rows as u64);
+                    }
+                    None => break,
+                }
+            }
+            _ = tick.tick() => {
+                if in_txn {
+                    commit_topic_epoch(&sink, &source, &input_topic, &offsets).await?;
+                    in_txn = false;
+                    metrics.inc_commits();
+                    tracing::info!(topic, "transacción de topic commiteada");
+                }
+            }
+        }
+    }
+    if in_txn {
+        commit_topic_epoch(&sink, &source, &input_topic, &offsets).await?;
+        metrics.inc_commits();
+    }
+    Ok(PipelineHandle {
+        metrics_addr,
+        metrics: metrics.clone(),
+    })
+}
+
+enum TopicWire {
+    Json,
+    Avro {
+        schema: std::sync::Arc<apache_avro::Schema>,
+        id: i32,
+    },
+}
+
+async fn commit_topic_epoch(
+    sink: &RedpandaSink,
+    source: &RdkafkaSource,
+    input_topic: &str,
+    offsets: &SourceOffsets,
+) -> Result<()> {
+    let parts = offsets
+        .get(input_topic)
+        .cloned()
+        .unwrap_or_default();
+    if parts.is_empty() {
+        anyhow::bail!("el epoch publicó filas y no tiene offsets de entrada");
+    }
+    let metadata = source.group_metadata().await.context("metadata del grupo")?;
+    sink.send_input_offsets(metadata.as_ptr(), input_topic, &parts)
+        .context("adjuntando offsets a la transacción")?;
+    sink.commit().await?;
+    Ok(())
+}
+
+async fn ensure_topic_partitions(brokers: &str, topic: &str, expected: usize) -> Result<()> {
+    let probe: rdkafka::consumer::BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .context("cliente para leer la metadata del topic")?;
+    let metadata = probe
+        .fetch_metadata(Some(topic), Duration::from_secs(10))
+        .with_context(|| format!("metadata de '{topic}'"))?;
+    let found = metadata
+        .topics()
+        .iter()
+        .find(|item| item.name() == topic)
+        .with_context(|| format!("el topic '{topic}' no está en la metadata"))?;
+    if let Some(err) = found.error() {
+        anyhow::bail!("el topic '{topic}' no se puede leer: {err:?}");
+    }
+    let partitions = found.partitions().len();
+    if partitions != expected {
+        anyhow::bail!(
+            "el topic '{topic}' tiene {partitions} particiones y deployment.partitions es {expected}"
+        );
+    }
+    Ok(())
 }
 
 fn validate_window(

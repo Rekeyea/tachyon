@@ -50,9 +50,9 @@ pub struct RdkafkaSource {
     /// al task de poll en `record_stream`.
     resume: Mutex<Option<BTreeMap<i32, i64>>>,
     /// Canal de comandos de commit hacia el task de poll.
-    commit_tx: tokio::sync::mpsc::UnboundedSender<CommitCommand>,
+    commit_tx: tokio::sync::mpsc::UnboundedSender<PollCommand>,
     /// Receiver del canal de commit (se mueve al task de poll en `record_stream`).
-    commit_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CommitCommand>>>,
+    commit_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PollCommand>>>,
     /// Tope de registros por envío al canal. Igual al `batch_size` del
     /// decoder: un lote del broker = un `RecordBatch`.
     max_batch: usize,
@@ -61,14 +61,37 @@ pub struct RdkafkaSource {
     handoff: Mutex<Option<(Arc<WindowHandoff>, u64)>>,
 }
 
-/// Comando de commit de offsets: el task de poll lo ejecuta sobre el
-/// `NativeConsumer` que posee y responde con el resultado.
-struct CommitCommand {
+/// Comando hacia el task de poll, que es el dueño del `NativeConsumer`.
+enum PollCommand {
     /// Offsets a commitear (partición -> próximo offset). Son los del
     /// checkpoint, NO la posición del consumer (que va por delante de lo que
     /// llegó a Paimon: commitearla perdería los registros en vuelo).
-    offsets: BTreeMap<i32, i64>,
-    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    Commit {
+        offsets: BTreeMap<i32, i64>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Copia del metadata del grupo, para `send_offsets_to_transaction`.
+    GroupMetadata {
+        reply: tokio::sync::oneshot::Sender<Result<GroupMetadata, String>>,
+    },
+}
+
+/// Copia del membership del consumer group. Se puede usar desde otro hilo
+/// para incluir los offsets de entrada en una transacción del productor.
+pub struct GroupMetadata(*mut rdsys::rd_kafka_consumer_group_metadata_t);
+
+unsafe impl Send for GroupMetadata {}
+
+impl GroupMetadata {
+    pub fn as_ptr(&self) -> *const rdsys::rd_kafka_consumer_group_metadata_t {
+        self.0
+    }
+}
+
+impl Drop for GroupMetadata {
+    fn drop(&mut self) {
+        unsafe { rdsys::rd_kafka_consumer_group_metadata_destroy(self.0) }
+    }
 }
 
 /// Consumidor nativo de librdkafka (FFI directo).
@@ -666,7 +689,7 @@ impl RdkafkaSource {
         }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.commit_tx
-            .send(CommitCommand {
+            .send(PollCommand::Commit {
                 offsets: offsets.clone(),
                 reply: reply_tx,
             })
@@ -675,6 +698,21 @@ impl RdkafkaSource {
             .await
             .map_err(|_| anyhow::anyhow!("timeout esperando el commit de offsets"))?
             .map_err(|_| anyhow::anyhow!("el task de poll terminó antes de commitar"))?;
+        result.map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Metadata del grupo de este consumidor. El sink a un topic lo adjunta
+    /// a la transacción que publica el lote, para que los offsets de entrada
+    /// se commiteen junto con esos registros.
+    pub async fn group_metadata(&self) -> Result<GroupMetadata> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.commit_tx
+            .send(PollCommand::GroupMetadata { reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("task de poll no disponible para el metadata del grupo"))?;
+        let result = tokio::time::timeout(Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("timeout esperando el metadata del grupo"))?
+            .map_err(|_| anyhow::anyhow!("el task de poll terminó antes del metadata"))?;
         result.map_err(|e| anyhow::anyhow!(e))
     }
 
@@ -806,9 +844,22 @@ impl RdkafkaSource {
                     // bloquea el poll (un Sync aquí paralizaba el consumo).
                     loop {
                         match commit_rx.try_recv() {
-                            Ok(cmd) => {
-                                let result = consumer.commit(&cmd.offsets);
-                                let _ = cmd.reply.send(result);
+                            Ok(PollCommand::Commit { offsets, reply }) => {
+                                let result = consumer.commit(&offsets);
+                                let _ = reply.send(result);
+                            }
+                            Ok(PollCommand::GroupMetadata { reply }) => {
+                                let ptr = unsafe {
+                                    rdsys::rd_kafka_consumer_group_metadata(consumer.rk)
+                                };
+                                let result = if ptr.is_null() {
+                                    Err(
+                                        "el consumidor todavía no entró al grupo".to_string(),
+                                    )
+                                } else {
+                                    Ok(GroupMetadata(ptr))
+                                };
+                                let _ = reply.send(result);
                             }
                             Err(_) => break, // Empty o Disconnected
                         }

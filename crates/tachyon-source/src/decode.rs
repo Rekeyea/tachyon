@@ -26,8 +26,10 @@ use apache_avro::types::Value as AvroValue;
 pub enum DecodeFormat {
     /// JSON (un objeto por mensaje).
     Json,
-    /// Avro (con el schema Avro).
+    /// Avro de un `.avsc`: datum crudo o object container, un solo schema.
     Avro(Arc<AvroSchema>),
+    /// Avro del registry: envelope `0x00` + id. El Arrow es el último schema.
+    Registry(Arc<crate::schema_wire::SchemaCache>),
 }
 
 /// Header de un object container Avro (`Obj` + versión 1).
@@ -84,7 +86,26 @@ impl Decoder {
             DecodeFormat::Json if self.fast_json => self.decode_json_simd(values),
             DecodeFormat::Json => self.decode_json_arrow(values),
             DecodeFormat::Avro(schema) => self.decode_avro(values, schema),
+            DecodeFormat::Registry(cache) => self.decode_registry(values, cache),
         }
+    }
+
+    fn decode_registry(
+        &self,
+        values: &[Vec<u8>],
+        cache: &crate::schema_wire::SchemaCache,
+    ) -> Result<RecordBatch> {
+        let mut records = Vec::with_capacity(values.len());
+        for (row, payload) in values.iter().enumerate() {
+            let id = crate::schema_wire::envelope_id(payload).with_context(|| {
+                format!("el mensaje {row} no trae el id de schema (0x00 + id)")
+            })?;
+            let writer = cache.writer(id)?;
+            let value = crate::schema_wire::decode_envelope(payload, &writer, &cache.reader)
+                .with_context(|| format!("mensaje {row}, schema {id}"))?;
+            records.push(value);
+        }
+        build_avro_batch(&self.schema, &records)
     }
 
     /// JSON fast path: parseo SIMD **in-place** (simd-json) directo a columnas
@@ -301,6 +322,11 @@ fn build_array(data_type: &DataType, values: &[Option<&AvroValue>]) -> Result<Ar
             let arr: Int64Array = values.iter().map(|v| v.and_then(extract_i64)).collect();
             Ok(Arc::new(arr))
         }
+        DataType::Int32 => {
+            let arr: arrow::array::Int32Array =
+                values.iter().map(|v| v.and_then(extract_i32)).collect();
+            Ok(Arc::new(arr))
+        }
         DataType::Float64 => {
             let arr: Float64Array = values.iter().map(|v| v.and_then(extract_f64)).collect();
             Ok(Arc::new(arr))
@@ -319,16 +345,30 @@ fn build_array(data_type: &DataType, values: &[Option<&AvroValue>]) -> Result<Ar
     }
 }
 
+fn peel(value: &AvroValue) -> &AvroValue {
+    match value {
+        AvroValue::Union(_, inner) => peel(inner),
+        other => other,
+    }
+}
+
 fn extract_i64(v: &AvroValue) -> Option<i64> {
-    match v {
+    match peel(v) {
         AvroValue::Long(n) => Some(*n),
         AvroValue::Int(n) => Some(*n as i64),
         _ => None,
     }
 }
 
+fn extract_i32(v: &AvroValue) -> Option<i32> {
+    match peel(v) {
+        AvroValue::Int(n) => Some(*n),
+        _ => None,
+    }
+}
+
 fn extract_f64(v: &AvroValue) -> Option<f64> {
-    match v {
+    match peel(v) {
         AvroValue::Double(f) => Some(*f),
         AvroValue::Float(f) => Some(*f as f64),
         _ => None,
@@ -336,14 +376,14 @@ fn extract_f64(v: &AvroValue) -> Option<f64> {
 }
 
 fn extract_str(v: &AvroValue) -> Option<&str> {
-    match v {
+    match peel(v) {
         AvroValue::String(s) => Some(s.as_str()),
         _ => None,
     }
 }
 
 fn extract_bool(v: &AvroValue) -> Option<bool> {
-    match v {
+    match peel(v) {
         AvroValue::Boolean(b) => Some(*b),
         _ => None,
     }

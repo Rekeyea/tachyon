@@ -11,7 +11,7 @@ use tachyon_metrics::InstanceMetrics;
 use tachyon_sink::writer::PaimonSink;
 use tachyon_sql::{parse_sql, WindowShape};
 
-use crate::run::{run_pipeline, PipelineHandle, PreparedInput, RunOptions};
+use crate::run::{run_pipeline, run_topic_pipeline, PipelineHandle, PreparedInput, RunOptions};
 
 /// Un pipeline de Tachyon (una instancia).
 #[derive(Debug)]
@@ -49,6 +49,7 @@ impl Pipeline {
             output: OutputDef {
                 name: config.output.name.clone(),
                 table: config.output.table.clone(),
+                topic: config.output.topic.clone(),
                 bucket: config.output.bucket,
                 sequence_field: config.output.sequence_field.clone(),
             },
@@ -82,18 +83,57 @@ impl Pipeline {
         &self,
         input_codecs: &std::collections::HashMap<String, PreparedInput>,
     ) -> Result<PipelineHandle> {
+        if let Some(topic) = &self.config.output.topic {
+            if self.window.is_some() {
+                anyhow::bail!(
+                    "una ventana escribe en Paimon: el topic no conserva las ventanas abiertas"
+                );
+            }
+            let options = RunOptions::from_config(&self.config);
+            let metrics = Arc::new(InstanceMetrics::new());
+            return run_topic_pipeline(
+                &self.config,
+                &self.select_sql,
+                &options,
+                topic,
+                &self.config.output.key,
+                input_codecs,
+                &metrics,
+            )
+            .await;
+        }
+
         // Abrir el sink Paimon desde el warehouse de la config.
-        let (db, table) = split_table_identifier(&self.config.output.table);
+        let table_id = self
+            .config
+            .output
+            .table
+            .as_deref()
+            .context("la salida no tiene tabla")?;
+        let (db, table) = split_table_identifier(table_id);
+        let warehouse = self
+            .config
+            .connectors
+            .paimon
+            .as_ref()
+            .context("la salida a tabla requiere connectors.paimon")?
+            .warehouse
+            .as_str();
+        let bucket = self
+            .config
+            .output
+            .bucket
+            .context("la salida a tabla requiere output.bucket")?;
         let sink = PaimonSink::open(
-            &self.config.connectors.paimon.warehouse,
+            warehouse,
             &db,
             &table,
             &self.config.output.key,
-            self.config.output.bucket as i32,
+            bucket as i32,
             self.config.output.sequence_field.as_deref(),
         )
         .await
-        .with_context(|| format!("abriendo sink Paimon para {}", self.config.output.table))?;
+        .with_context(|| format!("abriendo sink Paimon para {table_id}"))?;
 
         let options = RunOptions::from_config(&self.config);
         let metrics = Arc::new(InstanceMetrics::new());

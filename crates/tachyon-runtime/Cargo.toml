@@ -19,10 +19,12 @@ tokio.workspace = true
 arrow.workspace = true
 futures = "0.3"
 rdkafka = { version = "0.39", features = ["cmake-build"] }
+apache-avro = "0.21"
 
 [dev-dependencies]
 serde_yaml.workspace = true
 anyhow.workspace = true
 paimon = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
 libc = "0.2"

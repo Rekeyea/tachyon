@@ -26,7 +26,18 @@ fn default_version() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Connectors {
     pub redpanda: RedpandaConfig,
-    pub paimon: PaimonConfig,
+    /// Ausente cuando la salida es un topic: esa pipeline no abre warehouse.
+    #[serde(default)]
+    pub paimon: Option<PaimonConfig>,
+    /// Registry de Redpanda. Con `format: avro` el schema del `SELECT` se
+    /// registra ahí y el mensaje lleva el id.
+    #[serde(default)]
+    pub schema_registry: Option<SchemaRegistryConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SchemaRegistryConfig {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,8 +86,10 @@ pub struct InputDef {
     pub topic: String,
     /// Clave de particionado (== state key == bucket key).
     pub key: String,
-    /// Ruta al schema Arrow de las columnas que ve el SQL.
-    pub schema: String,
+    /// Ruta al schema Arrow de las columnas que ve el SQL. Ausente cuando
+    /// `format: avro` y el schema sale del registry.
+    #[serde(default)]
+    pub schema: Option<String>,
     /// Codificación del payload. Default: `json`.
     #[serde(default)]
     pub format: PayloadFormat,
@@ -99,15 +112,29 @@ pub struct WatermarkConfig {
     pub idle: Option<String>,
 }
 
-/// La salida (vincula nombre lógico -> tabla Paimon).
+/// La salida. Un pipeline tiene una: una tabla Paimon (`table`) o un topic
+/// de Redpanda (`topic`). El nombre lógico es el del `INSERT INTO`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OutputConfig {
     pub name: String,
-    pub table: String,
+    /// `db.tabla` en el warehouse. Excluyente con `topic`.
+    #[serde(default)]
+    pub table: Option<String>,
+    /// Topic de salida. La clave del mensaje es `key`, para que dos pipelines
+    /// que escriben la misma clave caigan en la misma partición.
+    #[serde(default)]
+    pub topic: Option<String>,
     pub key: String,
-    pub bucket: usize,
+    /// Buckets de la tabla. Obligatorio con `table`. `deployment.partitions`
+    /// tiene que igualarlo.
+    #[serde(default)]
+    pub bucket: Option<usize>,
     pub sequence_field: Option<String>,
     pub rowkind_field: Option<String>,
+    /// Codificación del topic de salida. Default: JSON. `avro` registra el
+    /// schema del `SELECT` y escribe el envelope `0x00` + id + datum.
+    #[serde(default)]
+    pub format: PayloadFormat,
 }
 
 #[derive(Debug, Clone, Deserialize)]

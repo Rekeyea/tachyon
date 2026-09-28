@@ -108,20 +108,42 @@ fn main() -> Result<()> {
     // topic es Avro, el .avsc solo sirve para decodificar el mensaje una vez.
     let mut input_codecs: HashMap<String, PreparedInput> = HashMap::new();
     for input in &config.inputs {
-        let arrow_path = resolve_schema_path(&input.schema, args.schemas_dir.as_ref())?;
-        let arrow = load_schema(&arrow_path)?;
         let prepared = match input.format {
-            PayloadFormat::Json => PreparedInput::json(arrow),
-            PayloadFormat::Avro => {
-                let spec = input.avro_schema.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("input '{}': format avro requiere avro_schema", input.name)
+            PayloadFormat::Json => {
+                let spec = input.schema.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("input '{}': format json requiere schema", input.name)
                 })?;
-                let avro_path = resolve_schema_path(spec, args.schemas_dir.as_ref())?;
+                let arrow_path = resolve_schema_path(spec, args.schemas_dir.as_ref())?;
+                PreparedInput::json(load_schema(&arrow_path)?)
+            }
+            PayloadFormat::Avro if input.avro_schema.is_some() => {
+                let spec = input.schema.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("input '{}': el avro de archivo requiere schema", input.name)
+                })?;
+                let arrow = load_schema(&resolve_schema_path(spec, args.schemas_dir.as_ref())?)?;
+                let avro_spec = input.avro_schema.as_deref().expect("avro_schema");
+                let avro_path = resolve_schema_path(avro_spec, args.schemas_dir.as_ref())?;
                 let avsc = std::fs::read_to_string(&avro_path).with_context(|| {
                     format!("leyendo schema Avro {}", avro_path.display())
                 })?;
                 PreparedInput::from_avsc(arrow, &avsc).with_context(|| {
                     format!("parseando schema Avro de '{}'", input.name)
+                })?
+            }
+            PayloadFormat::Avro => {
+                let url = config
+                    .connectors
+                    .schema_registry
+                    .as_ref()
+                    .map(|registry| registry.url.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "input '{}': format avro sin archivo requiere connectors.schema_registry.url",
+                            input.name
+                        )
+                    })?;
+                PreparedInput::from_registry(url, &input.topic).with_context(|| {
+                    format!("leyendo el schema de '{}'", input.name)
                 })?
             }
         };
