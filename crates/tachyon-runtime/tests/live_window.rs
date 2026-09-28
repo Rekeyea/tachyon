@@ -28,7 +28,7 @@ fn input_schema() -> Arc<Schema> {
     ]))
 }
 
-fn config_yaml(warehouse: &str) -> PipelineConfig {
+fn config_yaml(warehouse: &str, topic: &str, table: &str) -> PipelineConfig {
     serde_yaml::from_str(&format!(
         r#"
 pipeline:
@@ -42,7 +42,7 @@ connectors:
     catalog: local
 inputs:
   - name: orders
-    topic: {TOPIC}
+    topic: {topic}
     key: order_id
     schema: json/orders
     watermark:
@@ -50,7 +50,7 @@ inputs:
       lag: 1ms
 output:
   name: orders_lake
-  table: default.orders_window
+  table: default.{table}
   key: order_id
   bucket: 1
   sequence_field: window_end
@@ -60,6 +60,55 @@ deployment:
 "#
     ))
     .expect("config")
+}
+
+async fn fresh_topic(topic: &str) {
+    let mut cc = ClientConfig::new();
+    cc.set("bootstrap.servers", BROKER);
+    let admin: AdminClient<DefaultClientContext> = cc.create().expect("admin");
+    let _ = admin.delete_topics(&[topic], &Default::default()).await;
+    admin
+        .create_topics(
+            &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
+            &Default::default(),
+        )
+        .await
+        .expect("topic");
+}
+
+async fn produce(topic: &str, events: &[(i64, i64)]) {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", BROKER)
+        .create()
+        .expect("producer");
+    for (t, amount) in events {
+        let payload = format!(
+            "{{\"order_id\":1,\"event_time\":{t},\"amount\":{amount}}}"
+        );
+        producer
+            .send(
+                FutureRecord::to(topic).key("1").payload(&payload),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("produce");
+    }
+}
+
+fn read_windows(batches: &[arrow::array::RecordBatch]) -> Vec<(i64, i64, i64, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch.column_by_name("order_id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let starts = batch.column_by_name("window_start").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let ends = batch.column_by_name("window_end").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let ns = batch.column_by_name("n").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let amounts = batch.column_by_name("amount").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((ids.value(i), starts.value(i), ends.value(i), ns.value(i), amounts.value(i)));
+        }
+    }
+    rows.sort();
+    rows
 }
 
 #[tokio::test]
@@ -133,7 +182,7 @@ async fn live_tumble_minute_closes_into_paimon() {
                FROM orders \
                GROUP BY order_id, TUMBLE(event_time, INTERVAL '1' MINUTE)";
     let parsed = parse_sql(sql).expect("sql");
-    let config = Arc::new(config_yaml(&warehouse));
+    let config = Arc::new(config_yaml(&warehouse, TOPIC, "orders_window"));
     let options = RunOptions {
         commit_interval: Duration::from_secs(2),
         metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
@@ -215,4 +264,158 @@ async fn live_tumble_minute_closes_into_paimon() {
         "se esperaba la ventana [0, 60000) con dos eventos"
     );
     let _ = std::fs::remove_dir_all(&warehouse);
+}
+
+#[tokio::test]
+#[ignore = "requiere Redpanda local en localhost:9092"]
+async fn live_hop_puts_one_event_in_two_windows() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
+    let topic = format!("tachyon-hop-{}", std::process::id());
+    let warehouse = std::env::temp_dir().join(format!("tachyon-hop-wh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&warehouse);
+    std::fs::create_dir_all(&warehouse).expect("warehouse");
+    let warehouse = warehouse.to_string_lossy().to_string();
+    let table = create_test_table(
+        &warehouse,
+        "default",
+        "orders_hop",
+        &[
+            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            ("window_start", PDataType::BigInt(BigIntType::with_nullable(false))),
+            ("window_end", PDataType::BigInt(BigIntType::new())),
+            ("n", PDataType::BigInt(BigIntType::new())),
+            ("amount", PDataType::BigInt(BigIntType::new())),
+        ],
+        &["order_id", "window_start"],
+        1,
+        Some("window_end"),
+    )
+    .await
+    .expect("tabla");
+    fresh_topic(&topic).await;
+    // 12s cae en [5s, 15s) y [10s, 20s). 20.001s sube el watermark por encima
+    // de 20s (el lag es 1ms) y cierra esas dos. No entra en ninguna de las dos.
+    produce(&topic, &[(12_000, 3), (20_001, 1)]).await;
+
+    let sql = "INSERT INTO orders_lake \
+               SELECT order_id, window_start, window_end, COUNT(*) AS n, SUM(amount) AS amount \
+               FROM orders \
+               GROUP BY order_id, HOP(event_time, INTERVAL '5' SECOND, INTERVAL '10' SECOND)";
+    let rows = run_until(&warehouse, &topic, "orders_hop", &table, sql, 2).await;
+    assert_eq!(
+        rows,
+        vec![(1, 5_000, 15_000, 1, 3), (1, 10_000, 20_000, 1, 3)],
+        "un evento de hop tiene que salir en dos ventanas"
+    );
+    let _ = std::fs::remove_dir_all(&warehouse);
+}
+
+#[tokio::test]
+#[ignore = "requiere Redpanda local en localhost:9092"]
+async fn live_session_merges_inside_the_gap() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
+    let topic = format!("tachyon-session-{}", std::process::id());
+    let warehouse = std::env::temp_dir().join(format!("tachyon-session-wh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&warehouse);
+    std::fs::create_dir_all(&warehouse).expect("warehouse");
+    let warehouse = warehouse.to_string_lossy().to_string();
+    let table = create_test_table(
+        &warehouse,
+        "default",
+        "orders_session",
+        &[
+            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            ("window_start", PDataType::BigInt(BigIntType::with_nullable(false))),
+            ("window_end", PDataType::BigInt(BigIntType::new())),
+            ("n", PDataType::BigInt(BigIntType::new())),
+            ("amount", PDataType::BigInt(BigIntType::new())),
+        ],
+        &["order_id", "window_start"],
+        1,
+        Some("window_end"),
+    )
+    .await
+    .expect("tabla");
+    fresh_topic(&topic).await;
+    // 0 y 4s se fusionan. 9s cae justo en fin+gap y abre otra. 20s cierra las dos.
+    produce(&topic, &[(0, 2), (4_000, 3), (9_000, 1), (20_000, 1)]).await;
+
+    let sql = "INSERT INTO orders_lake \
+               SELECT order_id, window_start, window_end, COUNT(*) AS n, SUM(amount) AS amount \
+               FROM orders \
+               GROUP BY order_id, SESSION(event_time, INTERVAL '5' SECOND)";
+    let rows = run_until(&warehouse, &topic, "orders_session", &table, sql, 2).await;
+    assert_eq!(
+        rows,
+        vec![(1, 0, 4_000, 2, 5), (1, 9_000, 9_000, 1, 1)],
+        "la session de 0 y 4s se fusiona; la de 9s queda aparte"
+    );
+    let _ = std::fs::remove_dir_all(&warehouse);
+}
+
+async fn run_until(
+    warehouse: &str,
+    topic: &str,
+    table_name: &str,
+    table: &paimon::table::Table,
+    sql: &str,
+    want: usize,
+) -> Vec<(i64, i64, i64, i64, i64)> {
+    let parsed = parse_sql(sql).expect("sql");
+    let window = parsed.window.expect("ventana");
+    let select_sql = parsed.select_sql;
+    let config = Arc::new(config_yaml(warehouse, topic, table_name));
+    let options = RunOptions {
+        commit_interval: Duration::from_secs(2),
+        metrics_bind: Some("127.0.0.1:0".parse().unwrap()),
+        group_id: format!("tachyon-{table_name}-{}", std::process::id()),
+        commit_user: format!("tachyon-{table_name}-{}", std::process::id()),
+    };
+    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
+    let codecs = HashMap::from([("orders".to_string(), PreparedInput::json(input_schema()))]);
+    let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
+    let run_task = tokio::spawn(async move {
+        run_pipeline(
+            &config,
+            &select_sql,
+            &options,
+            sink,
+            &codecs,
+            &metrics,
+            Some(&window),
+        )
+        .await
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let mut got = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if run_task.is_finished() {
+            match run_task.await {
+                Ok(Ok(_)) => panic!("el pipeline terminó"),
+                Ok(Err(e)) => panic!("el pipeline falló: {e:#}"),
+                Err(e) => panic!("tarea abortada: {e}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Ok(batches) = read_table_rows(table).await {
+            got = read_windows(&batches);
+            if got.len() >= want {
+                break;
+            }
+        }
+    }
+    run_task.abort();
+    got
 }
