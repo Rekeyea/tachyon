@@ -10,5 +10,5 @@ pub mod runtime;
 
 pub use budget::StatelessBudget;
 pub use execute::{execute_query, InputSource, StreamTable, StreamTableFactory, TransformOutput};
-pub use run::{run_pipeline, PipelineHandle, RunOptions};
+pub use run::{run_pipeline, PipelineHandle, PreparedInput, RunOptions};
 pub use runtime::Pipeline;

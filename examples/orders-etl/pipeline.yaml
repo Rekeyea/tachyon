@@ -13,7 +13,9 @@ inputs:
   - name: orders
     topic: orders-topic
     key: order_id            # == state key == bucket key (invariante de alineación)
-    schema: avro/orders-v1
+    schema: avro/orders-v1   # schema Arrow (columnas que ve el SQL)
+    # format: avro           # default: json. Avro se decodifica una vez a Arrow
+    # avro_schema: orders.avsc
 
 output:
   name: orders_lake

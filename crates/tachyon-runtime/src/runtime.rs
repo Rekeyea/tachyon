@@ -4,15 +4,14 @@
 //! llega en los Slices 2-5 (ver MVP.md §4).
 
 use anyhow::{Context, Result};
-use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
 use tachyon_config::{validate_config, PipelineConfig};
 use tachyon_core::{OutputDef, PartitionKey, PipelinePlan, StreamDef};
 use tachyon_metrics::InstanceMetrics;
 use tachyon_sink::writer::PaimonSink;
-use tachyon_sql::parse_sql;
+use tachyon_sql::{parse_sql, WindowShape};
 
-use crate::run::{run_pipeline, PipelineHandle, RunOptions};
+use crate::run::{run_pipeline, PipelineHandle, PreparedInput, RunOptions};
 
 /// Un pipeline de Tachyon (una instancia).
 #[derive(Debug)]
@@ -20,6 +19,9 @@ pub struct Pipeline {
     plan: PipelinePlan,
     config: PipelineConfig,
     select_sql: String,
+    /// `Some` hasta que el operador de ventanas esté en el loop: el arranque
+    /// se rechaza en vez de mandar `TUMBLE` a DataFusion.
+    window: Option<WindowShape>,
 }
 
 impl Pipeline {
@@ -65,18 +67,27 @@ impl Pipeline {
             plan,
             config: config.clone(),
             select_sql: parsed.select_sql.clone(),
+            window: parsed.window,
         })
     }
 
     /// Corre el pipeline end-to-end (Slice 5): consume Redpanda, transforma con
     /// DataFusion y escribe a Paimon, con commits periódicos + métricas.
     ///
-    /// `input_schemas`: el schema Arrow de cada input (nombre lógico -> schema).
-    /// En producción vienen del schema Avro/JSON del topic; en tests se
-    /// proporcionan explícitamente.
+    /// `input_codecs`: schema Arrow y formato del topic de cada input
+    /// (nombre lógico -> codec). En tests se arman con `PreparedInput::json`.
     ///
     /// No retorna mientras el pipeline esté activo (el stream es infinito).
-    pub async fn run(&self, input_schemas: &std::collections::HashMap<String, SchemaRef>) -> Result<PipelineHandle> {
+    pub async fn run(
+        &self,
+        input_codecs: &std::collections::HashMap<String, PreparedInput>,
+    ) -> Result<PipelineHandle> {
+        if let Some(window) = &self.window {
+            anyhow::bail!(
+                "la query usa {:?} y el operador de ventanas todavía no está cableado",
+                window.kind
+            );
+        }
         // Abrir el sink Paimon desde el warehouse de la config.
         let (db, table) = split_table_identifier(&self.config.output.table);
         let sink = PaimonSink::open(
@@ -97,7 +108,7 @@ impl Pipeline {
             &self.select_sql,
             &options,
             sink,
-            input_schemas,
+            input_codecs,
             &metrics,
         )
         .await

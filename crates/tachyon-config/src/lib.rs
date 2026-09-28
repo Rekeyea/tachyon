@@ -3,5 +3,5 @@
 pub mod schema;
 pub mod validate;
 
-pub use schema::PipelineConfig;
-pub use validate::{parse_cpu_cores, validate_config};
+pub use schema::{PayloadFormat, PipelineConfig};
+pub use validate::{parse_cpu_cores, parse_fixed_duration, validate_config};

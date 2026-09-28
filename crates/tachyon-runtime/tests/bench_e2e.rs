@@ -30,7 +30,7 @@ use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use tachyon_config::PipelineConfig;
-use tachyon_runtime::{run_pipeline, RunOptions, StatelessBudget};
+use tachyon_runtime::{run_pipeline, PreparedInput, RunOptions, StatelessBudget};
 use tachyon_sink::writer::{create_test_table, PaimonSink};
 
 const BROKER: &str = "localhost:9092";
@@ -327,8 +327,10 @@ async fn bench_e2e_sustained_drain() {
     };
     let sink = PaimonSink::from_table(table, "order_id", partitions(), Some("source_version"))
         .expect("sink");
-    let input_schemas: HashMap<String, Arc<Schema>> =
-        HashMap::from([("orders".to_string(), orders_schema())]);
+    let input_schemas = HashMap::from([(
+        "orders".to_string(),
+        PreparedInput::json(orders_schema()),
+    )]);
     let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
     let select_sql = "SELECT order_id, status, source_version, amount FROM orders";
     let metrics_read = metrics.clone();

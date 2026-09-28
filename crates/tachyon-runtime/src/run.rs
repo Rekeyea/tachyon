@@ -30,12 +30,12 @@ use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use rdkafka::ClientConfig;
-use tachyon_config::PipelineConfig;
-use tachyon_core::SourceOffsets;
+use tachyon_config::{PayloadFormat, PipelineConfig};
+use tachyon_core::{CheckpointBody, SourceOffsets};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
-use tachyon_sink::writer::{CheckpointEpoch, PaimonSink};
+use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, Recovered};
 use tachyon_source::consumer::RdkafkaSource;
-use tachyon_source::decode::{DecodeFormat, Decoder};
+use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
 use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
 
 use crate::budget::StatelessBudget;
@@ -191,6 +191,40 @@ fn source_client_config(
     cc
 }
 
+/// Schema Arrow de un input y la codificación de los bytes del topic.
+///
+/// DataFusion y Paimon ven `schema`. `format` solo decide cómo se decodifica
+/// cada mensaje, una vez, en el borde.
+#[derive(Clone)]
+pub struct PreparedInput {
+    pub schema: SchemaRef,
+    pub format: DecodeFormat,
+}
+
+impl PreparedInput {
+    pub fn json(schema: SchemaRef) -> Self {
+        Self {
+            schema,
+            format: DecodeFormat::Json,
+        }
+    }
+
+    /// `avsc` es el texto de un `.avsc`. El schema queda en el decoder.
+    pub fn from_avsc(schema: SchemaRef, avsc: &str) -> Result<Self> {
+        Ok(Self {
+            schema,
+            format: DecodeFormat::Avro(parse_avro_schema(avsc)?),
+        })
+    }
+}
+
+fn format_matches(declared: PayloadFormat, format: &DecodeFormat) -> bool {
+    matches!(
+        (declared, format),
+        (PayloadFormat::Json, DecodeFormat::Json) | (PayloadFormat::Avro, DecodeFormat::Avro(_))
+    )
+}
+
 /// Corre el pipeline end-to-end.
 ///
 /// No retorna mientras el pipeline esté activo (el stream de salida es
@@ -206,9 +240,8 @@ pub async fn run_pipeline(
     // La tabla Paimon ya abierta (para no depender del catalog en el loop).
     // Se pasa por valor: el writer task la posee (write + commit en background).
     sink: PaimonSink,
-    // Schemas de los inputs (nombre lógico -> schema Arrow). En producción
-    // vienen del schema Avro/JSON del topic; en tests se proporcionan.
-    input_schemas: &std::collections::HashMap<String, SchemaRef>,
+    // Codecs de los inputs (nombre lógico -> schema Arrow + formato del topic).
+    input_codecs: &std::collections::HashMap<String, PreparedInput>,
     // Métricas de la instancia (pre-creadas por el caller).
     metrics: &Arc<InstanceMetrics>,
 ) -> Result<PipelineHandle> {
@@ -237,7 +270,15 @@ pub async fn run_pipeline(
     let mut sink = sink
         .with_commit_user(&options.commit_user)
         .context("fijando el commit_user del sink")?;
-    let resume = sink.recover().await.context("recuperando el último checkpoint")?;
+    let resume = match sink.recover().await.context("recuperando el último checkpoint")? {
+        Recovered::None => None,
+        Recovered::PassThrough { offsets, .. } => Some(offsets),
+        Recovered::Window { identifier, .. } => {
+            anyhow::bail!(
+                "checkpoint {identifier} tiene estado de ventana y el plan es pass-through; se rechaza"
+            );
+        }
+    };
     if let Some(offsets) = &resume {
         tracing::info!(?offsets, "reanudando desde el último checkpoint");
     }
@@ -253,16 +294,29 @@ pub async fn run_pipeline(
     let mut inputs: Vec<InputSource> = Vec::new();
     let mut name_to_sources: std::collections::HashMap<
         String,
-        (Vec<Arc<RdkafkaSource>>, OffsetTracker),
+        (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat),
     > = std::collections::HashMap::new();
     let cc = source_client_config(config, &options.group_id, &budget);
     let n_consumers = budget.consumers_per_topic;
 
     for input_def in &config.inputs {
-        let schema = input_schemas
+        let prepared = input_codecs
             .get(&input_def.name)
             .cloned()
             .with_context(|| format!("sin schema para el input '{}'", input_def.name))?;
+        if !format_matches(input_def.format, &prepared.format) {
+            anyhow::bail!(
+                "el input '{}' declara format {:?} pero el codec cargado no coincide",
+                input_def.name,
+                input_def.format
+            );
+        }
+        tracing::info!(
+            input = %input_def.name,
+            format = ?input_def.format,
+            "codec del input"
+        );
+        let schema = prepared.schema.clone();
 
         let source_group = format!("{}-{}", options.group_id, input_def.name);
         let mut source_cc = cc.clone();
@@ -287,7 +341,10 @@ pub async fn run_pipeline(
         let tracker = OffsetTracker::new();
         commit_sources.push((input_def.topic.clone(), input_sources[0].clone()));
         trackers.push((input_def.topic.clone(), tracker.clone()));
-        name_to_sources.insert(input_def.name.clone(), (input_sources, tracker));
+        name_to_sources.insert(
+            input_def.name.clone(),
+            (input_sources, tracker, prepared.format),
+        );
         inputs.push(InputSource {
             name: input_def.name.clone(),
             schema: schema.clone(),
@@ -301,11 +358,11 @@ pub async fn run_pipeline(
     let batch_size = budget.batch_size;
     let decode_parallelism = budget.decode_parallelism;
     let factory: Box<StreamTableFactory> = Box::new(move |name, schema| {
-        let (input_sources, tracker) = name_to_sources
+        let (input_sources, tracker, format) = name_to_sources
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("source no encontrado para '{name}'"))?;
-        let decoder = Decoder::new(schema.clone(), DecodeFormat::Json);
+        let decoder = Decoder::new(schema.clone(), format);
         // Un `record_stream()` por consumidor, fusionados con `select_all`:
         // el grupo reparte las particiones entre ellos y cada instancia
         // drena su propio buffer de fetch en paralelo. La factory se invoca
@@ -370,8 +427,9 @@ pub async fn run_pipeline(
             // Commit task: procesa los epochs EN ORDEN (FIFO del canal).
             while let Some(epoch) = epoch_rx.recv().await {
                 let t_commit = Instant::now();
+                let kafka_offsets = epoch.body.applied_offsets().clone();
                 let result = sink_committer
-                    .commit_epoch(epoch.writer, epoch.identifier, &epoch.offsets)
+                    .commit_epoch(epoch.writer, epoch.identifier, &epoch.body)
                     .await;
                 commit_metrics.add_commit_ns(t_commit.elapsed().as_nanos() as u64);
                 let Some(identifier) = result.context("checkpoint del sink")? else {
@@ -383,7 +441,7 @@ pub async fn run_pipeline(
                 // fuente de verdad del progreso es el checkpoint en Paimon,
                 // así que un fallo acá no rompe el exactly-once.
                 for (topic, source) in &commit_sources {
-                    if let Some(partitions) = epoch.offsets.get(topic) {
+                    if let Some(partitions) = kafka_offsets.get(topic) {
                         if let Err(e) = source.commit_offsets(partitions).await {
                             tracing::warn!(error = %e, topic, "commit de offsets en Kafka");
                             commit_metrics.inc_errors();
@@ -433,7 +491,7 @@ pub async fn run_pipeline(
                         let epoch = CheckpointEpoch {
                             writer: full_writer,
                             identifier,
-                            offsets: offsets.clone(),
+                            body: CheckpointBody::Offsets(offsets.clone()),
                         };
                         if epoch_tx.send(epoch).await.is_err() {
                             handoff_error = Some(anyhow::anyhow!(
@@ -455,7 +513,7 @@ pub async fn run_pipeline(
                 .send(CheckpointEpoch {
                     writer: full_writer,
                     identifier,
-                    offsets: offsets.clone(),
+                    body: CheckpointBody::Offsets(offsets.clone()),
                 })
                 .await;
         }

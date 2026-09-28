@@ -4,10 +4,16 @@
 //! streams, la clave de particionado (el invariante de alineación) y el plan
 //! de pipeline compilado desde `pipeline.sql` + `pipeline.yaml`.
 
+pub mod checkpoint;
 pub mod error;
 pub mod plan;
 pub mod types;
 
+pub use checkpoint::{
+    parse_checkpoint, Accumulators, AggKind, AggSpec, AggState, CheckpointBody, KeyState,
+    OperatorState, PartitionProgress, SessionState, WindowCheckpointV1, WindowKind, WindowSpecId,
+    MAX_SIDECAR_BYTES,
+};
 pub use error::Error;
 pub use plan::{OutputDef, PipelinePlan};
 pub use types::{Column, PartitionKey, SourceOffsets, StreamDef};

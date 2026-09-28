@@ -18,7 +18,7 @@ use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use tachyon_config::PipelineConfig;
-use tachyon_runtime::{run_pipeline, RunOptions};
+use tachyon_runtime::{run_pipeline, PreparedInput, RunOptions};
 use tachyon_sink::writer::{create_test_table, read_table_rows, PaimonSink};
 
 const BROKER: &str = "localhost:9092";
@@ -169,8 +169,10 @@ async fn live_end_to_end_redpanda_to_paimon() {
     // --- 3. Sink + schemas ---
     let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
         .expect("abriendo sink");
-    let input_schemas: HashMap<String, Arc<Schema>> =
-        HashMap::from([("orders".to_string(), orders_schema())]);
+    let input_schemas = HashMap::from([(
+        "orders".to_string(),
+        PreparedInput::json(orders_schema()),
+    )]);
 
     // --- 4. Corre el pipeline en una tarea (el stream es infinito) ---
     let select_sql = "SELECT order_id, status, source_version, amount \

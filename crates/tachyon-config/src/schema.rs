@@ -55,6 +55,19 @@ fn default_catalog() -> String {
     "local".to_string()
 }
 
+/// Codificación de los mensajes del topic. Adentro del pipeline el dato es
+/// siempre un `RecordBatch` Arrow: el decoder corre una sola vez en el borde.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadFormat {
+    /// Un objeto JSON por mensaje. Default.
+    #[default]
+    Json,
+    /// Un datum Avro por mensaje (o un object container), con el schema de
+    /// `avro_schema`.
+    Avro,
+}
+
 /// Un stream de entrada (vincula nombre lógico -> topic físico).
 #[derive(Debug, Clone, Deserialize)]
 pub struct InputDef {
@@ -62,7 +75,16 @@ pub struct InputDef {
     pub topic: String,
     /// Clave de particionado (== state key == bucket key).
     pub key: String,
+    /// Ruta al schema Arrow de las columnas que ve el SQL.
     pub schema: String,
+    /// Codificación del payload. Default: `json`.
+    #[serde(default)]
+    pub format: PayloadFormat,
+    /// Ruta al schema Avro (`.avsc`) de los mensajes. Obligatoria con
+    /// `format: avro`. No se usa como formato interno: cada mensaje se
+    /// decodifica a Arrow y el resto del pipeline no vuelve a ver Avro.
+    #[serde(default)]
+    pub avro_schema: Option<String>,
     #[serde(default)]
     pub watermark: Option<WatermarkConfig>,
 }

@@ -13,8 +13,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use clap::Parser;
 use serde::Deserialize;
 use std::sync::Arc;
-use tachyon_config::PipelineConfig;
-use tachyon_runtime::{Pipeline, StatelessBudget};
+use tachyon_config::{PayloadFormat, PipelineConfig};
+use tachyon_runtime::{Pipeline, PreparedInput, StatelessBudget};
 
 /// Tachyon: motor de ejecución de pipelines streaming sobre lakehouse.
 #[derive(Parser, Debug)]
@@ -61,6 +61,18 @@ fn parse_type(s: &str) -> Result<DataType> {
     })
 }
 
+/// Resuelve `schema` / `avro_schema`: una ruta (tiene `/` o extensión) se usa
+/// tal cual; un nombre suelto se busca en `--schemas-dir`.
+fn resolve_schema_path(spec: &str, schemas_dir: Option<&PathBuf>) -> Result<PathBuf> {
+    if spec.contains('/') || spec.ends_with(".json") || spec.ends_with(".avsc") {
+        Ok(PathBuf::from(spec))
+    } else if let Some(dir) = schemas_dir {
+        Ok(dir.join(spec))
+    } else {
+        anyhow::bail!("'{spec}' no es una ruta y no se especificó --schemas-dir");
+    }
+}
+
 /// Carga el schema Arrow de un input desde un archivo JSON.
 fn load_schema(path: &PathBuf) -> Result<Arc<Schema>> {
     let content = std::fs::read_to_string(path)
@@ -92,21 +104,28 @@ fn main() -> Result<()> {
     let sql_str = std::fs::read_to_string(&args.sql)
         .with_context(|| format!("leyendo SQL {}", args.sql.display()))?;
 
-    // Cargar los schemas de los inputs.
-    let mut input_schemas: HashMap<String, Arc<Schema>> = HashMap::new();
+    // Cargar los schemas de los inputs. El Arrow es el que ve el SQL; si el
+    // topic es Avro, el .avsc solo sirve para decodificar el mensaje una vez.
+    let mut input_codecs: HashMap<String, PreparedInput> = HashMap::new();
     for input in &config.inputs {
-        let path = if input.schema.contains('/') || input.schema.ends_with(".json") {
-            PathBuf::from(&input.schema)
-        } else if let Some(dir) = &args.schemas_dir {
-            dir.join(&input.schema)
-        } else {
-            anyhow::bail!(
-                "el schema '{}' no es una ruta y no se especificó --schemas-dir",
-                input.schema
-            );
+        let arrow_path = resolve_schema_path(&input.schema, args.schemas_dir.as_ref())?;
+        let arrow = load_schema(&arrow_path)?;
+        let prepared = match input.format {
+            PayloadFormat::Json => PreparedInput::json(arrow),
+            PayloadFormat::Avro => {
+                let spec = input.avro_schema.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("input '{}': format avro requiere avro_schema", input.name)
+                })?;
+                let avro_path = resolve_schema_path(spec, args.schemas_dir.as_ref())?;
+                let avsc = std::fs::read_to_string(&avro_path).with_context(|| {
+                    format!("leyendo schema Avro {}", avro_path.display())
+                })?;
+                PreparedInput::from_avsc(arrow, &avsc).with_context(|| {
+                    format!("parseando schema Avro de '{}'", input.name)
+                })?
+            }
         };
-        let schema = load_schema(&path)?;
-        input_schemas.insert(input.name.clone(), schema);
+        input_codecs.insert(input.name.clone(), prepared);
     }
 
     // El runtime se arma DESPUÉS de leer el pin: un `#[tokio::main]` default
@@ -130,7 +149,7 @@ fn main() -> Result<()> {
 
     rt.block_on(async move {
         let pipeline = Pipeline::new(&config, &sql_str)?;
-        let handle = pipeline.run(&input_schemas).await?;
+        let handle = pipeline.run(&input_codecs).await?;
 
         if let Some(addr) = handle.metrics_addr {
             tracing::info!(%addr, "métricas disponibles en http://{addr}/metrics");

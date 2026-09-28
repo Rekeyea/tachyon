@@ -2,14 +2,15 @@
 //!
 //! Soporta dos formatos:
 //! - **JSON** (vía `arrow-json`): cada mensaje es un objeto JSON.
-//! - **Avro** (vía `apache-avro`): cada mensaje está codificado Avro con un
-//!   schema conocido.
+//! - **Avro** (vía `apache-avro`): cada mensaje es un datum Avro del schema
+//!   conocido (lo que viaja en un topic) o un object container. Se materializa
+//!   a Arrow una sola vez; el resto del pipeline no vuelve a ver Avro.
 //!
 //! El decoder toma un lote de payloads (ya agrupados por partición) y produce
 //! un único `RecordBatch` cuyo schema coincide con el de la tabla de entrada.
 
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -27,6 +28,17 @@ pub enum DecodeFormat {
     Json,
     /// Avro (con el schema Avro).
     Avro(Arc<AvroSchema>),
+}
+
+/// Header de un object container Avro (`Obj` + versión 1).
+const AVRO_CONTAINER_MAGIC: &[u8] = b"Obj\x01";
+
+/// Parsea un `.avsc`. El schema queda en el decoder; cada mensaje se proyecta
+/// a las columnas Arrow y no se conserva como valor Avro.
+pub fn parse_avro_schema(avsc: &str) -> Result<Arc<AvroSchema>> {
+    AvroSchema::parse_str(avsc)
+        .map(Arc::new)
+        .map_err(|e| anyhow::anyhow!("schema Avro inválido: {e}"))
 }
 
 /// Decodifica los payloads de un lote de registros a un `RecordBatch`.
@@ -152,16 +164,27 @@ impl Decoder {
     }
 
     /// Avro: decodifica cada mensaje y construye las columnas Arrow.
+    ///
+    /// Un mensaje de topic es un datum (binario del schema, sin header). Un
+    /// object container (`Obj\x01`, lo que escribe `apache_avro::Writer`)
+    /// también se acepta: es el formato de los tests y de un productor que
+    /// empaqueta el registro.
     fn decode_avro(&self, values: &[Vec<u8>], schema: &Arc<AvroSchema>) -> Result<RecordBatch> {
         let mut records: Vec<AvroValue> = Vec::new();
-        for v in values {
-            let reader = apache_avro::Reader::with_schema(schema, BufReader::new(v.as_slice()))
-                .map_err(|e| anyhow::anyhow!("leyendo mensaje Avro: {e}"))?;
-            for record in reader {
-                records.push(
-                    record
-                        .map_err(|e| anyhow::anyhow!("decodificando registro Avro: {e}"))?,
-                );
+        for (row, v) in values.iter().enumerate() {
+            if v.starts_with(AVRO_CONTAINER_MAGIC) {
+                let reader = apache_avro::Reader::with_schema(schema, BufReader::new(v.as_slice()))
+                    .map_err(|e| anyhow::anyhow!("leyendo container Avro (fila {row}): {e}"))?;
+                for record in reader {
+                    records.push(record.map_err(|e| {
+                        anyhow::anyhow!("decodificando container Avro (fila {row}): {e}")
+                    })?);
+                }
+            } else {
+                let mut cursor = Cursor::new(v.as_slice());
+                let value = apache_avro::from_avro_datum(schema, &mut cursor, None)
+                    .with_context(|| format!("decodificando datum Avro (fila {row})"))?;
+                records.push(value);
             }
         }
         build_avro_batch(&self.schema, &records)
@@ -497,5 +520,45 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("columna status");
         assert_eq!(statuses.value(0), "paid");
+    }
+
+    #[test]
+    fn decodes_a_raw_avro_datum() {
+        let schema = orders_schema();
+        let avro_schema = parse_avro_schema(
+            r#"{
+                "type": "record",
+                "name": "Order",
+                "fields": [
+                    {"name": "order_id", "type": "long"},
+                    {"name": "status", "type": "string"},
+                    {"name": "amount", "type": "double"}
+                ]
+            }"#,
+        )
+        .expect("schema Avro");
+        let decoder = Decoder::new(schema, DecodeFormat::Avro(avro_schema.clone()));
+        let datum = apache_avro::to_avro_datum(
+            avro_schema.as_ref(),
+            AvroValue::Record(vec![
+                ("order_id".to_string(), AvroValue::Long(7)),
+                ("status".to_string(), AvroValue::String("paid".to_string())),
+                ("amount".to_string(), AvroValue::Double(12.5)),
+            ]),
+        )
+        .expect("datum");
+        assert!(
+            !datum.starts_with(b"Obj"),
+            "un datum de topic no lleva header de container"
+        );
+        let mut values = vec![datum];
+        let batch = decoder.decode(&mut values).expect("decode datum");
+        assert_eq!(batch.num_rows(), 1);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("order_id");
+        assert_eq!(ids.value(0), 7);
     }
 }

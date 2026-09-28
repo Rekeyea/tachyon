@@ -29,7 +29,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{Offset, TopicPartitionList};
 use tachyon_config::PipelineConfig;
 use tachyon_metrics::InstanceMetrics;
-use tachyon_runtime::{run_pipeline, RunOptions};
+use tachyon_runtime::{run_pipeline, PreparedInput, RunOptions};
 use tachyon_sink::writer::{create_test_table, read_table_rows, PaimonSink};
 
 const BROKER: &str = "localhost:9092";
@@ -136,7 +136,7 @@ fn start_instance(config: &PipelineConfig, table: &paimon::table::Table, group_i
     };
     let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
         .expect("abriendo sink");
-    let schemas = HashMap::from([("orders".to_string(), orders_schema())]);
+    let schemas = HashMap::from([("orders".to_string(), PreparedInput::json(orders_schema()))]);
     let metrics = Arc::new(InstanceMetrics::new());
     let task = tokio::spawn({
         let metrics = metrics.clone();

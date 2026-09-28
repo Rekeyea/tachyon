@@ -27,7 +27,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use tachyon_config::PipelineConfig;
 use tachyon_metrics::InstanceMetrics;
-use tachyon_runtime::{run_pipeline, RunOptions};
+use tachyon_runtime::{run_pipeline, PreparedInput, RunOptions};
 use tachyon_sink::writer::{create_test_table, read_table_rows, PaimonSink};
 
 const BROKER: &str = "localhost:9092";
@@ -153,8 +153,10 @@ async fn start_instance(
     let sink =
         PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
             .expect("abriendo sink");
-    let input_schemas: HashMap<String, Arc<Schema>> =
-        HashMap::from([("orders".to_string(), orders_schema())]);
+    let input_schemas = HashMap::from([(
+        "orders".to_string(),
+        PreparedInput::json(orders_schema()),
+    )]);
     let metrics = Arc::new(InstanceMetrics::new());
     let select_sql = select_sql.to_string();
     let task = tokio::spawn({

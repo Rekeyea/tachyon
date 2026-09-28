@@ -13,8 +13,10 @@
 //! reales. Aquí se valida la estructura y el binding lógico contra la config.
 
 use datafusion::sql::sqlparser::ast::{
-    Query, SetExpr, Statement, TableFactor, TableObject,
+    DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    Query, SetExpr, Statement, TableFactor, TableObject, Value,
 };
+use tachyon_core::WindowKind;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use tachyon_core::Error;
@@ -33,6 +35,21 @@ pub struct ParsedSql {
     /// La query SELECT ejecutable (sin el `INSERT INTO <out>`), lista para
     /// correr en DataFusion contra las tablas streaming registradas.
     pub select_sql: String,
+    /// `Some` si el `GROUP BY` tiene `TUMBLE`, `HOP` o `SESSION`. El operador
+    /// todavía no está cableado: el runtime rechaza el arranque.
+    pub window: Option<WindowShape>,
+}
+
+/// Ventana reconocida en el `GROUP BY`, antes de que DataFusion vea la SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowShape {
+    pub event_time: String,
+    pub kind: WindowKind,
+    pub size_ms: i64,
+    pub slide_ms: Option<i64>,
+    pub gap_ms: Option<i64>,
+    /// Columnas del `GROUP BY` que no son la llamada de ventana.
+    pub group_columns: Vec<String>,
 }
 
 /// Parsea `pipeline.sql` y valida que sea un `INSERT INTO <out> SELECT ...`.
@@ -73,10 +90,12 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         .as_ref()
         .ok_or_else(|| Error::Sql("el INSERT no tiene una query SELECT".to_string()))?;
     let source_tables = extract_source_tables(source);
+    let window = window_shape(source)?;
 
     // La query SELECT ejecutable (sin el INSERT INTO <out>), serializada de
     // vuelta a string desde el AST. Esta es la que corre en DataFusion contra
-    // las tablas streaming registradas.
+    // las tablas streaming registradas. Una ventana no llega a planificarse:
+    // el runtime la rechaza hasta que el operador esté cableado.
     let select_sql = source.to_string();
 
     Ok(ParsedSql {
@@ -84,7 +103,189 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         source_tables,
         query: sql.to_string(),
         select_sql,
+        window,
     })
+}
+
+/// Una sola llamada de ventana en el `GROUP BY`. Cero llamadas es pass-through.
+fn window_shape(query: &Query) -> Result<Option<WindowShape>, Error> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let GroupByExpr::Expressions(exprs, _) = &select.group_by else {
+        return Ok(None);
+    };
+    let mut window: Option<WindowShape> = None;
+    let mut group_columns = Vec::new();
+    for expr in exprs {
+        if let Some(shape) = window_call(expr)? {
+            if window.is_some() {
+                return Err(Error::Sql(
+                    "el GROUP BY tiene más de una ventana".to_string(),
+                ));
+            }
+            window = Some(shape);
+        } else {
+            group_columns.push(column_name(expr)?);
+        }
+    }
+    if let Some(shape) = window.as_mut() {
+        shape.group_columns = group_columns;
+    }
+    Ok(window)
+}
+
+fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
+    let Expr::Function(fun) = expr else {
+        return Ok(None);
+    };
+    let name = fun.name.to_string().to_ascii_uppercase();
+    if !matches!(name.as_str(), "TUMBLE" | "HOP" | "SESSION") {
+        return Ok(None);
+    }
+    let args = function_args(fun)?;
+    let shape = match name.as_str() {
+        "TUMBLE" => {
+            if args.len() != 2 {
+                return Err(Error::Sql(
+                    "TUMBLE(event_time, INTERVAL size) espera 2 argumentos".to_string(),
+                ));
+            }
+            let size_ms = interval_ms(args[1])?;
+            WindowShape {
+                event_time: column_name(args[0])?,
+                kind: WindowKind::Tumble,
+                size_ms,
+                slide_ms: None,
+                gap_ms: None,
+                group_columns: vec![],
+            }
+        }
+        "HOP" => {
+            if args.len() != 3 {
+                return Err(Error::Sql(
+                    "HOP(event_time, INTERVAL slide, INTERVAL size) espera 3 argumentos"
+                        .to_string(),
+                ));
+            }
+            let slide_ms = interval_ms(args[1])?;
+            let size_ms = interval_ms(args[2])?;
+            if slide_ms <= 0 || size_ms % slide_ms != 0 {
+                return Err(Error::Sql(format!(
+                    "el slide ({slide_ms} ms) tiene que dividir al tamaño ({size_ms} ms)"
+                )));
+            }
+            WindowShape {
+                event_time: column_name(args[0])?,
+                kind: WindowKind::Hop,
+                size_ms,
+                slide_ms: Some(slide_ms),
+                gap_ms: None,
+                group_columns: vec![],
+            }
+        }
+        "SESSION" => {
+            if args.len() != 2 {
+                return Err(Error::Sql(
+                    "SESSION(event_time, INTERVAL gap) espera 2 argumentos".to_string(),
+                ));
+            }
+            WindowShape {
+                event_time: column_name(args[0])?,
+                kind: WindowKind::Session,
+                size_ms: 0,
+                slide_ms: None,
+                gap_ms: Some(interval_ms(args[1])?),
+                group_columns: vec![],
+            }
+        }
+        _ => unreachable!("nombre ya filtrado"),
+    };
+    Ok(Some(shape))
+}
+
+fn function_args(fun: &Function) -> Result<Vec<&Expr>, Error> {
+    let FunctionArguments::List(list) = &fun.args else {
+        return Err(Error::Sql(
+            "la ventana tiene que llamarse con argumentos".to_string(),
+        ));
+    };
+    list.args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Ok(expr),
+            _ => Err(Error::Sql(
+                "la ventana solo acepta argumentos posicionales".to_string(),
+            )),
+        })
+        .collect()
+}
+
+fn column_name(expr: &Expr) -> Result<String, Error> {
+    match expr {
+        Expr::Identifier(ident) => Ok(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|ident| ident.value.clone())
+            .ok_or_else(|| Error::Sql("identificador de columna vacío".to_string())),
+        _ => Err(Error::Sql(format!(
+            "se esperaba una columna en el GROUP BY, llegó {expr}"
+        ))),
+    }
+}
+
+fn interval_ms(expr: &Expr) -> Result<i64, Error> {
+    let Expr::Interval(interval) = expr else {
+        return Err(Error::Sql(format!(
+            "el tamaño de la ventana tiene que ser INTERVAL, llegó {expr}"
+        )));
+    };
+    let value = literal_i64(interval.value.as_ref())?;
+    if value <= 0 {
+        return Err(Error::Sql(
+            "el intervalo de la ventana tiene que ser > 0".to_string(),
+        ));
+    }
+    let factor: i64 = match interval.leading_field {
+        Some(DateTimeField::Millisecond) => 1,
+        Some(DateTimeField::Second) => 1_000,
+        Some(DateTimeField::Minute) => 60_000,
+        Some(DateTimeField::Hour) => 3_600_000,
+        Some(DateTimeField::Day) => 86_400_000,
+        Some(_) => {
+            return Err(Error::Sql(
+                "la ventana solo acepta intervalos de milisegundos, segundos, minutos, horas o días"
+                    .to_string(),
+            ))
+        }
+        None => {
+            return Err(Error::Sql(
+                "el INTERVAL de la ventana tiene que nombrar la unidad".to_string(),
+            ))
+        }
+    };
+    value.checked_mul(factor).ok_or_else(|| {
+        Error::Sql("el intervalo de la ventana se pasa de i64 milisegundos".to_string())
+    })
+}
+
+fn literal_i64(expr: &Expr) -> Result<i64, Error> {
+    let Expr::Value(value) = expr else {
+        return Err(Error::Sql(format!(
+            "el valor del INTERVAL tiene que ser un literal, llegó {expr}"
+        )));
+    };
+    match &value.value {
+        Value::Number(number, _) => number.parse::<i64>().map_err(|_| {
+            Error::Sql(format!("el INTERVAL '{number}' no es un entero"))
+        }),
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => text
+            .parse::<i64>()
+            .map_err(|_| Error::Sql(format!("el INTERVAL '{text}' no es un entero"))),
+        other => Err(Error::Sql(format!(
+            "el INTERVAL '{other}' no es un entero"
+        ))),
+    }
 }
 
 /// Extrae los nombres lógicos de las tablas del `FROM` de una query.
@@ -167,6 +368,41 @@ mod tests {
         assert!(parsed.select_sql.to_uppercase().starts_with("SELECT"));
         assert!(parsed.select_sql.contains("SUM(amount)"));
         assert!(parsed.select_sql.contains("orders"));
+        assert!(parsed.window.is_none());
+    }
+
+    #[test]
+    fn tumble_and_hop_come_from_the_ast() {
+        let tumble = parse_sql(
+            "INSERT INTO out SELECT order_id, COUNT(*) \
+             FROM orders GROUP BY order_id, TUMBLE(event_time, INTERVAL '1' MINUTE)",
+        )
+        .unwrap();
+        let shape = tumble.window.expect("tumble");
+        assert_eq!(shape.event_time, "event_time");
+        assert_eq!(shape.kind, tachyon_core::WindowKind::Tumble);
+        assert_eq!(shape.size_ms, 60_000);
+        assert_eq!(shape.group_columns, vec!["order_id"]);
+
+        let hop = parse_sql(
+            "INSERT INTO out SELECT order_id \
+             FROM orders GROUP BY order_id, HOP(event_time, INTERVAL '5' SECOND, INTERVAL '10' SECOND)",
+        )
+        .unwrap();
+        let shape = hop.window.expect("hop");
+        assert_eq!(shape.slide_ms, Some(5_000));
+        assert_eq!(shape.size_ms, 10_000);
+        assert_eq!(shape.kind, tachyon_core::WindowKind::Hop);
+    }
+
+    #[test]
+    fn hop_slide_must_divide_the_size() {
+        let err = parse_sql(
+            "INSERT INTO out SELECT order_id FROM orders \
+             GROUP BY order_id, HOP(event_time, INTERVAL '3' SECOND, INTERVAL '10' SECOND)",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("dividir"), "{err}");
     }
 
     #[test]

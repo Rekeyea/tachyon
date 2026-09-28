@@ -16,6 +16,6 @@ pub mod record;
 pub mod stream;
 
 pub use consumer::{in_memory_stream, RdkafkaSource, RecordStream};
-pub use decode::{DecodeFormat, Decoder};
+pub use decode::{parse_avro_schema, DecodeFormat, Decoder};
 pub use record::SourceRecord;
 pub use stream::{OffsetTracker, RedpandaPartitionStream};

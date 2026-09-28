@@ -34,7 +34,7 @@ use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
 use paimon::catalog::Identifier;
 use paimon::{CatalogFactory, Options};
-use tachyon_core::SourceOffsets;
+use tachyon_core::{parse_checkpoint, CheckpointBody, SourceOffsets, MAX_SIDECAR_BYTES};
 
 /// Reintentos de un commit de Paimon con resultado incierto (error de I/O
 /// tras el prepare). El reintento filtra identifiers ya commiteados, así que
@@ -161,13 +161,14 @@ impl PaimonSink {
 
     /// Recupera el último checkpoint commiteado por este `commit_user`.
     ///
-    /// Devuelve los offsets de fuente de ese checkpoint (o `None` si nunca
-    /// commiteó) y deja el sink listo para commitear el siguiente identifier.
-    pub async fn recover(&mut self) -> Result<Option<SourceOffsets>> {
+    /// `None` si nunca commiteó. Un sidecar sin snapshot no se lee. El
+    /// identifier del archivo v1 tiene que ser el del snapshot; si no, se
+    /// rechaza el arranque.
+    pub async fn recover(&mut self) -> Result<Recovered> {
         let Some(identifier) = last_committed_identifier(&self.table, &self.commit_user).await?
         else {
             self.next_identifier = 1;
-            return Ok(None);
+            return Ok(Recovered::None);
         };
         let path = offsets_path(&self.table, &self.commit_user, identifier);
         let bytes = self
@@ -180,31 +181,39 @@ impl PaimonSink {
             .with_context(|| {
                 format!("el checkpoint {identifier} está commiteado pero falta {path}")
             })?;
-        let offsets: SourceOffsets = serde_json::from_slice(&bytes)
-            .with_context(|| format!("offsets del checkpoint corruptos: {path}"))?;
+        let body = parse_checkpoint(&bytes)
+            .map_err(|e| anyhow::anyhow!("checkpoint {identifier} corrupto ({path}): {e}"))?;
         self.next_identifier = identifier + 1;
-        Ok(Some(offsets))
+        match body {
+            CheckpointBody::Offsets(offsets) => Ok(Recovered::PassThrough { identifier, offsets }),
+            CheckpointBody::Window(checkpoint) => {
+                if checkpoint.commit_identifier != identifier {
+                    anyhow::bail!(
+                        "checkpoint {identifier}: el sidecar dice identifier {}, no coinciden",
+                        checkpoint.commit_identifier
+                    );
+                }
+                Ok(Recovered::Window {
+                    identifier,
+                    checkpoint,
+                })
+            }
+        }
     }
 
-    /// Commitea todo lo escrito desde el último checkpoint junto con los
-    /// offsets de fuente que cubre (exactly-once).
+    /// Commitea todo lo escrito desde el último checkpoint.
     ///
-    /// Devuelve el identifier commiteado, o `None` si no había nada que
-    /// commitear (sin archivos nuevos: los offsets no avanzan y los registros
-    /// correspondientes se re-procesan al recuperar, sin producir salida).
-    pub async fn commit_checkpoint(&mut self, offsets: &SourceOffsets) -> Result<Option<i64>> {
+    /// Devuelve el identifier, o `None` si no había archivos nuevos. En ese
+    /// caso no se escribe sidecar: paimon 0.3 no crea snapshot con mensajes
+    /// vacíos, y un archivo sin snapshot no es un commit.
+    pub async fn commit_checkpoint(&mut self, body: &CheckpointBody) -> Result<Option<i64>> {
         let messages = self.writer.prepare_commit().await.context("prepare_commit")?;
         if messages.is_empty() {
             return Ok(None);
         }
         let identifier = self.next_identifier;
-
-        // 1. Offsets primero: solo cuentan si el snapshot `identifier` existe.
-        write_offsets(&self.table, &offsets_path(&self.table, &self.commit_user, identifier), offsets)
+        publish_checkpoint(&self.table, &self.commit_user, &self.committer, messages, identifier, body)
             .await?;
-
-        // 2. Snapshot de Paimon: el punto de commit atómico.
-        commit_with_retries(&self.committer, messages, identifier).await?;
         self.next_identifier = identifier + 1;
         Ok(Some(identifier))
     }
@@ -380,7 +389,7 @@ impl PaimonCommitterHalf {
         &mut self,
         mut writer: paimon::table::TableWrite,
         identifier: i64,
-        offsets: &SourceOffsets,
+        body: &CheckpointBody,
     ) -> Result<Option<i64>> {
         let debug = std::env::var("TACHYON_DEBUG_COMMIT").is_ok();
         let t_prepare = std::time::Instant::now();
@@ -389,26 +398,85 @@ impl PaimonCommitterHalf {
         if messages.is_empty() {
             return Ok(None);
         }
-
-        // 1. Offsets primero: solo cuentan si el snapshot `identifier` existe.
         let t_offsets = std::time::Instant::now();
-        write_offsets(&self.table, &offsets_path(&self.table, &self.commit_user, identifier), offsets)
-            .await?;
-        let d_offsets = t_offsets.elapsed();
-
-        // 2. Snapshot de Paimon: el punto de commit atómico.
-        let t_commit = std::time::Instant::now();
-        commit_with_retries(&self.committer, messages, identifier).await?;
+        publish_checkpoint(
+            &self.table,
+            &self.commit_user,
+            &self.committer,
+            messages,
+            identifier,
+            body,
+        )
+        .await?;
         if debug {
             eprintln!(
-                "[commit] id={identifier} prepare={:.0}ms offsets={:.0}ms commit={:.0}ms",
+                "[commit] id={identifier} prepare={:.0}ms sidecar+snapshot={:.0}ms",
                 d_prepare.as_secs_f64() * 1e3,
-                d_offsets.as_secs_f64() * 1e3,
-                t_commit.elapsed().as_secs_f64() * 1e3
+                t_offsets.elapsed().as_secs_f64() * 1e3
             );
         }
         Ok(Some(identifier))
     }
+}
+
+/// Lo que `recover` encontró para este `commit_user`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recovered {
+    /// Este `commit_user` nunca commiteó.
+    None,
+    PassThrough {
+        identifier: i64,
+        offsets: SourceOffsets,
+    },
+    Window {
+        identifier: i64,
+        checkpoint: tachyon_core::WindowCheckpointV1,
+    },
+}
+
+/// Sidecar primero, snapshot después. Sin archivos no se llama: el caller ya
+/// filtró `messages` vacío.
+async fn publish_checkpoint(
+    table: &paimon::table::Table,
+    commit_user: &str,
+    committer: &paimon::table::TableCommit,
+    messages: Vec<paimon::table::CommitMessage>,
+    identifier: i64,
+    body: &CheckpointBody,
+) -> Result<()> {
+    let stamped = match body {
+        CheckpointBody::Offsets(_) => body.clone(),
+        CheckpointBody::Window(checkpoint) => {
+            let mut owned = checkpoint.clone();
+            owned.commit_identifier = identifier;
+            owned.v = 1;
+            CheckpointBody::Window(owned)
+        }
+    };
+    let bytes = stamped
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!("serializando sidecar: {e}"))?;
+    if bytes.len() > MAX_SIDECAR_BYTES {
+        anyhow::bail!(
+            "sidecar de {identifier} pesa {} bytes, tope {MAX_SIDECAR_BYTES}",
+            bytes.len()
+        );
+    }
+    let path = offsets_path(table, commit_user, identifier);
+    write_bytes(table, &path, bytes::Bytes::from(bytes)).await?;
+    commit_with_retries(committer, messages, identifier).await?;
+    if matches!(body, CheckpointBody::Window(_)) {
+        // Quedan N y N-1. Un delete fallido no invalida el snapshot.
+        if identifier >= 2 {
+            for old in 1..identifier - 1 {
+                let old_path = offsets_path(table, commit_user, old);
+                if let Err(e) = table.file_io().delete_file(&old_path).await {
+                    tracing::warn!(error = %e, %old_path, "no se pudo borrar un sidecar viejo");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Un epoch cerrado pendiente de commit: lo que el writer task entrega al
@@ -416,7 +484,7 @@ impl PaimonCommitterHalf {
 pub struct CheckpointEpoch {
     pub writer: paimon::table::TableWrite,
     pub identifier: i64,
-    pub offsets: SourceOffsets,
+    pub body: CheckpointBody,
 }
 
 /// Último identifier commiteado por este `commit_user` (recorre los
@@ -460,9 +528,8 @@ fn offsets_path(table: &paimon::table::Table, commit_user: &str, identifier: i64
 /// Escribe los offsets de un checkpoint (tmp + rename; si el storage no
 /// soporta rename, escritura directa). Sobrescribe un archivo previo del
 /// mismo identifier (intento anterior que no llegó a commitear).
-async fn write_offsets(table: &paimon::table::Table, path: &str, offsets: &SourceOffsets) -> Result<()> {
+async fn write_bytes(table: &paimon::table::Table, path: &str, json: bytes::Bytes) -> Result<()> {
     let file_io = table.file_io();
-    let json = bytes::Bytes::from(serde_json::to_vec(offsets).context("serializando offsets")?);
     if let Some(dir) = path.rsplit_once('/').map(|(d, _)| d) {
         let _ = file_io.mkdirs(dir).await;
     }

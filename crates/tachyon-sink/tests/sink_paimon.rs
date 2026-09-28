@@ -15,7 +15,8 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use paimon::spec::{DataType, BigIntType, DoubleType, VarCharType};
-use tachyon_sink::writer::{create_test_table, read_table_rows, PaimonSink};
+use tachyon_core::CheckpointBody;
+use tachyon_sink::writer::{create_test_table, read_table_rows, PaimonSink, Recovered};
 
 const DB: &str = "default";
 const TABLE: &str = "orders_lake";
@@ -240,21 +241,33 @@ async fn checkpoint_offsets_survive_restart() {
 
     // --- Instancia fresca: sin checkpoint ---
     let mut sink = open("tachyon-eos");
-    assert_eq!(sink.recover().await.expect("recover"), None);
+    assert_eq!(sink.recover().await.expect("recover"), Recovered::None);
 
     // Sin datos escritos no hay checkpoint (los offsets no avanzan).
-    assert_eq!(sink.commit_checkpoint(&offsets(&[(0, 3)])).await.expect("vacío"), None);
+    assert_eq!(
+        sink.commit_checkpoint(&CheckpointBody::Offsets(offsets(&[(0, 3)])))
+            .await
+            .expect("vacío"),
+        None
+    );
 
     // --- Dos checkpoints ---
     sink.write(&batch(vec![1, 2], vec!["paid", "paid"], vec![1, 2], vec![1.0, 2.0]))
         .await
         .expect("write 1");
-    assert_eq!(sink.commit_checkpoint(&offsets(&[(0, 2)])).await.expect("ckpt 1"), Some(1));
+    assert_eq!(
+        sink.commit_checkpoint(&CheckpointBody::Offsets(offsets(&[(0, 2)])))
+            .await
+            .expect("ckpt 1"),
+        Some(1)
+    );
     sink.write(&batch(vec![3], vec!["paid"], vec![3], vec![3.0]))
         .await
         .expect("write 2");
     assert_eq!(
-        sink.commit_checkpoint(&offsets(&[(0, 2), (1, 1)])).await.expect("ckpt 2"),
+        sink.commit_checkpoint(&CheckpointBody::Offsets(offsets(&[(0, 2), (1, 1)])))
+            .await
+            .expect("ckpt 2"),
         Some(2)
     );
 
@@ -269,25 +282,278 @@ async fn checkpoint_offsets_survive_restart() {
     let mut sink = open("tachyon-eos");
     assert_eq!(
         sink.recover().await.expect("recover"),
-        Some(offsets(&[(0, 2), (1, 1)])),
+        Recovered::PassThrough {
+            identifier: 2,
+            offsets: offsets(&[(0, 2), (1, 1)]),
+        },
         "debe recuperar los offsets del último snapshot commiteado, no el huérfano"
     );
     sink.write(&batch(vec![4], vec!["paid"], vec![4], vec![4.0]))
         .await
         .expect("write 3");
     assert_eq!(
-        sink.commit_checkpoint(&offsets(&[(0, 3), (1, 1)])).await.expect("ckpt 3"),
+        sink.commit_checkpoint(&CheckpointBody::Offsets(offsets(&[(0, 3), (1, 1)])))
+            .await
+            .expect("ckpt 3"),
         Some(3),
         "el identifier sigue siendo monótono tras el reinicio"
     );
     let mut sink = open("tachyon-eos");
-    assert_eq!(sink.recover().await.expect("recover"), Some(offsets(&[(0, 3), (1, 1)])));
+    assert_eq!(
+        sink.recover().await.expect("recover"),
+        Recovered::PassThrough {
+            identifier: 3,
+            offsets: offsets(&[(0, 3), (1, 1)]),
+        }
+    );
 
     // --- Otro commit_user no ve estos checkpoints ---
     let mut other = open("tachyon-eos-otra-instancia");
-    assert_eq!(other.recover().await.expect("recover otro"), None);
+    assert_eq!(other.recover().await.expect("recover otro"), Recovered::None);
 
     let rows = rows_sorted(&read_table_rows(&table).await.expect("lectura"));
     assert_eq!(rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    let _ = std::fs::remove_dir_all(&warehouse);
+}
+
+/// Identifiers de snapshot de un `commit_user`: `(snapshot_id, commit_identifier)`.
+async fn committed_identifiers(table: &paimon::table::Table, commit_user: &str) -> Vec<(i64, i64)> {
+    let snapshots = table.snapshot_manager();
+    let Ok(Some(latest)) = snapshots.get_latest_snapshot_id().await else {
+        return Vec::new();
+    };
+    let earliest = snapshots
+        .earliest_snapshot_id()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(latest);
+    let mut out = Vec::new();
+    for id in earliest..=latest {
+        let Ok(snapshot) = snapshots.get_snapshot(id).await else {
+            continue;
+        };
+        if snapshot.commit_user() == commit_user && snapshot.commit_identifier() != i64::MAX {
+            out.push((id, snapshot.commit_identifier()));
+        }
+    }
+    out
+}
+
+/// paimon 0.3: un epoch sin archivos no deja snapshot.
+///
+/// `commit_with_identifier([])` vuelve `Ok` y no llama a `try_commit`.
+/// `write_arrow_batch` de 0 filas tampoco abre un writer, así que
+/// `prepare_commit` sigue vacío. Un commit con una fila sí crea snapshot:
+/// el negativo no es un falso negativo del catalog.
+#[tokio::test]
+async fn empty_commit_does_not_create_a_snapshot() {
+    let warehouse = fresh_warehouse("empty_commit").await;
+    let table = create_test_table(
+        &warehouse,
+        DB,
+        "empty_commit",
+        &[
+            (
+                "order_id".into(),
+                DataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            ("status".into(), DataType::VarChar(VarCharType::string_type())),
+            ("source_version".into(), DataType::BigInt(BigIntType::new())),
+            ("amount".into(), DataType::Double(DoubleType::new())),
+        ],
+        &["order_id"],
+        1,
+        Some("source_version"),
+    )
+    .await
+    .expect("tabla");
+
+    let user = "tachyon-empty";
+
+    // --- 1. prepare sin escrituras + commit de mensajes vacíos ---
+    let builder = table
+        .new_write_builder()
+        .with_commit_user(user)
+        .expect("commit_user");
+    let mut writer = builder.new_write().expect("writer");
+    let committer = builder.new_commit();
+    let messages = writer.prepare_commit().await.expect("prepare vacío");
+    assert!(
+        messages.is_empty(),
+        "sin filas, prepare_commit no debe producir CommitMessage: {messages:?}"
+    );
+    committer
+        .commit_with_identifier(messages, 1)
+        .await
+        .expect("commit vacío debe ser Ok");
+    assert!(
+        committed_identifiers(&table, user).await.is_empty(),
+        "commit_with_identifier([]) no crea snapshot"
+    );
+
+    // --- 2. batch de 0 filas, el fallback del diseño ---
+    let builder = table
+        .new_write_builder()
+        .with_commit_user(user)
+        .expect("commit_user");
+    let mut writer = builder.new_write().expect("writer");
+    let committer = builder.new_commit();
+    let empty = RecordBatch::new_empty(arrow_schema());
+    writer
+        .write_arrow_batch(&empty)
+        .await
+        .expect("write de 0 filas");
+    let messages = writer.prepare_commit().await.expect("prepare de 0 filas");
+    assert!(
+        messages.is_empty(),
+        "un RecordBatch de 0 filas tampoco produce CommitMessage: {messages:?}"
+    );
+    committer
+        .commit_with_identifier(messages, 2)
+        .await
+        .expect("commit de 0 filas debe ser Ok");
+    assert!(
+        committed_identifiers(&table, user).await.is_empty(),
+        "el batch vacío tampoco crea snapshot"
+    );
+
+    // --- 3. control: una fila sí deja snapshot con ese identifier ---
+    let builder = table
+        .new_write_builder()
+        .with_commit_user(user)
+        .expect("commit_user");
+    let mut writer = builder.new_write().expect("writer");
+    let committer = builder.new_commit();
+    writer
+        .write_arrow_batch(&batch(vec![1], vec!["paid"], vec![1], vec![10.0]))
+        .await
+        .expect("write de 1 fila");
+    let messages = writer.prepare_commit().await.expect("prepare con fila");
+    assert!(!messages.is_empty(), "una fila debe producir CommitMessage");
+    committer
+        .commit_with_identifier(messages, 7)
+        .await
+        .expect("commit con fila");
+    let ids = committed_identifiers(&table, user).await;
+    assert!(
+        ids.iter().any(|(_, ident)| *ident == 7),
+        "el commit con datos debe verse; snapshots={ids:?}"
+    );
+    assert!(
+        ids.iter().all(|(_, ident)| *ident != 1 && *ident != 2),
+        "los commits vacíos no deben aparecer; snapshots={ids:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&warehouse);
+}
+
+/// Un sidecar v1 se restaura con el mismo identifier del snapshot, y el JSON
+/// no es un mapa de offsets pelado.
+#[tokio::test]
+async fn window_checkpoint_roundtrips_with_the_snapshot() {
+    use std::collections::BTreeMap;
+    use tachyon_core::{
+        Accumulators, AggKind, AggSpec, AggState, KeyState, OperatorState, WindowCheckpointV1,
+        WindowKind, WindowSpecId,
+    };
+
+    let warehouse = fresh_warehouse("window_ckpt").await;
+    let table = create_test_table(
+        &warehouse,
+        DB,
+        "window_ckpt",
+        &[
+            (
+                "order_id".into(),
+                DataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            ("status".into(), DataType::VarChar(VarCharType::string_type())),
+            ("source_version".into(), DataType::BigInt(BigIntType::new())),
+            ("amount".into(), DataType::Double(DoubleType::new())),
+        ],
+        &["order_id"],
+        1,
+        Some("source_version"),
+    )
+    .await
+    .expect("tabla");
+
+    let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
+        .expect("sink")
+        .with_commit_user("tachyon-window")
+        .expect("commit_user");
+    sink.write(&batch(vec![1], vec!["paid"], vec![1], vec![10.0]))
+        .await
+        .expect("write");
+
+    let mut keys = BTreeMap::new();
+    keys.insert(
+        7i64.to_le_bytes().to_vec(),
+        KeyState {
+            windows: BTreeMap::from([(
+                0,
+                Accumulators {
+                    slots: vec![AggState::Count(1)],
+                },
+            )]),
+            sessions: vec![],
+        },
+    );
+    let checkpoint = WindowCheckpointV1 {
+        v: 1,
+        commit_identifier: 0,
+        consumers_per_topic: 1,
+        applied: offsets(&[(0, 4)]),
+        progress: BTreeMap::new(),
+        instance_watermark_ms: Some(1_000),
+        spec: WindowSpecId {
+            input: "orders".into(),
+            event_time: "event_time".into(),
+            kind: WindowKind::Tumble,
+            size_ms: 60_000,
+            slide_ms: None,
+            gap_ms: None,
+            group_columns: vec!["order_id".into()],
+            partial: false,
+            aggs: vec![AggSpec {
+                kind: AggKind::Count,
+                input: None,
+                alias: "n".into(),
+            }],
+        },
+        state: OperatorState { keys },
+    };
+    assert_eq!(
+        sink.commit_checkpoint(&CheckpointBody::Window(checkpoint.clone()))
+            .await
+            .expect("commit ventana"),
+        Some(1)
+    );
+
+    let path = std::path::Path::new(&warehouse)
+        .join(format!("{DB}.db"))
+        .join("window_ckpt")
+        .join("tachyon-offsets/tachyon-window/1.json");
+    let text = std::fs::read_to_string(&path).expect("sidecar");
+    assert!(text.contains("\"v\":1"), "{text}");
+
+    let mut sink = PaimonSink::from_table(table, "order_id", 1, Some("source_version"))
+        .expect("sink")
+        .with_commit_user("tachyon-window")
+        .expect("commit_user");
+    match sink.recover().await.expect("recover") {
+        Recovered::Window {
+            identifier,
+            checkpoint: got,
+        } => {
+            assert_eq!(identifier, 1);
+            assert_eq!(got.commit_identifier, 1);
+            assert_eq!(got.applied, checkpoint.applied);
+            assert_eq!(got.state, checkpoint.state);
+            assert_eq!(got.spec, checkpoint.spec);
+        }
+        other => panic!("se esperaba ventana, llegó {other:?}"),
+    }
     let _ = std::fs::remove_dir_all(&warehouse);
 }

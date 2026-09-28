@@ -6,4 +6,4 @@
 
 pub mod parse;
 
-pub use parse::parse_sql;
+pub use parse::{parse_sql, WindowShape};
