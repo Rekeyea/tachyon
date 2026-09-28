@@ -109,6 +109,11 @@ pub struct SessionState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Accumulators {
     pub slots: Vec<AggState>,
+    /// Paralelo a `slots`. `false` = todavía no llegó un valor no-null
+    /// (`SUM`/`MIN`/`MAX` salen null). Vacío en un sidecar viejo: se trata
+    /// como todo presente.
+    #[serde(default)]
+    pub present: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +259,7 @@ mod tests {
                     60_000,
                     Accumulators {
                         slots: vec![AggState::SumI64(1i128 << 60)],
+                        present: vec![true],
                     },
                 )]),
                 sessions: vec![],

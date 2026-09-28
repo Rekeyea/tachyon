@@ -495,6 +495,7 @@ async fn window_checkpoint_roundtrips_with_the_snapshot() {
                 0,
                 Accumulators {
                     slots: vec![AggState::Count(1)],
+                    present: vec![true],
                 },
             )]),
             sessions: vec![],
