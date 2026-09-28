@@ -34,9 +34,9 @@ use rdkafka::ClientConfig;
 use tachyon_config::{parse_fixed_duration, PayloadFormat, PipelineConfig};
 use tachyon_core::{CheckpointBody, SourceOffsets};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
-use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, Recovered};
+use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, PartitionTickets, Recovered};
 use tachyon_source::consumer::RdkafkaSource;
-use tachyon_source::WindowHandoff;
+use tachyon_source::{StateRequest, WindowHandoff};
 use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
 use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
 use tachyon_sql::WindowShape;
@@ -50,6 +50,45 @@ use crate::window::{
 
 /// Fusiona `update` en `offsets` (máximo por partición: el progreso nunca
 /// retrocede).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn same_window(stored: &tachyon_core::WindowSpecId, current: &tachyon_core::WindowSpecId) -> bool {
+    stored.kind == current.kind
+        && stored.size_ms == current.size_ms
+        && stored.slide_ms == current.slide_ms
+        && stored.gap_ms == current.gap_ms
+        && stored.group_columns == current.group_columns
+}
+
+fn release_lost_partitions(
+    handoff: &Option<Arc<WindowHandoff>>,
+    operator: &mut WindowOperator,
+    applied: &mut SourceOffsets,
+) {
+    let Some(handoff) = handoff else {
+        return;
+    };
+    let topic = handoff.topic().to_string();
+    for partition in handoff.take_released() {
+        tracing::info!(
+            %topic,
+            partition,
+            "la partición dejó el proceso; sus ventanas abiertas se releen desde el último snapshot"
+        );
+        operator.release_partition(partition);
+        if let Some(parts) = applied.get_mut(&topic) {
+            parts.remove(&partition);
+        }
+        handoff.forget_partition(partition);
+    }
+}
+
 fn merge_offsets(offsets: &mut SourceOffsets, update: &SourceOffsets) {
     for (topic, partitions) in update {
         let entry = offsets.entry(topic.clone()).or_default();
@@ -351,6 +390,8 @@ pub async fn run_pipeline(
         (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat),
     > = std::collections::HashMap::new();
     let mut window_handoff: Option<Arc<WindowHandoff>> = None;
+    let (adopt_tx, adopt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut adopt_rx = if window.is_some() { Some(adopt_rx) } else { None };
     let cc = source_client_config(config, &options.group_id, &budget);
     // Ventana y pass-through usan el mismo presupuesto: min(particiones, CPUs)
     // salvo override. El handoff evita aplicar dos veces una partición que
@@ -359,7 +400,6 @@ pub async fn run_pipeline(
     if let Some(checkpoint) = &restored_window {
         ensure_window_consumers(checkpoint.consumers_per_topic, n_consumers)?;
     }
-    let instance = instance_name();
     let session_timeout_ms = window_session_timeout_ms(options.commit_interval);
     let planned_sql = match window {
         Some(shape) => shape.rewrite_sql(),
@@ -416,9 +456,13 @@ pub async fn run_pipeline(
                     &options.commit_user,
                 )),
             };
+            gate.bind_state_bus(adopt_tx.clone());
             window_handoff = Some(gate.clone());
+            // El id estático incluye el commit_user: dos procesos en la misma
+            // máquina no se pisan el membership, y un restart del mismo
+            // proceso conserva el id.
             let ids: Vec<String> = (0..n_consumers)
-                .map(|index| format!("{instance}-{index}"))
+                .map(|index| format!("{}-{index}", options.commit_user))
                 .collect();
             tracing::info!(
                 input = %input_def.name,
@@ -445,7 +489,10 @@ pub async fn run_pipeline(
                     // KIP-345: un id distinto por miembro. No va en el config
                     // compartido, porque el segundo join con el mismo id echa
                     // al primero.
-                    consumer_cc.set("group.instance.id", format!("{instance}-{index}"));
+                    consumer_cc.set(
+                        "group.instance.id",
+                        format!("{}-{index}", options.commit_user),
+                    );
                 }
                 let mut source = RdkafkaSource::new(&consumer_cc, &input_def.topic)
                     .with_context(|| format!("creando source para '{}'", input_def.name))?
@@ -535,6 +582,7 @@ pub async fn run_pipeline(
             .schema
             .clone();
         let (lag_ms, idle_ms) = validate_window(config, shape, user_schema.as_ref(), &sink.field_names())?;
+        let ticket_table = sink.tickets();
         return drive_window(
             shape,
             lag_ms,
@@ -550,6 +598,11 @@ pub async fn run_pipeline(
             metrics_addr,
             window_handoff,
             n_consumers,
+            adopt_rx.take().unwrap_or_else(|| {
+                let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+                rx
+            }),
+            ticket_table,
         )
         .await;
     }
@@ -810,6 +863,8 @@ async fn drive_window(
     metrics_addr: Option<std::net::SocketAddr>,
     handoff: Option<Arc<WindowHandoff>>,
     n_consumers: usize,
+    mut adopt_rx: tokio::sync::mpsc::UnboundedReceiver<StateRequest>,
+    ticket_table: PartitionTickets,
 ) -> Result<PipelineHandle> {
     let spec = spec_from_shape(shape);
     let mut operator = match &restored {
@@ -910,13 +965,17 @@ async fn drive_window(
     // El futuro de `stream.next()` vive en otro task. El select de acá
     // espera un canal, así que un tick no cancela el batch de DataFusion.
     let (batch_in_tx, mut batch_in_rx) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move {
+    // Si el pipeline se aborta, esta tarea tiene que morir: si no, el stream
+    // no se suelta, el poll no ve el canal cerrado y el consumidor se queda
+    // en el grupo hasta el session timeout.
+    let stream_task = tokio::spawn(async move {
         while let Some(item) = stream.next().await {
             if batch_in_tx.send(item).await.is_err() {
                 break;
             }
         }
     });
+    let _stop_stream = AbortOnDrop(stream_task);
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
@@ -925,9 +984,15 @@ async fn drive_window(
         enum Wake {
             Batch(arrow::array::RecordBatch),
             Tick,
+            Adopt(StateRequest),
             End,
         }
+        release_lost_partitions(&handoff, &mut operator, &mut applied);
         let wake = tokio::select! {
+            req = adopt_rx.recv() => match req {
+                Some(req) => Wake::Adopt(req),
+                None => Wake::End,
+            },
             result = batch_in_rx.recv() => match result {
                 Some(batch) => Wake::Batch(batch.context("batch de la ventana")?),
                 None => Wake::End,
@@ -936,7 +1001,56 @@ async fn drive_window(
         };
         match wake {
             Wake::End => break,
+            Wake::Adopt(req) => {
+                let topic = handoff
+                    .as_ref()
+                    .map(|gate| gate.topic().to_string())
+                    .unwrap_or_default();
+                let reply = match ticket_table.read(&topic, req.partition).await
+                {
+                    Ok(Some(ticket)) => {
+                        if !same_window(operator.spec(), &ticket.spec) {
+                            Err(format!(
+                                "el estado de la partición {} no corresponde a esta ventana",
+                                req.partition
+                            ))
+                        } else {
+                            let offset = ticket.applied_offset;
+                            let closed = operator.adopt_partition(
+                                ticket.partition,
+                                ticket.keys,
+                                ticket.max_event_time_ms,
+                                Instant::now(),
+                            );
+                            applied
+                                .entry(topic)
+                                .or_default()
+                                .insert(req.partition, offset);
+                            if let Some(gate) = &handoff {
+                                gate.note_adopted(req.partition, offset);
+                            }
+                            if !closed.is_empty() {
+                                let out = batch_from_closed(&closed, shape, user_schema.as_ref())
+                                    .context("armando la salida adoptada")?;
+                                tx.send(WindowMsg::Rows(out))
+                                    .await
+                                    .context("enviando filas adoptadas")?;
+                            }
+                            tracing::info!(
+                                partition = req.partition,
+                                offset,
+                                "partición adoptada desde la ficha"
+                            );
+                            Ok(Some(offset))
+                        }
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = req.ack.send(reply);
+            }
             Wake::Batch(record) => {
+                release_lost_partitions(&handoff, &mut operator, &mut applied);
                 let rows = inputs_from_batch(&record, shape).context("leyendo el batch de ventana")?;
                 let closed = operator
                     .apply(&rows, Instant::now())
@@ -945,12 +1059,20 @@ async fn drive_window(
                     let snap = tracker.snapshot();
                     let entry = applied.entry(topic.clone()).or_default();
                     for (partition, next) in &snap {
+                        if operator.is_released(*partition) {
+                            continue;
+                        }
                         let slot = entry.entry(*partition).or_insert(*next);
                         *slot = (*slot).max(*next);
                     }
                     if let Some(handoff) = &handoff {
                         if handoff.topic() == topic {
-                            handoff.publish_applied(&snap);
+                            let published: BTreeMap<i32, i64> = snap
+                                .iter()
+                                .filter(|(partition, _)| !operator.is_released(**partition))
+                                .map(|(partition, next)| (*partition, *next))
+                                .collect();
+                            handoff.publish_applied(&published);
                         }
                     }
                 }
@@ -964,6 +1086,7 @@ async fn drive_window(
                 }
             }
             Wake::Tick => {
+                release_lost_partitions(&handoff, &mut operator, &mut applied);
                 let closed = operator.on_tick(Instant::now());
                 if !closed.is_empty() {
                     let out = batch_from_closed(&closed, shape, user_schema.as_ref())?;

@@ -34,7 +34,10 @@ use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
 use paimon::catalog::Identifier;
 use paimon::{CatalogFactory, Options};
-use tachyon_core::{parse_checkpoint, CheckpointBody, SourceOffsets, MAX_SIDECAR_BYTES};
+use tachyon_core::{
+    parse_checkpoint, partition_tickets, CheckpointBody, PartitionTicketV1, SourceOffsets,
+    MAX_SIDECAR_BYTES,
+};
 
 /// Reintentos de un commit de Paimon con resultado incierto (error de I/O
 /// tras el prepare). El reintento filtra identifiers ya commiteados, así que
@@ -297,6 +300,10 @@ impl PaimonSink {
     }
 
     /// Nombres de campo de la tabla, en el orden en que hay que escribir el batch.
+    pub fn tickets(&self) -> PartitionTickets {
+        PartitionTickets(self.table.clone())
+    }
+
     pub fn field_names(&self) -> Vec<String> {
         self.table
             .schema()
@@ -475,6 +482,9 @@ async fn publish_checkpoint(
     let path = offsets_path(table, commit_user, identifier);
     write_bytes(table, &path, bytes::Bytes::from(bytes)).await?;
     commit_with_retries(committer, messages, identifier).await?;
+    if let CheckpointBody::Window(checkpoint) = &stamped {
+        write_partition_tickets(table, checkpoint, commit_user).await?;
+    }
     if matches!(body, CheckpointBody::Window(_)) {
         // Quedan N y N-1. Un delete fallido no invalida el snapshot.
         if identifier >= 2 {
@@ -526,6 +536,86 @@ async fn last_committed_identifier(table: &paimon::table::Table, commit_user: &s
         }
     }
     Ok(None)
+}
+
+fn ticket_path(table: &paimon::table::Table, topic: &str, partition: i32) -> Result<String> {
+    if topic.is_empty() || topic.contains('/') || topic.contains("..") {
+        anyhow::bail!("topic inválido para la ficha de partición: {topic}");
+    }
+    Ok(format!(
+        "{}/tachyon-partitions/{topic}/{partition}.json",
+        table.location().trim_end_matches('/'),
+    ))
+}
+
+fn missing_file(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("not found")
+        || msg.contains("notfound")
+        || msg.contains("no such")
+        || msg.contains("404")
+        || msg.contains("os error 2")
+}
+
+async fn write_partition_tickets(
+    table: &paimon::table::Table,
+    checkpoint: &tachyon_core::WindowCheckpointV1,
+    commit_user: &str,
+) -> Result<()> {
+    for ticket in partition_tickets(checkpoint, commit_user) {
+        let bytes = ticket
+            .to_bytes()
+            .map_err(|e| anyhow::anyhow!("serializando la ficha de la partición {}: {e}", ticket.partition))?;
+        if bytes.len() > MAX_SIDECAR_BYTES {
+            anyhow::bail!(
+                "la ficha de la partición {} pesa {} bytes, tope {MAX_SIDECAR_BYTES}",
+                ticket.partition,
+                bytes.len()
+            );
+        }
+        let path = ticket_path(table, &ticket.topic, ticket.partition)?;
+        write_bytes(table, &path, bytes::Bytes::from(bytes)).await?;
+        tracing::info!(
+            topic = %ticket.topic,
+            partition = ticket.partition,
+            offset = ticket.applied_offset,
+            snapshot = ticket.snapshot_id,
+            "ficha de partición publicada"
+        );
+    }
+    Ok(())
+}
+
+/// Copia de la tabla para leer fichas de partición desde el operador.
+pub struct PartitionTickets(paimon::table::Table);
+
+impl PartitionTickets {
+    pub async fn read(&self, topic: &str, partition: i32) -> Result<Option<PartitionTicketV1>> {
+        read_partition_ticket(&self.0, topic, partition).await
+    }
+}
+
+/// La ficha del último snapshot que commiteó esta partición, o `None` si nadie
+/// la publicó todavía. Un archivo ausente no es un error.
+pub async fn read_partition_ticket(
+    table: &paimon::table::Table,
+    topic: &str,
+    partition: i32,
+) -> Result<Option<PartitionTicketV1>> {
+    let path = ticket_path(table, topic, partition)?;
+    let input = match table.file_io().new_input(&path) {
+        Ok(input) => input,
+        Err(e) if missing_file(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let bytes = match input.read().await {
+        Ok(bytes) => bytes,
+        Err(e) if missing_file(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    PartitionTicketV1::from_bytes(&bytes)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("ficha {path}: {e}"))
 }
 
 fn offsets_path(table: &paimon::table::Table, commit_user: &str, identifier: i64) -> String {

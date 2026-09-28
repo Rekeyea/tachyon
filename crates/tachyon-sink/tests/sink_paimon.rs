@@ -491,6 +491,7 @@ async fn window_checkpoint_roundtrips_with_the_snapshot() {
     keys.insert(
         7i64.to_le_bytes().to_vec(),
         KeyState {
+            partition: 0,
             windows: BTreeMap::from([(
                 0,
                 Accumulators {

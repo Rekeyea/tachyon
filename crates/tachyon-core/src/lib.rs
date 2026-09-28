@@ -10,9 +10,9 @@ pub mod plan;
 pub mod types;
 
 pub use checkpoint::{
-    parse_checkpoint, Accumulators, AggKind, AggSpec, AggState, CheckpointBody, KeyState,
-    OperatorState, PartitionProgress, SessionState, WindowCheckpointV1, WindowKind, WindowSpecId,
-    MAX_SIDECAR_BYTES,
+    parse_checkpoint, partition_tickets, Accumulators, AggKind, AggSpec, AggState, CheckpointBody,
+    KeyState, OperatorState, PartitionProgress, PartitionTicketV1, SessionState,
+    WindowCheckpointV1, WindowKind, WindowSpecId, MAX_SIDECAR_BYTES,
 };
 pub use error::Error;
 pub use plan::{OutputDef, PipelinePlan};

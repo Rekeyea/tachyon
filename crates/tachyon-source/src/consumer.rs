@@ -376,6 +376,39 @@ fn ffi_set_paused(
     Ok(())
 }
 
+/// Un miembro estático no abandona el grupo en `consumer_close`. Este
+/// unsubscribe corre antes, con el hilo de grupo libre, y el poll siguiente
+/// sirve el revoke. `assign(NULL)` desde ese callback sí manda LeaveGroup
+/// porque el cierre todavía no marcó TERMINATE.
+fn leave_static_member(rk: *mut rdsys::rd_kafka_t) {
+    tracing::info!("miembro estático: unsubscribe para soltar el grupo");
+    unsafe {
+        let err = rdsys::rd_kafka_unsubscribe(rk);
+        if err != rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
+            tracing::warn!(error = %err_str(err), "unsubscribe antes de cerrar");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            rdsys::rd_kafka_poll(rk, 100);
+            let mid = rdsys::rd_kafka_memberid(rk);
+            if mid.is_null() {
+                rdsys::rd_kafka_poll(rk, 200);
+                tracing::info!("miembro estático salió del grupo");
+                return;
+            }
+            let empty = *mid == 0;
+            rdsys::rd_kafka_mem_free(rk, mid.cast());
+            if empty {
+                // El id se borra al enviar LeaveGroup. Este poll espera el ack.
+                rdsys::rd_kafka_poll(rk, 500);
+                tracing::info!("miembro estático salió del grupo");
+                return;
+            }
+        }
+    }
+    tracing::warn!("el miembro estático no confirmó la salida del grupo");
+}
+
 /// Consulta de arranque y seek del handoff. `Some` es un error fatal: el
 /// poll sale sin seguir admitiendo. `None` si no hay handoff o si esta
 /// vuelta no cambió nada.
@@ -432,6 +465,10 @@ fn startup_query(
     handoff: &WindowHandoff,
     partition: i32,
 ) -> Result<Option<i64>, String> {
+    if let Some(offset) = handoff.request_adopt(partition)? {
+        return Ok(Some(offset));
+    }
+    handoff.note_no_ticket(partition)?;
     let committed = ffi_committed_offset(rk, &drain.topic, partition)?;
     match handoff.observe_committed(partition, committed)? {
         CommittedObs::Ready(offset) => Ok(Some(offset)),
@@ -487,6 +524,9 @@ unsafe extern "C" fn native_rebalance_cb(
         // Pausa local hasta que el poll, entre llamadas, decida el seek.
         // Los fetches de esta asignación todavía no están en la cola.
         let _ = ffi_set_paused(rk, &state.topic, &ids, true);
+        if let Some(handoff) = &state.handoff {
+            handoff.note_assignment(state.consumer_id, &ids);
+        }
         state.assigned = ids;
         state.live.clear();
         state.assign_gen = state.assign_gen.wrapping_add(1);
@@ -496,6 +536,7 @@ unsafe extern "C" fn native_rebalance_cb(
         state.flush_local_admitted();
         if let Some(handoff) = &state.handoff {
             handoff.note_revoke(&ids);
+            handoff.note_revoking(state.consumer_id);
         }
         state.assigned.clear();
         state.live.clear();
@@ -819,11 +860,16 @@ impl RdkafkaSource {
                         last_report = std::time::Instant::now();
                     }
                 }
+                // group.instance.id (KIP-345) no manda LeaveGroup dentro de
+                // consumer_close. Sin esta salida la partición sigue tomada
+                // hasta session.timeout.ms y el proceso nuevo no la adopta.
+                if consumer.drain.handoff.is_some() {
+                    leave_static_member(consumer.rk);
+                }
                 // El `NativeConsumer` se destruye aquí (Drop): consumer_close
-                // (leave group limpio) + destroy de topic y handle. El estado
-                // de drenado (`drain`) se dropea después del cuerpo de Drop,
-                // así que cualquier callback durante el cierre lo encuentra
-                // vivo.
+                // + destroy de topic y handle. El estado de drenado (`drain`)
+                // se dropea después del cuerpo de Drop, así que cualquier
+                // callback durante el cierre lo encuentra vivo.
             })
             .await;
             // El task de poll terminó (error o shutdown): el receiver verá el

@@ -455,6 +455,9 @@ pub struct WindowOperator {
     /// Fin de disparo (el `end` de tumble/hop, `end + gap` de session) → claves.
     by_end: BTreeMap<i64, BTreeSet<Vec<u8>>>,
     partitions: BTreeMap<i32, PartitionClock>,
+    /// Particiones que este proceso ya soltó. Sus filas no reabren ventanas:
+    /// las vuelve a leer quien las tenga ahora.
+    released: std::collections::HashSet<i32>,
     instance_watermark_ms: Option<i64>,
 }
 
@@ -467,6 +470,7 @@ impl WindowOperator {
             keys: BTreeMap::new(),
             by_end: BTreeMap::new(),
             partitions: BTreeMap::new(),
+            released: std::collections::HashSet::new(),
             instance_watermark_ms: None,
         }
     }
@@ -488,6 +492,48 @@ impl WindowOperator {
 
     pub fn instance_watermark_ms(&self) -> Option<i64> {
         self.instance_watermark_ms
+    }
+
+    pub fn spec(&self) -> &WindowSpecId {
+        &self.spec
+    }
+
+    pub fn is_released(&self, partition: i32) -> bool {
+        self.released.contains(&partition)
+    }
+
+    /// Suelta la partición sin emitir. Las ventanas abiertas las reconstruye
+    /// quien la reciba, desde el último snapshot.
+    pub fn release_partition(&mut self, partition: i32) {
+        self.released.insert(partition);
+        self.partitions.remove(&partition);
+        self.keys.retain(|_, state| state.partition != partition);
+        self.reindex();
+    }
+
+    /// Incorpora la ficha commiteada de una partición que este proceso no tenía.
+    /// Puede cerrar ventanas si el watermark de esa partición ya las pasó.
+    pub fn adopt_partition(
+        &mut self,
+        partition: i32,
+        keys: BTreeMap<Vec<u8>, KeyState>,
+        max_event_time_ms: Option<i64>,
+        now: Instant,
+    ) -> Vec<ClosedWindow> {
+        self.released.remove(&partition);
+        for (key, mut state) in keys {
+            state.partition = partition;
+            self.keys.insert(key, state);
+        }
+        self.partitions.insert(
+            partition,
+            PartitionClock {
+                max_event_time_ms,
+                last_on_time: Some(now),
+            },
+        );
+        self.reindex();
+        self.raise_and_close(now)
     }
 
     pub fn open_windows(&self) -> usize {
@@ -570,6 +616,9 @@ impl WindowOperator {
         let (Some(key), Some(t)) = (&row.key, row.event_time_ms) else {
             return Ok(Vec::new());
         };
+        if self.released.contains(&row.partition) {
+            return Ok(Vec::new());
+        }
         if self
             .instance_watermark_ms
             .is_some_and(|watermark| t < watermark)
@@ -621,7 +670,11 @@ impl WindowOperator {
         end: i64,
         row: &WindowInput,
     ) -> Result<(), WindowFault> {
-        let state = self.keys.entry(key.clone()).or_insert_with(empty_key);
+        let state = self
+            .keys
+            .entry(key.clone())
+            .or_insert_with(|| empty_key(row.partition));
+        state.partition = row.partition;
         let is_new = !state.windows.contains_key(&start);
         let acc = state
             .windows
@@ -642,7 +695,11 @@ impl WindowOperator {
         row: &WindowInput,
     ) -> Result<(), WindowFault> {
         let aggs = self.spec.aggs.clone();
-        let state = self.keys.entry(key.clone()).or_insert_with(empty_key);
+        let state = self
+            .keys
+            .entry(key.clone())
+            .or_insert_with(|| empty_key(row.partition));
+        state.partition = row.partition;
         let hit: Vec<usize> = state
             .sessions
             .iter()
@@ -801,8 +858,9 @@ impl PartitionClock {
     }
 }
 
-fn empty_key() -> KeyState {
+fn empty_key(partition: i32) -> KeyState {
     KeyState {
+        partition,
         windows: BTreeMap::new(),
         sessions: Vec::new(),
     }
@@ -1195,6 +1253,42 @@ mod tests {
         assert_eq!(closed.len(), 1);
         assert_eq!(sum_of(&closed[0]), 6);
         assert_eq!(closed[0].window_start, 0);
+    }
+
+    #[test]
+    fn releasing_a_partition_drops_its_keys_and_does_not_reopen_them() {
+        let t0 = Instant::now();
+        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 60_000, None, None), 0, 60_000);
+        op.apply(&[row(1, 10_000, 0, 4), row(2, 10_000, 1, 9)], t0)
+            .unwrap();
+        assert_eq!(op.open_windows(), 2);
+        op.release_partition(1);
+        assert_eq!(op.open_windows(), 1);
+        let closed = op
+            .apply(&[row(2, 80_000, 1, 1), row(1, 80_000, 0, 3)], t0)
+            .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(sum_of(&closed[0]), 4);
+        assert_eq!(op.open_windows(), 1);
+    }
+
+    #[test]
+    fn adopting_a_partition_keeps_the_open_window() {
+        let t0 = Instant::now();
+        let spec_id = spec(WindowKind::Tumble, 60_000, None, None);
+        let mut op = WindowOperator::new(spec_id, 0, 60_000);
+        op.apply(&[row(1, 10_000, 0, 4)], t0).unwrap();
+        let state = op.freeze_state();
+        op.release_partition(0);
+        assert_eq!(op.open_windows(), 0);
+        let closed = op.adopt_partition(0, state.keys, Some(10_000), t0);
+        assert!(closed.is_empty());
+        assert_eq!(op.open_windows(), 1);
+        let closed = op.apply(&[row(1, 20_000, 0, 3)], t0).unwrap();
+        assert!(closed.is_empty());
+        let closed = op.apply(&[row(1, 70_000, 0, 1)], t0).unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(sum_of(&closed[0]), 7);
     }
 }
 

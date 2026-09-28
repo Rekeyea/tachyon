@@ -93,6 +93,11 @@ pub struct OperatorState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyState {
+    /// Partición de Kafka de la que salió la clave. Sirve para llevarse solo
+    /// esas ventanas cuando la partición cambia de proceso. Un sidecar viejo
+    /// no trae el campo: queda en 0.
+    #[serde(default)]
+    pub partition: i32,
     /// TUMBLE y HOP. Vacío en SESSION. La clave `i64` viaja como string decimal.
     pub windows: BTreeMap<i64, Accumulators>,
     /// SESSION. Vacío en TUMBLE/HOP. Ordenado por `start_ms`.
@@ -219,6 +224,75 @@ pub fn parse_checkpoint(bytes: &[u8]) -> Result<CheckpointBody, String> {
     Ok(CheckpointBody::Offsets(offsets))
 }
 
+/// Ficha de una partición, visible para cualquier `commit_user`. Se escribe
+/// después del snapshot. Sin snapshot no hay ficha nueva: queda la anterior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartitionTicketV1 {
+    pub v: u32,
+    pub topic: String,
+    pub partition: i32,
+    pub commit_user: String,
+    pub snapshot_id: i64,
+    pub applied_offset: i64,
+    pub max_event_time_ms: Option<i64>,
+    pub spec: WindowSpecId,
+    #[serde(serialize_with = "ser_keys", deserialize_with = "de_keys")]
+    pub keys: BTreeMap<Vec<u8>, KeyState>,
+}
+
+impl PartitionTicketV1 {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| e.to_string())
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let ticket: Self =
+            serde_json::from_slice(bytes).map_err(|e| format!("ficha de partición corrupta: {e}"))?;
+        if ticket.v != 1 {
+            return Err(format!("versión de ficha desconocida: {}", ticket.v));
+        }
+        Ok(ticket)
+    }
+}
+
+/// Una ficha por partición presente en `applied`. Las claves de otras
+/// particiones no entran. Una partición sin ventanas abiertas igual publica
+/// su offset, para no releer lo ya cerrado.
+pub fn partition_tickets(
+    checkpoint: &WindowCheckpointV1,
+    commit_user: &str,
+) -> Vec<PartitionTicketV1> {
+    let mut tickets = Vec::new();
+    for (topic, parts) in &checkpoint.applied {
+        for (&partition, &applied_offset) in parts {
+            let keys = checkpoint
+                .state
+                .keys
+                .iter()
+                .filter(|(_, state)| state.partition == partition)
+                .map(|(key, state)| (key.clone(), state.clone()))
+                .collect();
+            let max_event_time_ms = checkpoint
+                .progress
+                .get(topic)
+                .and_then(|parts| parts.get(&partition))
+                .and_then(|progress| progress.max_event_time_ms);
+            tickets.push(PartitionTicketV1 {
+                v: 1,
+                topic: topic.clone(),
+                partition,
+                commit_user: commit_user.to_string(),
+                snapshot_id: checkpoint.commit_identifier,
+                applied_offset,
+                max_event_time_ms,
+                spec: checkpoint.spec.clone(),
+                keys,
+            });
+        }
+    }
+    tickets
+}
+
 impl CheckpointBody {
     /// Bytes que van al archivo. v0 no agrega claves. v1 estampa `v: 1`.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
@@ -255,6 +329,7 @@ mod tests {
         keys.insert(
             key,
             KeyState {
+                partition: 0,
                 windows: BTreeMap::from([(
                     60_000,
                     Accumulators {
@@ -311,6 +386,22 @@ mod tests {
             CheckpointBody::Offsets(got) => assert_eq!(got, offsets),
             CheckpointBody::Window(_) => panic!("v0 leído como ventana"),
         }
+    }
+
+    #[test]
+    fn a_ticket_keeps_only_the_keys_of_its_partition() {
+        let checkpoint = sample_window();
+        let tickets = partition_tickets(&checkpoint, "commit-a");
+        assert_eq!(tickets.len(), 2);
+        let p0 = tickets.iter().find(|t| t.partition == 0).unwrap();
+        assert_eq!(p0.applied_offset, 10);
+        assert_eq!(p0.keys.len(), 1);
+        assert_eq!(p0.max_event_time_ms, Some(70_000));
+        let p1 = tickets.iter().find(|t| t.partition == 1).unwrap();
+        assert!(p1.keys.is_empty());
+        assert_eq!(p1.applied_offset, 3);
+        let bytes = p0.to_bytes().unwrap();
+        assert_eq!(PartitionTicketV1::from_bytes(&bytes).unwrap(), *p0);
     }
 
     #[test]

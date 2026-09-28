@@ -11,8 +11,20 @@
 //! seek a `applied`. La consulta de `rd_kafka_committed` y el low watermark
 //! corren entre polls, nunca dentro del callback de rebalance.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
+
+/// Pedido del poll al operador: ¿hay una ficha commiteada de esta partición?
+pub struct StateRequest {
+    pub partition: i32,
+    pub ack: tokio::sync::oneshot::Sender<Result<Option<i64>, String>>,
+}
+
+struct Member {
+    revoking: bool,
+    reported: bool,
+    assigned: HashSet<i32>,
+}
 
 /// Qué hacer con una partición asignada, entre dos polls.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +61,11 @@ struct Inner {
     blocked_until: BTreeMap<i32, i64>,
     queried: HashSet<i32>,
     seeded: HashSet<i32>,
+    members: HashMap<u64, Member>,
+    /// Particiones que este proceso llegó a poseer. El primer assign completo
+    /// suelta las que ya no están.
+    process_owned: HashSet<i32>,
+    pending_release: Vec<i32>,
     next_consumer: u64,
     fatal: Option<String>,
 }
@@ -64,6 +81,7 @@ pub struct WindowHandoff {
     /// snapshot de un arranque vacío.
     restored: bool,
     inner: Mutex<Inner>,
+    bus: Mutex<Option<tokio::sync::mpsc::UnboundedSender<StateRequest>>>,
 }
 
 impl WindowHandoff {
@@ -99,6 +117,7 @@ impl WindowHandoff {
         applied: BTreeMap<i32, i64>,
     ) -> Self {
         let admitted = applied.clone();
+        let process_owned = applied.keys().copied().collect();
         Self {
             group: group.to_string(),
             topic: topic.to_string(),
@@ -113,10 +132,40 @@ impl WindowHandoff {
                 blocked_until: BTreeMap::new(),
                 queried: HashSet::new(),
                 seeded: HashSet::new(),
+                members: HashMap::new(),
+                process_owned,
+                pending_release: Vec::new(),
                 next_consumer: 0,
                 fatal: None,
             }),
+            bus: Mutex::new(None),
         }
+    }
+
+    pub fn bind_state_bus(&self, tx: tokio::sync::mpsc::UnboundedSender<StateRequest>) {
+        *self.bus.lock().expect("lock del bus de estado") = Some(tx);
+    }
+
+    /// Bloquea hasta que el operador diga si había ficha. `Ok(None)` si este
+    /// proceso no tiene operador escuchando.
+    pub fn request_adopt(&self, partition: i32) -> Result<Option<i64>, String> {
+        let tx = self
+            .bus
+            .lock()
+            .expect("lock del bus de estado")
+            .clone();
+        let Some(tx) = tx else {
+            return Ok(None);
+        };
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(StateRequest {
+            partition,
+            ack: ack_tx,
+        })
+        .map_err(|_| "el operador no recibe adopciones".to_string())?;
+        ack_rx
+            .blocking_recv()
+            .map_err(|_| "el operador cortó la adopción".to_string())?
     }
 
     pub fn topic(&self) -> &str {
@@ -127,10 +176,89 @@ impl WindowHandoff {
     pub fn register_consumer(&self) -> u64 {
         let mut inner = self.lock();
         inner.next_consumer += 1;
-        inner.next_consumer
+        let id = inner.next_consumer;
+        inner.members.insert(
+            id,
+            Member {
+                revoking: false,
+                reported: false,
+                assigned: HashSet::new(),
+            },
+        );
+        id
     }
 
-    pub fn classify(&self, consumer: u64, partition: i32) -> Result<PartitionAction, String> {
+    /// Asignación ya estable de un cliente. Cuando todos reportaron y nadie
+    /// está en medio de un revoke, las particiones que este proceso ya no
+    /// tiene quedan para soltar.
+    pub fn note_assignment(&self, consumer: u64, partitions: &[i32]) {
+        let mut inner = self.lock();
+        let member = inner.members.entry(consumer).or_insert(Member {
+            revoking: false,
+            reported: false,
+            assigned: HashSet::new(),
+        });
+        member.revoking = false;
+        member.reported = true;
+        member.assigned = partitions.iter().copied().collect();
+        recompute_owned(&mut inner);
+    }
+
+    /// El revoke todavía no dice la asignación nueva. No se suelta nada hasta
+    /// el assign que le sigue.
+    pub fn note_revoking(&self, consumer: u64) {
+        let mut inner = self.lock();
+        if let Some(member) = inner.members.get_mut(&consumer) {
+            member.revoking = true;
+            member.assigned.clear();
+        }
+    }
+
+    pub fn take_released(&self) -> Vec<i32> {
+        let mut inner = self.lock();
+        let mut out = std::mem::take(&mut inner.pending_release);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// La partición dejó este proceso. El próximo assign vuelve a preguntar
+    /// si hay una ficha.
+    pub fn forget_partition(&self, partition: i32) {
+        let mut inner = self.lock();
+        inner.applied.remove(&partition);
+        inner.admitted.remove(&partition);
+        inner.blocked_until.remove(&partition);
+        inner.owner.remove(&partition);
+        inner.queried.remove(&partition);
+        inner.seeded.remove(&partition);
+        inner.process_owned.remove(&partition);
+    }
+
+    pub fn note_adopted(&self, partition: i32, offset: i64) {
+        let mut inner = self.lock();
+        let reached = {
+            let slot = inner.applied.entry(partition).or_insert(offset);
+            *slot = (*slot).max(offset);
+            *slot
+        };
+        let admitted = inner.admitted.entry(partition).or_insert(reached);
+        *admitted = (*admitted).max(reached);
+        inner.queried.insert(partition);
+        inner.seeded.insert(partition);
+        inner.process_owned.insert(partition);
+        if inner
+            .blocked_until
+            .get(&partition)
+            .is_some_and(|until| reached >= *until)
+        {
+            inner.blocked_until.remove(&partition);
+        }
+    }
+
+    /// No hay ficha. Si este proceso restauró un checkpoint y la partición no
+    /// estaba, se sale: no hay estado que adoptar ni low watermark seguro.
+    pub fn note_no_ticket(&self, partition: i32) -> Result<(), String> {
         let mut inner = self.lock();
         if let Some(fatal) = inner.fatal.clone() {
             return Err(fatal);
@@ -145,12 +273,18 @@ impl WindowHandoff {
                 self.topic, self.commit_user
             );
             inner.fatal = Some(fatal.clone());
+            inner.queried.insert(partition);
             return Err(fatal);
         }
-        if !inner.snapshot_committed
-            && !inner.applied.contains_key(&partition)
-            && !inner.queried.contains(&partition)
-        {
+        Ok(())
+    }
+
+    pub fn classify(&self, consumer: u64, partition: i32) -> Result<PartitionAction, String> {
+        let inner = self.lock();
+        if let Some(fatal) = inner.fatal.clone() {
+            return Err(fatal);
+        }
+        if !inner.applied.contains_key(&partition) && !inner.queried.contains(&partition) {
             return Ok(PartitionAction::Query);
         }
         if held(&inner, consumer, partition) {
@@ -288,6 +422,27 @@ impl WindowHandoff {
     }
 }
 
+fn recompute_owned(inner: &mut Inner) {
+    if inner.members.is_empty() {
+        return;
+    }
+    if inner
+        .members
+        .values()
+        .any(|member| !member.reported || member.revoking)
+    {
+        return;
+    }
+    let mut union = HashSet::new();
+    for member in inner.members.values() {
+        union.extend(member.assigned.iter().copied());
+    }
+    for partition in inner.process_owned.difference(&union) {
+        inner.pending_release.push(*partition);
+    }
+    inner.process_owned = union;
+}
+
 fn held(inner: &Inner, consumer: u64, partition: i32) -> bool {
     if let Some(&until) = inner.blocked_until.get(&partition) {
         let have = inner.applied.get(&partition).copied().unwrap_or(i64::MIN);
@@ -407,7 +562,8 @@ mod tests {
             gate.classify(id, 0).unwrap(),
             PartitionAction::Ready(Some(12))
         );
-        let err = gate.classify(id, 1).unwrap_err();
+        assert_eq!(gate.classify(id, 1).unwrap(), PartitionAction::Query);
+        let err = gate.note_no_ticket(1).unwrap_err();
         assert!(
             err.contains("partición 1") && err.contains("checkpoint 7"),
             "{err}"
@@ -419,6 +575,26 @@ mod tests {
         gate.mark_snapshot_committed();
         // Una partición nueva, después del primer snapshot de este proceso,
         // no repite la consulta ni se toma como ajena al mapa restaurado.
-        assert_eq!(gate.classify(id, 3).unwrap(), PartitionAction::Ready(None));
+        assert_eq!(gate.classify(id, 3).unwrap(), PartitionAction::Query);
+    }
+
+    #[test]
+    fn a_partition_that_leaves_the_process_is_released_once_assignment_settles() {
+        let gate = WindowHandoff::starting("g", "orders", "commit-a");
+        let a = gate.register_consumer();
+        let b = gate.register_consumer();
+        gate.note_assignment(a, &[0, 1]);
+        assert!(gate.take_released().is_empty());
+        gate.note_assignment(b, &[1]);
+        assert!(gate.take_released().is_empty());
+        gate.note_revoking(a);
+        gate.note_revoking(b);
+        assert!(
+            gate.take_released().is_empty(),
+            "un revoke a medias no suelta las claves"
+        );
+        gate.note_assignment(a, &[]);
+        gate.note_assignment(b, &[1]);
+        assert_eq!(gate.take_released(), vec![0]);
     }
 }
