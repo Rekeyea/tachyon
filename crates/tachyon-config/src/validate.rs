@@ -207,6 +207,8 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
         }
     }
 
+    validate_dimensions(cfg)?;
+
     if let Some(cpu) = cfg
         .deployment
         .resources
@@ -278,6 +280,109 @@ pub fn parse_fixed_duration(raw: &str) -> Result<i64, Error> {
     value.checked_mul(factor).ok_or_else(|| {
         Error::Config(format!("duración '{raw}' se pasa de i64 milisegundos"))
     })
+}
+
+fn validate_dimensions(cfg: &PipelineConfig) -> Result<(), Error> {
+    if cfg.dimensions.is_empty() {
+        return Ok(());
+    }
+    if cfg.dimensions.len() > 1 {
+        return Err(Error::Config(
+            "el lookup une una dimensión".to_string(),
+        ));
+    }
+    let dim = &cfg.dimensions[0];
+    if dim.name.trim().is_empty() || dim.table.trim().is_empty() || dim.key.trim().is_empty() {
+        return Err(Error::Config(
+            "la dimensión necesita name, table y key".to_string(),
+        ));
+    }
+    if cfg.inputs.iter().any(|input| input.name == dim.name) {
+        return Err(Error::Config(format!(
+            "la dimensión '{}' usa el nombre de un input",
+            dim.name
+        )));
+    }
+    if cfg.inputs.iter().any(|input| input.paimon_table().is_some()) {
+        return Err(Error::Config(
+            "el lookup enriquece un stream, no una cola de snapshots".to_string(),
+        ));
+    }
+    let warehouse = cfg
+        .connectors
+        .paimon
+        .as_ref()
+        .map(|paimon| paimon.warehouse.trim())
+        .unwrap_or("");
+    if warehouse.is_empty() {
+        return Err(Error::Config(
+            "una dimensión requiere connectors.paimon.warehouse".to_string(),
+        ));
+    }
+    let memory = cfg
+        .deployment
+        .resources
+        .as_ref()
+        .and_then(|resources| resources.memory.as_deref())
+        .unwrap_or("");
+    if memory.trim().is_empty() {
+        return Err(Error::Config(
+            "una dimensión necesita deployment.resources.memory".to_string(),
+        ));
+    }
+    parse_memory_bytes(memory)?;
+    Ok(())
+}
+
+/// `deployment.resources.memory` en bytes. Acepta un entero y los sufijos
+/// `K/M/G/T` (1000) o `Ki/Mi/Gi/Ti` (1024).
+pub fn parse_memory_bytes(raw: &str) -> Result<u64, Error> {
+    let s = raw.trim();
+    let (number, factor) = if let Some(n) = strip_unit(s, "Ti") {
+        (n, 1024u64.pow(4))
+    } else if let Some(n) = strip_unit(s, "Gi") {
+        (n, 1024u64.pow(3))
+    } else if let Some(n) = strip_unit(s, "Mi") {
+        (n, 1024u64.pow(2))
+    } else if let Some(n) = strip_unit(s, "Ki") {
+        (n, 1024)
+    } else if let Some(n) = strip_unit(s, "T") {
+        (n, 1_000_000_000_000)
+    } else if let Some(n) = strip_unit(s, "G") {
+        (n, 1_000_000_000)
+    } else if let Some(n) = strip_unit(s, "M") {
+        (n, 1_000_000)
+    } else if let Some(n) = strip_unit(s, "K") {
+        (n, 1_000)
+    } else {
+        (s, 1)
+    };
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::Config(format!(
+            "memoria '{raw}' debe ser un entero con sufijo K, M, G, T, Ki, Mi, Gi o Ti"
+        )));
+    }
+    let value: u64 = number.parse().map_err(|_| {
+        Error::Config(format!("memoria '{raw}' no entra en un entero de bytes"))
+    })?;
+    if value == 0 {
+        return Err(Error::Config(format!("memoria '{raw}' debe ser > 0")));
+    }
+    value.checked_mul(factor).ok_or_else(|| {
+        Error::Config(format!("memoria '{raw}' se pasa de u64 bytes"))
+    })
+}
+
+fn strip_unit<'a>(raw: &'a str, unit: &str) -> Option<&'a str> {
+    if raw.len() <= unit.len() {
+        return None;
+    }
+    let (head, tail) = raw.split_at(raw.len() - unit.len());
+    if tail.eq_ignore_ascii_case(unit) {
+        Some(head)
+    } else {
+        None
+    }
 }
 
 /// Interpreta `deployment.resources.cpu` como cantidad de cores enteros.
@@ -522,5 +627,66 @@ deployment:
         .expect("yaml"))
         .unwrap_err();
         assert!(err.to_string().contains("publica un topic"), "{err}");
+    }
+
+    #[test]
+    fn memory_suffixes_are_bytes() {
+        assert_eq!(parse_memory_bytes("4Gi").unwrap(), 4 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_bytes("512Mi").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory_bytes("2K").unwrap(), 2_000);
+        assert_eq!(parse_memory_bytes("4096").unwrap(), 4096);
+        assert!(parse_memory_bytes("0").is_err());
+        assert!(parse_memory_bytes("4GiB").is_err());
+    }
+
+    #[test]
+    fn a_dimension_needs_a_warehouse_and_a_memory_budget() {
+        let ok: PipelineConfig = serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  redpanda:
+    brokers: ["localhost:9092"]
+  paimon:
+    warehouse: ./w
+inputs:
+  - name: orders
+    topic: orders
+    key: order_id
+    schema: orders.json
+dimensions:
+  - name: customers
+    table: default.customers
+    key: customer_id
+output:
+  name: orders_out
+  topic: orders-out
+  key: order_id
+deployment:
+  partitions: 1
+  resources:
+    memory: 256Mi
+"#,
+        )
+        .expect("yaml");
+        assert!(validate_config(&ok).is_ok(), "{ok:?}");
+
+        let mut missing_memory = ok.clone();
+        missing_memory.deployment.resources = None;
+        let err = validate_config(&missing_memory).unwrap_err();
+        assert!(err.to_string().contains("memory"), "{err}");
+
+        let mut clash = ok.clone();
+        clash.dimensions[0].name = "orders".to_string();
+        let err = validate_config(&clash).unwrap_err();
+        assert!(err.to_string().contains("nombre de un input"), "{err}");
+
+        let mut table_input = ok.clone();
+        table_input.inputs[0].topic = None;
+        table_input.inputs[0].table = Some("default.orders".to_string());
+        table_input.inputs[0].schema = None;
+        let err = validate_config(&table_input).unwrap_err();
+        assert!(err.to_string().contains("cola de snapshots"), "{err}");
     }
 }

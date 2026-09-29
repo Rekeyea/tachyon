@@ -42,6 +42,9 @@ pub struct ParsedSql {
     pub window: Option<WindowShape>,
     /// `Some` si el `FROM` es un join por intervalo de dos streams.
     pub join: Option<IntervalJoin>,
+    /// `Some` si el `FROM` es un lookup: una igualdad contra una dimensión.
+    /// Qué lado es la dimensión lo resuelve la config.
+    pub lookup: Option<LookupShape>,
 }
 
 /// Ventana reconocida en el `GROUP BY`, antes de que DataFusion vea la SQL.
@@ -149,10 +152,19 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         }
         shape.source = source_tables[0].clone();
     }
-    let join = interval_join(source)?;
+    let (join, lookup) = match classify_join(source)? {
+        Some(JoinClass::Interval(join)) => (Some(join), None),
+        Some(JoinClass::Lookup(lookup)) => (None, Some(lookup)),
+        None => (None, None),
+    };
     if join.is_some() && window.is_some() {
         return Err(Error::Sql(
             "una query no puede ser ventana y join a la vez".to_string(),
+        ));
+    }
+    if lookup.is_some() && window.is_some() {
+        return Err(Error::Sql(
+            "una query no puede ser ventana y lookup a la vez".to_string(),
         ));
     }
 
@@ -169,7 +181,263 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         select_sql,
         window,
         join,
+        lookup,
     })
+}
+
+/// Igualdad de un stream contra una dimensión, antes de saber cuál lado es cuál.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupShape {
+    pub left: String,
+    pub left_alias: String,
+    pub right: String,
+    pub right_alias: String,
+    pub left_key: String,
+    pub right_key: String,
+    pub kind: LookupKind,
+}
+
+/// Lookup ya orientado: el hecho es el stream y la dimensión es la tabla de Paimon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupJoin {
+    pub fact: String,
+    pub fact_alias: String,
+    pub fact_key: String,
+    pub dimension: String,
+    pub dimension_alias: String,
+    pub dimension_key: String,
+    pub kind: LookupKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupKind {
+    Inner,
+    Left,
+}
+
+/// Columna de la dimensión que el SQL usa, con el nombre que ve DataFusion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DimColumn {
+    pub source: String,
+    pub name: String,
+}
+
+/// SELECT de una sola tabla. Las columnas de la dimensión ya están en el stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewrittenLookup {
+    pub sql: String,
+    pub columns: Vec<DimColumn>,
+}
+
+enum JoinClass {
+    Interval(IntervalJoin),
+    Lookup(LookupShape),
+}
+
+/// El lado que está en `dimension_names` es la dimensión. El otro es un input.
+pub fn orient_lookup(
+    shape: &LookupShape,
+    dimension_names: &[&str],
+    input_names: &[&str],
+) -> Result<LookupJoin, Error> {
+    let left_dim = dimension_names.contains(&shape.left.as_str());
+    let right_dim = dimension_names.contains(&shape.right.as_str());
+    let left_input = input_names.contains(&shape.left.as_str());
+    let right_input = input_names.contains(&shape.right.as_str());
+    let (fact, fact_alias, fact_key, dimension, dimension_alias, dimension_key) =
+        match (left_dim, right_dim) {
+            (false, true) if left_input => (
+                shape.left.clone(),
+                shape.left_alias.clone(),
+                shape.left_key.clone(),
+                shape.right.clone(),
+                shape.right_alias.clone(),
+                shape.right_key.clone(),
+            ),
+            (true, false) if right_input && shape.kind == LookupKind::Inner => (
+                shape.right.clone(),
+                shape.right_alias.clone(),
+                shape.right_key.clone(),
+                shape.left.clone(),
+                shape.left_alias.clone(),
+                shape.left_key.clone(),
+            ),
+            (true, false) if shape.kind == LookupKind::Left => {
+                return Err(Error::Sql(
+                    "el LEFT JOIN conserva el stream; la dimensión va a la derecha".to_string(),
+                ));
+            }
+            (true, true) => {
+                return Err(Error::Sql(
+                    "el lookup une el stream con una dimensión".to_string(),
+                ));
+            }
+            (false, false) if left_input && right_input => {
+                return Err(Error::Sql(
+                    "el join de dos streams es por intervalo: igualdad de la clave y un BETWEEN"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                let missing = if !left_input && !left_dim {
+                    &shape.left
+                } else {
+                    &shape.right
+                };
+                return Err(Error::Sql(format!(
+                    "la tabla '{missing}' no está en inputs ni en dimensions"
+                )));
+            }
+        };
+    Ok(LookupJoin {
+        fact,
+        fact_alias,
+        fact_key,
+        dimension,
+        dimension_alias,
+        dimension_key,
+        kind: shape.kind,
+    })
+}
+
+/// Saca el JOIN. DataFusion ve el hecho con las columnas de la dimensión ya pegadas.
+pub fn rewrite_lookup(
+    select_sql: &str,
+    lookup: &LookupJoin,
+    fact_columns: &[String],
+) -> Result<RewrittenLookup, Error> {
+    use std::collections::HashSet;
+    use std::ops::ControlFlow;
+
+    let mut statements = Parser::parse_sql(&GenericDialect {}, select_sql)
+        .map_err(|e| Error::Sql(format!("error de sintaxis: {e}")))?;
+    if statements.len() != 1 {
+        return Err(Error::Sql(
+            "el lookup reescribe una sola sentencia".to_string(),
+        ));
+    }
+    let Statement::Query(query) = &mut statements[0] else {
+        return Err(Error::Sql(
+            "el lookup reescribe el SELECT".to_string(),
+        ));
+    };
+    {
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            return Err(Error::Sql("el lookup reescribe el SELECT".to_string()));
+        };
+        reject_star(&select.projection)?;
+        if select.from.len() != 1 {
+            return Err(Error::Sql("el lookup tiene un solo FROM".to_string()));
+        }
+        // El ON no aporta columnas: se suelta antes de recorrer el SELECT y el WHERE.
+        select.from[0].joins.clear();
+        select.from[0].relation = bare_table(&lookup.fact);
+    }
+
+    let fact_set: HashSet<&str> = fact_columns.iter().map(String::as_str).collect();
+    let mut columns: Vec<DimColumn> = Vec::new();
+    let mut used: HashSet<String> = HashSet::new();
+    let walked = datafusion::sql::sqlparser::ast::visit_expressions_mut(query, |expr| {
+        let extracted = match &*expr {
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                Some((parts[0].value.clone(), parts[1].value.clone()))
+            }
+            Expr::CompoundIdentifier(parts) => {
+                return ControlFlow::Break(Error::Sql(format!(
+                    "se esperaba alias.columna, llegó {}",
+                    parts
+                        .iter()
+                        .map(|part| part.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                )));
+            }
+            _ => None,
+        };
+        let Some((table, col)) = extracted else {
+            return ControlFlow::Continue(());
+        };
+        let name = if table == lookup.fact_alias {
+            col
+        } else if table == lookup.dimension_alias {
+            if let Some(existing) = columns.iter().find(|item| item.source == col) {
+                existing.name.clone()
+            } else {
+                let name = match column_name_in_stream(&col, &fact_set, &lookup.dimension_alias, &used)
+                {
+                    Ok(name) => name,
+                    Err(err) => return ControlFlow::Break(err),
+                };
+                used.insert(name.clone());
+                columns.push(DimColumn {
+                    source: col,
+                    name: name.clone(),
+                });
+                name
+            }
+        } else {
+            return ControlFlow::Break(Error::Sql(format!(
+                "la columna {table}.{col} no es del stream ni de la dimensión"
+            )));
+        };
+        *expr = Expr::Identifier(datafusion::sql::sqlparser::ast::Ident::new(name));
+        ControlFlow::Continue(())
+    });
+    if let ControlFlow::Break(err) = walked {
+        return Err(err);
+    }
+
+    Ok(RewrittenLookup {
+        sql: query.to_string(),
+        columns,
+    })
+}
+
+fn column_name_in_stream(
+    source: &str,
+    fact: &std::collections::HashSet<&str>,
+    alias: &str,
+    used: &std::collections::HashSet<String>,
+) -> Result<String, Error> {
+    let prefixed = format!("{alias}_{source}");
+    for candidate in [source.to_string(), prefixed] {
+        if !fact.contains(candidate.as_str()) && !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::Sql(format!(
+        "la columna '{source}' de la dimensión no entra al lado del hecho"
+    )))
+}
+
+fn bare_table(name: &str) -> TableFactor {
+    use datafusion::sql::sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+    TableFactor::Table {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        alias: None,
+        args: None,
+        with_hints: vec![],
+        version: None,
+        with_ordinality: false,
+        partitions: vec![],
+        json_path: None,
+        sample: None,
+        index_hints: vec![],
+    }
+}
+
+fn reject_star(items: &[SelectItem]) -> Result<(), Error> {
+    for item in items {
+        if !matches!(
+            item,
+            SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }
+        ) {
+            return Err(Error::Sql(
+                "el lookup no acepta SELECT *".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Join por intervalo de dos streams. `None` si el `FROM` no tiene join.
@@ -196,7 +464,7 @@ pub struct JoinSelect {
     pub alias: String,
 }
 
-fn interval_join(query: &Query) -> Result<Option<IntervalJoin>, Error> {
+fn classify_join(query: &Query) -> Result<Option<JoinClass>, Error> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
@@ -212,16 +480,44 @@ fn interval_join(query: &Query) -> Result<Option<IntervalJoin>, Error> {
     let (left, left_alias) = table_ref(&from.relation)?;
     let join = &from.joins[0];
     let (right, right_alias) = table_ref(&join.relation)?;
-    let on = match &join.join_operator {
+    let (on, kind) = match &join.join_operator {
         JoinOperator::Join(JoinConstraint::On(expr))
-        | JoinOperator::Inner(JoinConstraint::On(expr)) => expr,
+        | JoinOperator::Inner(JoinConstraint::On(expr)) => (expr, LookupKind::Inner),
+        JoinOperator::Left(JoinConstraint::On(expr))
+        | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => (expr, LookupKind::Left),
         _ => {
             return Err(Error::Sql(
-                "el join tiene que ser INNER con ON".to_string(),
+                "el join tiene que ser INNER o LEFT con ON".to_string(),
             ))
         }
     };
     let predicates = split_and(on);
+    if predicates.len() == 1 || kind == LookupKind::Left {
+        if predicates.len() != 1 {
+            return Err(Error::Sql(
+                "el LEFT JOIN de una dimensión es una sola igualdad".to_string(),
+            ));
+        }
+        let Some((left_qual, right_qual)) = equality_of(predicates[0])? else {
+            return Err(Error::Sql(
+                "el ON del lookup es una igualdad".to_string(),
+            ));
+        };
+        reject_star(&select.projection)?;
+        let left_name = left_alias.unwrap_or_else(|| left.clone());
+        let right_name = right_alias.unwrap_or_else(|| right.clone());
+        let (left_key, right_key) =
+            assign_pair(&left_name, &right_name, left_qual, right_qual)?;
+        return Ok(Some(JoinClass::Lookup(LookupShape {
+            left,
+            left_alias: left_name,
+            right,
+            right_alias: right_name,
+            left_key,
+            right_key,
+            kind,
+        })));
+    }
     if predicates.len() != 2 {
         return Err(Error::Sql(
             "el ON del join es la igualdad de la clave y un BETWEEN".to_string(),
@@ -277,7 +573,7 @@ fn interval_join(query: &Query) -> Result<Option<IntervalJoin>, Error> {
         (span.probe_column, span.base_column)
     };
     let columns = join_select(&select.projection, left_name, right_name)?;
-    Ok(Some(IntervalJoin {
+    Ok(Some(JoinClass::Interval(IntervalJoin {
         left,
         right,
         left_key,
@@ -288,7 +584,7 @@ fn interval_join(query: &Query) -> Result<Option<IntervalJoin>, Error> {
         upper_ms: span.upper_ms,
         base_is_left,
         columns,
-    }))
+    })))
 }
 
 struct TimeSpan {
@@ -484,10 +780,22 @@ fn join_select(
 
 fn table_ref(factor: &TableFactor) -> Result<(String, Option<String>), Error> {
     match factor {
-        TableFactor::Table { name, alias, .. } => Ok((
-            table_name(name),
-            alias.as_ref().map(|alias| alias.name.value.clone()),
-        )),
+        TableFactor::Table {
+            name,
+            alias,
+            version,
+            ..
+        } => {
+            if version.is_some() {
+                return Err(Error::Sql(
+                    "FOR SYSTEM_TIME AS OF queda para después".to_string(),
+                ));
+            }
+            Ok((
+                table_name(name),
+                alias.as_ref().map(|alias| alias.name.value.clone()),
+            ))
+        }
         _ => Err(Error::Sql(
             "el join solo acepta tablas, no subqueries".to_string(),
         )),
@@ -1135,10 +1443,81 @@ mod tests {
     }
 
     #[test]
-    fn a_join_without_an_interval_does_not_parse() {
-        let sql = "INSERT INTO out SELECT a.x FROM a JOIN b ON a.id = b.id";
-        let err = parse_sql(sql).unwrap_err();
+    fn an_equality_join_is_a_lookup() {
+        let sql = "INSERT INTO out SELECT a.x, b.name \
+            FROM a JOIN b ON a.id = b.id";
+        let parsed = parse_sql(sql).unwrap();
+        assert!(parsed.join.is_none());
+        let shape = parsed.lookup.expect("lookup");
+        assert_eq!(shape.left, "a");
+        assert_eq!(shape.right, "b");
+        assert_eq!(shape.left_key, "id");
+        assert_eq!(shape.right_key, "id");
+        assert_eq!(shape.kind, LookupKind::Inner);
+        let err = orient_lookup(&shape, &[], &["a", "b"]).unwrap_err();
         assert!(err.to_string().contains("BETWEEN"), "{err}");
+        let join = orient_lookup(&shape, &["b"], &["a"]).unwrap();
+        assert_eq!(join.fact, "a");
+        assert_eq!(join.dimension, "b");
+        assert_eq!(join.dimension_key, "id");
+    }
+
+    #[test]
+    fn a_left_lookup_keeps_the_stream_on_the_left() {
+        let sql = "INSERT INTO out \
+            SELECT o.order_id, c.name AS customer_name \
+            FROM orders o \
+            LEFT JOIN customers c ON o.customer_id = c.customer_id \
+            WHERE c.country = 'AR'";
+        let parsed = parse_sql(sql).unwrap();
+        let shape = parsed.lookup.expect("lookup");
+        assert_eq!(shape.kind, LookupKind::Left);
+        let err = orient_lookup(&shape, &["orders"], &["customers"]).unwrap_err();
+        assert!(err.to_string().contains("derecha"), "{err}");
+        let join = orient_lookup(&shape, &["customers"], &["orders"]).unwrap();
+        let rewritten = rewrite_lookup(
+            &parsed.select_sql,
+            &join,
+            &["order_id".to_string(), "customer_id".to_string()],
+        )
+        .unwrap();
+        assert!(!rewritten.sql.to_uppercase().contains("JOIN"), "{}", rewritten.sql);
+        assert!(rewritten.sql.contains("customer_name"), "{}", rewritten.sql);
+        assert!(rewritten.sql.contains("country"), "{}", rewritten.sql);
+        assert_eq!(
+            rewritten
+                .columns
+                .iter()
+                .map(|col| col.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["name", "country"]
+        );
+        assert_eq!(rewritten.columns[0].name, "name");
+    }
+
+    #[test]
+    fn a_dimension_column_that_collides_gets_the_alias() {
+        let sql = "INSERT INTO out SELECT o.order_id, c.name AS customer_name \
+            FROM orders o JOIN customers c ON o.customer_id = c.customer_id";
+        let parsed = parse_sql(sql).unwrap();
+        let join = orient_lookup(parsed.lookup.as_ref().unwrap(), &["customers"], &["orders"]).unwrap();
+        let rewritten = rewrite_lookup(
+            &parsed.select_sql,
+            &join,
+            &["order_id".to_string(), "name".to_string(), "customer_id".to_string()],
+        )
+        .unwrap();
+        assert_eq!(rewritten.columns[0].name, "c_name");
+        assert!(rewritten.sql.contains("c_name"), "{}", rewritten.sql);
+    }
+
+    #[test]
+    fn system_time_stays_out() {
+        let sql = "INSERT INTO out SELECT o.order_id \
+            FROM orders o JOIN customers FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-01' c \
+            ON o.customer_id = c.customer_id";
+        let err = parse_sql(sql).unwrap_err();
+        assert!(err.to_string().contains("SYSTEM_TIME"), "{err}");
     }
 
     #[test]

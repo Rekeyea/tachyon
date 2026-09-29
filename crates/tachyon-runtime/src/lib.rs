@@ -6,6 +6,7 @@
 pub mod budget;
 pub mod execute;
 pub mod join;
+pub mod lookup;
 pub mod run;
 pub mod runtime;
 pub mod table_stream;

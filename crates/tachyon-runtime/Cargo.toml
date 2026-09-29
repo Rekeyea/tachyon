@@ -22,6 +22,7 @@ rdkafka = { version = "0.39", features = ["cmake-build"] }
 apache-avro = "0.21"
 
 [dev-dependencies]
+tachyon-sink = { path = "../tachyon-sink" }
 serde_yaml.workspace = true
 anyhow.workspace = true
 paimon = "0.3"

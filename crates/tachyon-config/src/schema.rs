@@ -9,6 +9,10 @@ pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
     pub connectors: Connectors,
     pub inputs: Vec<InputDef>,
+    /// Dimensiones chicas de Paimon. El SQL las une por igualdad; Tachyon
+    /// las tiene en memoria y enriquece el stream antes de DataFusion.
+    #[serde(default)]
+    pub dimensions: Vec<DimensionDef>,
     pub output: OutputConfig,
     pub deployment: Deployment,
 }
@@ -106,6 +110,16 @@ pub struct InputDef {
     pub avro_schema: Option<String>,
     #[serde(default)]
     pub watermark: Option<WatermarkConfig>,
+}
+
+/// Una dimensión de Paimon. El nombre es el de la tabla en el `JOIN`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DimensionDef {
+    pub name: String,
+    /// `db.tabla` en el warehouse.
+    pub table: String,
+    /// Columna de la igualdad. Una sola.
+    pub key: String,
 }
 
 impl InputDef {

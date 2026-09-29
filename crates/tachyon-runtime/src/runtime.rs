@@ -9,10 +9,13 @@ use tachyon_config::{validate_config, PipelineConfig};
 use tachyon_core::{OutputDef, PartitionKey, PipelinePlan, StreamDef};
 use tachyon_metrics::InstanceMetrics;
 use tachyon_sink::writer::PaimonSink;
-use tachyon_sql::{parse_sql, WindowShape};
+use tachyon_sql::{orient_lookup, parse_sql, LookupJoin, LookupShape, WindowShape};
 
 use crate::join::run_join_pipeline;
-use crate::run::{run_pipeline, run_topic_pipeline, PipelineHandle, PreparedInput, RunOptions};
+use crate::run::{
+    run_pipeline_with_lookup, run_topic_pipeline_with_lookup, PipelineHandle, PreparedInput,
+    RunOptions,
+};
 use crate::table_stream::run_table_stream;
 
 /// Un pipeline de Tachyon (una instancia).
@@ -25,6 +28,7 @@ pub struct Pipeline {
     /// se rechaza en vez de mandar `TUMBLE` a DataFusion.
     window: Option<WindowShape>,
     join: Option<tachyon_sql::IntervalJoin>,
+    lookup: Option<LookupJoin>,
 }
 
 impl Pipeline {
@@ -34,6 +38,7 @@ impl Pipeline {
     pub fn new(config: &PipelineConfig, sql: &str) -> Result<Self> {
         validate_config(config)?;
         let parsed = parse_sql(sql)?;
+        let lookup = bind_lookup(config, parsed.lookup.as_ref())?;
 
         // Los schemas de columnas de los inputs se pueblan en el Slice 2, al
         // cargar los schemas Avro. Aquí solo el nombre lógico + la clave.
@@ -62,7 +67,10 @@ impl Pipeline {
             partitions: config.deployment.partitions,
             query: parsed.query,
             sql_target: parsed.target,
-            sql_source_tables: parsed.source_tables,
+            sql_source_tables: match &lookup {
+                Some(join) => vec![join.fact.clone()],
+                None => parsed.source_tables,
+            },
         };
 
         plan.validate_alignment()?;
@@ -73,6 +81,7 @@ impl Pipeline {
             select_sql: parsed.select_sql.clone(),
             window: parsed.window,
             join: parsed.join,
+            lookup,
         })
     }
 
@@ -119,7 +128,7 @@ impl Pipeline {
             }
             let options = RunOptions::from_config(&self.config);
             let metrics = Arc::new(InstanceMetrics::new());
-            return run_topic_pipeline(
+            return run_topic_pipeline_with_lookup(
                 &self.config,
                 &self.select_sql,
                 &options,
@@ -127,6 +136,7 @@ impl Pipeline {
                 &self.config.output.key,
                 input_codecs,
                 &metrics,
+                self.lookup.as_ref(),
             )
             .await;
         }
@@ -178,7 +188,7 @@ impl Pipeline {
             )
             .await;
         }
-        run_pipeline(
+        run_pipeline_with_lookup(
             &self.config,
             &self.select_sql,
             &options,
@@ -186,9 +196,48 @@ impl Pipeline {
             input_codecs,
             &metrics,
             self.window.as_ref(),
+            self.lookup.as_ref(),
         )
         .await
     }
+}
+
+/// Orienta el JOIN contra el YAML. La dimensión no es un input.
+fn bind_lookup(
+    config: &PipelineConfig,
+    shape: Option<&LookupShape>,
+) -> Result<Option<LookupJoin>> {
+    let dimension_names: Vec<&str> = config
+        .dimensions
+        .iter()
+        .map(|dimension| dimension.name.as_str())
+        .collect();
+    let input_names: Vec<&str> = config.inputs.iter().map(|input| input.name.as_str()).collect();
+    if let Some(shape) = shape {
+        let join = orient_lookup(shape, &dimension_names, &input_names)?;
+        if config.inputs.len() != 1 {
+            anyhow::bail!("el lookup enriquece un solo stream");
+        }
+        let Some(dimension) = config.dimensions.first() else {
+            anyhow::bail!("el lookup une una dimensión");
+        };
+        if join.dimension != dimension.name {
+            anyhow::bail!("la dimensión '{}' no está en el JOIN", dimension.name);
+        }
+        if dimension.key != join.dimension_key {
+            anyhow::bail!(
+                "la clave de '{}' es '{}' en el YAML y '{}' en el JOIN",
+                dimension.name,
+                dimension.key,
+                join.dimension_key
+            );
+        }
+        return Ok(Some(join));
+    }
+    if let Some(dimension) = config.dimensions.first() {
+        anyhow::bail!("la dimensión '{}' no está en el JOIN", dimension.name);
+    }
+    Ok(None)
 }
 
 /// Divide un identificador `db.table` en (db, table).
@@ -302,5 +351,78 @@ deployment:
             err.to_string().contains("sintaxis"),
             "error inesperado: {err}"
         );
+    }
+
+    fn lookup_yaml() -> String {
+        r#"
+pipeline:
+  name: orders-lookup
+connectors:
+  redpanda:
+    brokers: [localhost:9092]
+  paimon:
+    warehouse: ./warehouse
+inputs:
+  - name: orders
+    topic: orders-topic
+    key: order_id
+    schema: orders.json
+dimensions:
+  - name: customers
+    table: default.customers
+    key: customer_id
+output:
+  name: orders_out
+  topic: orders-out
+  key: order_id
+deployment:
+  partitions: 1
+  resources:
+    memory: 256Mi
+"#
+        .to_string()
+    }
+
+    const LOOKUP_SQL: &str = "INSERT INTO orders_out \
+        SELECT o.order_id, c.name AS customer_name \
+        FROM orders o \
+        LEFT JOIN customers c ON o.customer_id = c.customer_id";
+
+    #[test]
+    fn a_lookup_binds_only_the_fact() {
+        let pipeline = Pipeline::new(&load(&lookup_yaml()), LOOKUP_SQL).expect("lookup");
+        assert_eq!(pipeline.plan.sql_source_tables, vec!["orders"]);
+        let lookup = pipeline.lookup.expect("lookup");
+        assert_eq!(lookup.fact, "orders");
+        assert_eq!(lookup.dimension, "customers");
+        assert_eq!(lookup.dimension_key, "customer_id");
+        assert_eq!(lookup.kind, tachyon_sql::LookupKind::Left);
+    }
+
+    #[test]
+    fn a_dimension_key_must_match_the_join() {
+        let yaml = lookup_yaml().replace("key: customer_id", "key: other_id");
+        let err = Pipeline::new(&load(&yaml), LOOKUP_SQL).unwrap_err();
+        assert!(err.to_string().contains("JOIN"), "{err}");
+    }
+
+    #[test]
+    fn a_dimension_without_a_join_does_not_start() {
+        let err = Pipeline::new(
+            &load(&lookup_yaml()),
+            "INSERT INTO orders_out SELECT order_id FROM orders",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no está en el JOIN"), "{err}");
+    }
+
+    #[test]
+    fn a_lookup_enriches_one_stream() {
+        let yaml = lookup_yaml().replace(
+            "    schema: orders.json\n",
+            "    schema: orders.json\n  - name: payments\n    topic: payments\n    key: order_id\n    schema: payments.json\n",
+        );
+        let err = Pipeline::new(&load(&yaml), LOOKUP_SQL).unwrap_err();
+        assert!(err.to_string().contains("un solo stream"), "{err}");
     }
 }

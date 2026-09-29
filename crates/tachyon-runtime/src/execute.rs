@@ -424,4 +424,70 @@ mod tests {
             assert!(ensure_passthrough(&plan).is_err(), "{sql} debe rechazarse");
         }
     }
+
+    #[tokio::test]
+    async fn a_rewritten_lookup_stays_passthrough() {
+        use tachyon_sql::{orient_lookup, parse_sql, rewrite_lookup};
+
+        let parsed = parse_sql(
+            "INSERT INTO out \
+             SELECT o.order_id, c.name AS customer_name \
+             FROM orders o \
+             LEFT JOIN customers c ON o.customer_id = c.customer_id \
+             WHERE c.country = 'AR'",
+        )
+        .expect("parse");
+        let join = orient_lookup(
+            parsed.lookup.as_ref().expect("lookup"),
+            &["customers"],
+            &["orders"],
+        )
+        .expect("orient");
+        let rewritten = rewrite_lookup(
+            &parsed.select_sql,
+            &join,
+            &[
+                "order_id".to_string(),
+                "customer_id".to_string(),
+                "status".to_string(),
+                "amount".to_string(),
+            ],
+        )
+        .expect("rewrite");
+        assert!(!rewritten.sql.to_uppercase().contains("JOIN"), "{}", rewritten.sql);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("customer_id", DataType::Int64, true),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("amount", DataType::Float64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("country", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![Some(7)])),
+                Arc::new(StringArray::from(vec![Some("paid")])),
+                Arc::new(Float64Array::from(vec![Some(10.0)])),
+                Arc::new(StringArray::from(vec![Some("ana")])),
+                Arc::new(StringArray::from(vec![Some("AR")])),
+            ],
+        )
+        .expect("batch");
+        let inputs = vec![InputSource {
+            name: "orders".into(),
+            schema,
+        }];
+        let factory = in_memory_factory(&std::collections::HashMap::from([(
+            "orders".to_string(),
+            batch,
+        )]));
+        let plan = plan_query(&rewritten.sql, &inputs, &factory)
+            .await
+            .expect("plan")
+            .0;
+        ensure_passthrough(&plan).unwrap_or_else(|err| panic!("{}: {err:#}", rewritten.sql));
+    }
 }

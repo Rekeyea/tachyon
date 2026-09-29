@@ -7,6 +7,7 @@
 pub mod parse;
 
 pub use parse::{
-    parse_sql, table_select, IntervalJoin, JoinSelect, TableColumns, TableSelect, WindowAgg,
+    orient_lookup, parse_sql, rewrite_lookup, table_select, DimColumn, IntervalJoin, JoinSelect,
+    LookupJoin, LookupKind, LookupShape, RewrittenLookup, TableColumns, TableSelect, WindowAgg,
     WindowShape,
 };

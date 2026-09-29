@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
+use datafusion::physical_plan::streaming::PartitionStream;
 use futures::StreamExt;
 use rdkafka::consumer::Consumer;
 use rdkafka::ClientConfig;
@@ -45,10 +46,11 @@ use tachyon_source::{
     register_topic_schema, SchemaCache,
 };
 use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
-use tachyon_sql::WindowShape;
+use tachyon_sql::{LookupJoin, WindowShape};
 
 use crate::budget::StatelessBudget;
 use crate::execute::{ensure_passthrough, plan_query, InputSource, StreamTableFactory};
+use crate::lookup::{prepare_lookup, LookupStream, PreparedLookup};
 use crate::window::{
     batch_from_closed, inputs_from_batch, output_field_names, schema_with_partition,
     spec_from_shape, user_schema_without_partition, WindowOperator, PARTITION_COLUMN,
@@ -93,6 +95,67 @@ fn release_lost_partitions(
         }
         handoff.forget_partition(partition);
     }
+}
+
+/// Schema del decoder y schema del stream interno. Con lookup el decoder ve
+/// el hecho; la tabla de DataFusion ya trae las columnas de la dimensión.
+fn decode_plan(
+    table_schema: &SchemaRef,
+    lookup: &Option<PreparedLookup>,
+    name: &str,
+) -> (SchemaRef, SchemaRef, bool) {
+    if let Some(prepared) = lookup.as_ref().filter(|item| item.fact == name) {
+        return (
+            prepared.fact_schema.clone(),
+            prepared.fact_schema.clone(),
+            false,
+        );
+    }
+    if table_schema
+        .fields()
+        .last()
+        .is_some_and(|field| field.name() == PARTITION_COLUMN)
+    {
+        return (
+            user_schema_without_partition(table_schema),
+            table_schema.clone(),
+            true,
+        );
+    }
+    (table_schema.clone(), table_schema.clone(), false)
+}
+
+fn as_partition(
+    inner: RedpandaPartitionStream,
+    lookup: &Option<PreparedLookup>,
+    name: &str,
+) -> Arc<dyn PartitionStream> {
+    if let Some(prepared) = lookup.as_ref().filter(|item| item.fact == name) {
+        Arc::new(LookupStream::new(inner, prepared))
+    } else {
+        Arc::new(inner)
+    }
+}
+
+fn input_table_schema(
+    prepared_schema: SchemaRef,
+    input_name: &str,
+    window: bool,
+    lookup: &Option<PreparedLookup>,
+) -> Result<SchemaRef> {
+    if window {
+        if prepared_schema.field_with_name(PARTITION_COLUMN).is_ok() {
+            anyhow::bail!("'{PARTITION_COLUMN}' está reservado");
+        }
+        return Ok(schema_with_partition(prepared_schema));
+    }
+    if let Some(prepared) = lookup
+        .as_ref()
+        .filter(|item| item.fact == input_name)
+    {
+        return Ok(prepared.enriched_schema.clone());
+    }
+    Ok(prepared_schema)
 }
 
 pub(crate) fn merge_offsets(offsets: &mut SourceOffsets, update: &SourceOffsets) {
@@ -342,6 +405,29 @@ pub async fn run_pipeline(
     metrics: &Arc<InstanceMetrics>,
     window: Option<&WindowShape>,
 ) -> Result<PipelineHandle> {
+    run_pipeline_with_lookup(
+        config,
+        select_sql,
+        options,
+        sink,
+        input_codecs,
+        metrics,
+        window,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_pipeline_with_lookup(
+    config: &PipelineConfig,
+    select_sql: &str,
+    options: &RunOptions,
+    sink: PaimonSink,
+    input_codecs: &std::collections::HashMap<String, PreparedInput>,
+    metrics: &Arc<InstanceMetrics>,
+    window: Option<&WindowShape>,
+    lookup: Option<&LookupJoin>,
+) -> Result<PipelineHandle> {
     // Exactly-once no se desactiva: los offsets se commitean con el snapshot
     // de Paimon y un plan que retiene filas entre batches se rechaza abajo.
     // El paralelismo sale del pin (ver `StatelessBudget`).
@@ -432,9 +518,21 @@ pub async fn run_pipeline(
         ensure_window_consumers(checkpoint.consumers_per_topic, n_consumers)?;
     }
     let session_timeout_ms = window_session_timeout_ms(options.commit_interval);
-    let planned_sql = match window {
-        Some(shape) => shape.rewrite_sql(),
-        None => select_sql.to_string(),
+    let prepared_lookup = match lookup {
+        Some(join) if window.is_none() => {
+            let codec = input_codecs.get(&join.fact).cloned().with_context(|| {
+                format!("sin schema para el input '{}'", join.fact)
+            })?;
+            Some(prepare_lookup(config, join, select_sql, codec.schema).await?)
+        }
+        _ => None,
+    };
+    let planned_sql = if let Some(shape) = window {
+        shape.rewrite_sql()
+    } else if let Some(prepared) = &prepared_lookup {
+        prepared.sql.clone()
+    } else {
+        select_sql.to_string()
     };
 
     for input_def in &config.inputs {
@@ -455,14 +553,12 @@ pub async fn run_pipeline(
             "codec del input"
         );
         let topic = input_def.kafka_topic()?.to_string();
-        let schema = if window.is_some() {
-            if prepared.schema.field_with_name(PARTITION_COLUMN).is_ok() {
-                anyhow::bail!("'{PARTITION_COLUMN}' está reservado");
-            }
-            schema_with_partition(prepared.schema.clone())
-        } else {
-            prepared.schema.clone()
-        };
+        let schema = input_table_schema(
+            prepared.schema.clone(),
+            &input_def.name,
+            window.is_some(),
+            &prepared_lookup,
+        )?;
 
         let source_group = format!("{}-{}", options.group_id, input_def.name);
         let mut source_cc = cc.clone();
@@ -560,15 +656,8 @@ pub async fn run_pipeline(
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("source no encontrado para '{name}'"))?;
-        let (decode_schema, row_partitions) = if schema
-            .fields()
-            .last()
-            .is_some_and(|field| field.name() == PARTITION_COLUMN)
-        {
-            (user_schema_without_partition(&schema), true)
-        } else {
-            (schema.clone(), false)
-        };
+        let (decode_schema, inner_schema, row_partitions) =
+            decode_plan(&schema, &prepared_lookup, name);
         let decoder = Decoder::new(decode_schema, format);
         // Un `record_stream()` por consumidor, fusionados con `select_all`:
         // el grupo reparte las particiones entre ellos y cada instancia
@@ -585,12 +674,17 @@ pub async fn run_pipeline(
                 Box::pin(futures::stream::select_all(streams));
             merged
         });
-        let ps = Arc::new(
-            RedpandaPartitionStream::new(0, schema.clone(), decoder.clone(), batch_size, make_stream)
-                .with_offset_tracker(tracker)
-                .with_decode_parallelism(decode_parallelism)
-                .with_row_partitions(row_partitions),
-        );
+        let inner = RedpandaPartitionStream::new(
+            0,
+            inner_schema,
+            decoder,
+            batch_size,
+            make_stream,
+        )
+        .with_offset_tracker(tracker)
+        .with_decode_parallelism(decode_parallelism)
+        .with_row_partitions(row_partitions);
+        let ps = as_partition(inner, &prepared_lookup, name);
         let table = datafusion::catalog::streaming::StreamingTable::try_new(
             schema,
             vec![ps],
@@ -822,6 +916,29 @@ pub async fn run_topic_pipeline(
     input_codecs: &std::collections::HashMap<String, PreparedInput>,
     metrics: &Arc<InstanceMetrics>,
 ) -> Result<PipelineHandle> {
+    run_topic_pipeline_with_lookup(
+        config,
+        select_sql,
+        options,
+        topic,
+        key,
+        input_codecs,
+        metrics,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_topic_pipeline_with_lookup(
+    config: &PipelineConfig,
+    select_sql: &str,
+    options: &RunOptions,
+    topic: &str,
+    key: &str,
+    input_codecs: &std::collections::HashMap<String, PreparedInput>,
+    metrics: &Arc<InstanceMetrics>,
+    lookup: Option<&LookupJoin>,
+) -> Result<PipelineHandle> {
     if config.inputs.len() != 1 {
         anyhow::bail!(
             "el sink a un topic tiene un solo input: la transacción commitea un consumer group"
@@ -883,12 +1000,32 @@ pub async fn run_topic_pipeline(
     let batch_size = budget.batch_size;
     let decode_parallelism = budget.decode_parallelism;
     let input_name = input_def.name.clone();
-    let input_schema = prepared.schema.clone();
+    let prepared_lookup = match lookup {
+        Some(join) => {
+            if join.fact != input_def.name {
+                anyhow::bail!("el lookup enriquece '{}'", join.fact);
+            }
+            Some(prepare_lookup(config, join, select_sql, prepared.schema.clone()).await?)
+        }
+        None => None,
+    };
+    let input_schema = input_table_schema(
+        prepared.schema.clone(),
+        &input_def.name,
+        false,
+        &prepared_lookup,
+    )?;
+    let planned_sql = prepared_lookup
+        .as_ref()
+        .map(|item| item.sql.clone())
+        .unwrap_or_else(|| select_sql.to_string());
     let factory: Box<StreamTableFactory> = Box::new(move |name, schema| {
         if name != input_name {
             anyhow::bail!("source no encontrado para '{name}'");
         }
-        let decoder = Decoder::new(schema.clone(), decoder_format.clone());
+        let (decode_schema, inner_schema, _row_partitions) =
+            decode_plan(&schema, &prepared_lookup, name);
+        let decoder = Decoder::new(decode_schema, decoder_format.clone());
         let sources = input_sources.clone();
         let make_stream = Arc::new(move || {
             let merged: tachyon_source::consumer::RecordStream =
@@ -897,11 +1034,10 @@ pub async fn run_topic_pipeline(
                 ));
             merged
         });
-        let ps = Arc::new(
-            RedpandaPartitionStream::new(0, schema.clone(), decoder, batch_size, make_stream)
-                .with_offset_tracker(stream_tracker.clone())
-                .with_decode_parallelism(decode_parallelism),
-        );
+        let inner = RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
+            .with_offset_tracker(stream_tracker.clone())
+            .with_decode_parallelism(decode_parallelism);
+        let ps = as_partition(inner, &prepared_lookup, name);
         let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, vec![ps])
             .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
         Ok(Arc::new(table.with_infinite_table(true)))
@@ -910,7 +1046,7 @@ pub async fn run_topic_pipeline(
         name: input_def.name.clone(),
         schema: input_schema,
     }];
-    let (plan, task_ctx) = plan_query(select_sql, &inputs, &factory)
+    let (plan, task_ctx) = plan_query(&planned_sql, &inputs, &factory)
         .await
         .context("planificando la transformación")?;
     ensure_passthrough(&plan).context("la transformación no admite exactly-once")?;
