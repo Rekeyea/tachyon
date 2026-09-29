@@ -15,6 +15,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tachyon_config::{PayloadFormat, PipelineConfig};
 use tachyon_runtime::{Pipeline, PreparedInput, StatelessBudget};
+use tachyon_sink::compact::compact_table;
+use tachyon_sink::writer::open_table;
 
 /// Tachyon: motor de ejecución de pipelines streaming sobre lakehouse.
 #[derive(Parser, Debug)]
@@ -32,6 +34,14 @@ struct Args {
     /// `schema` de la config es solo un nombre de archivo).
     #[arg(long)]
     schemas_dir: Option<PathBuf>,
+
+    /// Compacta la tabla de salida y termina. No corre el pipeline.
+    #[arg(long)]
+    compact: bool,
+
+    /// Archivos en un bucket a partir de los cuales esa pasada compacta.
+    #[arg(long, default_value_t = 8)]
+    compact_min_files: usize,
 }
 
 /// Un campo del schema Arrow (formato JSON simplificado).
@@ -92,6 +102,39 @@ fn load_schema(path: &PathBuf) -> Result<Arc<Schema>> {
     Ok(Arc::new(Schema::new(arrow_fields)))
 }
 
+fn split_table(id: &str) -> (String, String) {
+    match id.split_once('.') {
+        Some((database, table)) => (database.to_string(), table.to_string()),
+        None => ("default".to_string(), id.to_string()),
+    }
+}
+
+async fn compact_output(config: &PipelineConfig, min_files: usize) -> Result<()> {
+    let table_name = config.output.table.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("la compactación publica un snapshot de output.table")
+    })?;
+    let warehouse = config
+        .connectors
+        .paimon
+        .as_ref()
+        .map(|paimon| paimon.warehouse.as_str())
+        .ok_or_else(|| anyhow::anyhow!("la compactación necesita connectors.paimon.warehouse"))?;
+    let (database, table_id) = split_table(table_name);
+    let table = open_table(warehouse, &database, &table_id).await?;
+    let outcome = compact_table(&table, min_files).await?;
+    match outcome.snapshot_id {
+        Some(id) => println!(
+            "compacté el snapshot {id}: {} archivos, quedan {}",
+            outcome.files_before, outcome.files_after
+        ),
+        None => println!(
+            "ningún bucket llegó a {min_files} archivos (hay {})",
+            outcome.files_before
+        ),
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
@@ -100,6 +143,16 @@ fn main() -> Result<()> {
         .with_context(|| format!("leyendo config {}", args.config.display()))?;
     let config: PipelineConfig =
         serde_yaml::from_str(&config_str).with_context(|| "parseando pipeline.yaml".to_string())?;
+
+    if args.compact {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("tachyon-compact")
+            .build()
+            .context("creando el runtime")?;
+        return rt.block_on(compact_output(&config, args.compact_min_files));
+    }
 
     let sql_str = std::fs::read_to_string(&args.sql)
         .with_context(|| format!("leyendo SQL {}", args.sql.display()))?;

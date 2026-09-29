@@ -4782,6 +4782,7 @@ dependencies = [
  "serde_yaml",
  "tachyon-config",
  "tachyon-runtime",
+ "tachyon-sink",
  "tokio",
  "tracing",
  "tracing-subscriber",

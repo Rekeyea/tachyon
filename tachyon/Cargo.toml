@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 tachyon-config = { path = "../crates/tachyon-config" }
 tachyon-runtime = { path = "../crates/tachyon-runtime" }
+tachyon-sink = { path = "../crates/tachyon-sink" }
 anyhow.workspace = true
 clap.workspace = true
 serde = { version = "1", features = ["derive"] }
