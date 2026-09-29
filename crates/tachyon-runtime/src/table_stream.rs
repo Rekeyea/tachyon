@@ -4,6 +4,9 @@
 //! la misma transacción: los registros en el topic de salida y uno en
 //! `{topic}-tachyon-cursor`, con clave `commit_user` y el id en decimal. Un
 //! crash antes del commit no deja ni las filas ni el cursor.
+//!
+//! Si la tabla tiene changelog, cada mensaje lleva `rowkind` (`+I`, `-U`,
+//! `+U`, `-D`) adelante de las columnas del `SELECT`.
 
 use std::time::{Duration, Instant};
 
@@ -19,7 +22,7 @@ use rdkafka::{Offset, TopicPartitionList};
 use tachyon_config::{PayloadFormat, PipelineConfig};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
 use tachyon_sink::redpanda::RedpandaSink;
-use tachyon_sink::writer::{open_table, projection_schema, tail_appends};
+use tachyon_sink::writer::{open_table, stream_schema, tail_appends};
 use tachyon_source::{
     avro_json_from_arrow, encode_envelopes, parse_avro_schema, register_topic_schema,
 };
@@ -84,7 +87,7 @@ pub async fn run_table_stream(
     if !columns.iter().any(|name| name == key) {
         anyhow::bail!("la clave '{key}' no está en el SELECT");
     }
-    let schema = projection_schema(&table, &columns)?;
+    let schema = stream_schema(&table, &columns).context("schema de la cola")?;
     let key_field = schema
         .field_with_name(key)
         .map_err(|_| anyhow::anyhow!("la salida no tiene la clave '{key}'"))?;

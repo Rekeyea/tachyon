@@ -155,6 +155,9 @@ pub struct OutputConfig {
     #[serde(default)]
     pub bucket: Option<usize>,
     pub sequence_field: Option<String>,
+    /// Columna del batch con `+I`, `-U`, `+U` o `-D`. Con
+    /// `changelog-producer=input` Tachyon la graba en el changelog. Si la
+    /// tabla declara `rowkind.field`, tiene que ser esta columna.
     pub rowkind_field: Option<String>,
     /// Codificación del topic de salida. Default: JSON. `avro` registra el
     /// schema del `SELECT` y escribe el envelope `0x00` + id + datum.

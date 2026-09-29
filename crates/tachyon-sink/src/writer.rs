@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use anyhow::{Context, Result};
-use arrow::array::RecordBatch;
+use arrow::array::{Array, RecordBatch};
 use paimon::catalog::Identifier;
 use paimon::spec::CommitKind;
 use paimon::table::IncrementalScanMode;
@@ -62,6 +62,9 @@ pub struct PaimonSink {
     bucket: i32,
     /// Columna de sequence number, si la fuente la aporta.
     sequence_field: Option<String>,
+    /// Columna `+I`/`-U`/`+U`/`-D`, su posición en el schema y quién la
+    /// convierte en `_VALUE_KIND`.
+    rowkind: Option<(String, usize, RowkindWrite)>,
     /// Identidad del writer en los snapshots de Paimon. Debe ser estable entre
     /// reinicios para que `recover` encuentre los checkpoints propios.
     commit_user: String,
@@ -142,6 +145,7 @@ impl PaimonSink {
             key_column: key_column.to_string(),
             bucket,
             sequence_field: sequence_field.map(|s| s.to_string()),
+            rowkind: None,
             commit_user,
             next_identifier: 1,
         })
@@ -161,6 +165,45 @@ impl PaimonSink {
         self.writer = builder.new_write().context("new_write")?;
         self.committer = builder.new_commit();
         self.commit_user = commit_user.to_string();
+        Ok(self)
+    }
+
+    /// Exige que el YAML y las opciones de la tabla digan lo mismo.
+    ///
+    /// Con `changelog-producer=input`, Tachyon copia `field` a `_VALUE_KIND`
+    /// y el changelog guarda cada fila, también `-U` y `+U` de la misma clave.
+    /// Si la tabla declara `rowkind.field`, ese nombre es `field` y Paimon
+    /// hace la copia. Sin `field`, la tabla no publica cambios.
+    pub fn align_rowkind(mut self, field: Option<&str>) -> Result<Self> {
+        let configured = field.map(str::trim).filter(|field| !field.is_empty());
+        let source = change_source(&self.table)?;
+        match (configured, source) {
+            (Some(field), ChangeRead::Changelog) => {
+                let index = rowkind_column(&self.table, field)?;
+                self.rowkind = Some((field.to_string(), index, RowkindWrite::Stamp));
+            }
+            (Some(field), ChangeRead::ValueKind) => {
+                let declared = rowkind_option(&self.table).unwrap_or("");
+                if declared != field {
+                    anyhow::bail!(
+                        "rowkind_field '{field}' no coincide con rowkind.field '{declared}' de la tabla"
+                    );
+                }
+                let index = rowkind_column(&self.table, field)?;
+                self.rowkind = Some((field.to_string(), index, RowkindWrite::Native));
+            }
+            (Some(field), ChangeRead::Append) => anyhow::bail!(
+                "rowkind_field '{field}' necesita changelog-producer=input en la tabla"
+            ),
+            (None, ChangeRead::Append) => {}
+            (None, ChangeRead::Changelog) => anyhow::bail!(
+                "la tabla tiene changelog-producer=input; output.rowkind_field tiene que nombrar la columna"
+            ),
+            (None, ChangeRead::ValueKind) => anyhow::bail!(
+                "la tabla tiene rowkind.field '{}'; output.rowkind_field tiene que nombrarla",
+                rowkind_option(&self.table).unwrap_or("")
+            ),
+        }
         Ok(self)
     }
 
@@ -246,6 +289,7 @@ impl PaimonSink {
                 commit_user: self.commit_user.clone(),
                 active: self.writer,
                 next_identifier: self.next_identifier,
+                rowkind: self.rowkind.clone(),
             },
             PaimonCommitterHalf {
                 table: self.table,
@@ -261,8 +305,9 @@ impl PaimonSink {
     /// BigInt→Int64, VarChar→Utf8, Double→Float64, etc. (ver SPIKE paimon-write).
     /// Si está declarado `sequence.field`, el batch debe incluir esa columna.
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let prepared = prepare_batch(batch, &self.rowkind)?;
         self.writer
-            .write_arrow_batch(batch)
+            .write_arrow_batch(&prepared)
             .await
             .context("write_arrow_batch")
     }
@@ -375,13 +420,16 @@ pub struct PaimonWriterHalf {
     active: paimon::table::TableWrite,
     /// Identifier del próximo checkpoint (monótono por `commit_user`).
     next_identifier: i64,
+    /// Misma columna que `PaimonSink::rowkind`.
+    rowkind: Option<(String, usize, RowkindWrite)>,
 }
 
 impl PaimonWriterHalf {
     /// Escribe un `RecordBatch` (mismas reglas de schema que `PaimonSink::write`).
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let prepared = prepare_batch(batch, &self.rowkind)?;
         self.active
-            .write_arrow_batch(batch)
+            .write_arrow_batch(&prepared)
             .await
             .context("write_arrow_batch")
     }
@@ -691,6 +739,29 @@ pub async fn create_test_table(
     bucket: i32,
     sequence_field: Option<&str>,
 ) -> Result<paimon::table::Table> {
+    create_test_table_with(
+        warehouse,
+        database,
+        table,
+        fields,
+        primary_key,
+        bucket,
+        sequence_field,
+        &[],
+    )
+    .await
+}
+
+async fn create_test_table_with(
+    warehouse: &str,
+    database: &str,
+    table: &str,
+    fields: &[(&str, paimon::spec::DataType)],
+    primary_key: &[&str],
+    bucket: i32,
+    sequence_field: Option<&str>,
+    extra_options: &[(&str, &str)],
+) -> Result<paimon::table::Table> {
     let options = Options::from_map(
         [(String::from("warehouse"), warehouse.to_string())]
             .into_iter()
@@ -711,6 +782,9 @@ pub async fn create_test_table(
     builder = builder.primary_key(primary_key.iter().copied());
     if let Some(seq) = sequence_field {
         builder = builder.option("sequence.field", seq);
+    }
+    for (key, value) in extra_options {
+        builder = builder.option(*key, *value);
     }
     let schema = builder
         .option("bucket", &bucket.to_string())
@@ -801,17 +875,235 @@ pub fn projection_schema(
 }
 
 /// Snapshots nuevos de una cola. `through` es el id hasta el que se puede
-/// avanzar el cursor. `blocked_at` es un OVERWRITE que quedó afuera: sus
-/// archivos reescriben el bucket y no son filas nuevas.
+/// avanzar el cursor. `blocked_at` es un OVERWRITE de una tabla sin changelog:
+/// sus archivos reescriben el bucket y no son filas nuevas.
 pub struct AppendTail {
     pub through: i64,
     pub batches: Vec<RecordBatch>,
     pub blocked_at: Option<i64>,
 }
 
-/// Lee los APPEND en `(after, último]`. COMPACT y ANALYZE no traen filas y
-/// el cursor igual puede avanzar. Un OVERWRITE corta el rango: publicarlo
-/// como delta repetiría las filas del archivo reescrito.
+/// Quién copia la columna de rowkind a `_VALUE_KIND`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowkindWrite {
+    /// `changelog-producer=input`: Tachyon agrega `_VALUE_KIND` y el changelog
+    /// guarda cada fila.
+    Stamp,
+    /// `rowkind.field` en la tabla: Paimon agrega `_VALUE_KIND`.
+    Native,
+}
+
+/// De dónde sale cada cambio al leer la tabla.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeRead {
+    /// APPEND del data file, sin columna `rowkind`.
+    Append,
+    /// Changelog de `changelog-producer=input`.
+    Changelog,
+    /// `_VALUE_KIND` del data file cuando la tabla declara `rowkind.field`.
+    ValueKind,
+}
+
+/// `true` cuando la cola publica `rowkind` (`+I`, `-U`, `+U`, `-D`) en vez de
+/// repetir el archivo reescrito del bucket.
+pub fn publishes_rowkind(table: &paimon::table::Table) -> Result<bool> {
+    Ok(change_source(table)? != ChangeRead::Append)
+}
+
+fn change_source(table: &paimon::table::Table) -> Result<ChangeRead> {
+    let options = table.schema().options();
+    let producer = options
+        .get("changelog-producer")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    let declared = rowkind_option(table).is_some();
+    match (producer.to_ascii_lowercase().as_str(), declared) {
+        ("none", false) => Ok(ChangeRead::Append),
+        ("none", true) => Ok(ChangeRead::ValueKind),
+        ("input", false) => Ok(ChangeRead::Changelog),
+        ("input", true) => anyhow::bail!(
+            "Paimon no combina rowkind.field con changelog-producer=input"
+        ),
+        (other, _) => anyhow::bail!(
+            "changelog-producer '{other}' no lo lee la cola; hace falta input o none"
+        ),
+    }
+}
+
+fn rowkind_option(table: &paimon::table::Table) -> Option<&str> {
+    table
+        .schema()
+        .options()
+        .get("rowkind.field")
+        .map(|field| field.trim())
+        .filter(|field| !field.is_empty())
+}
+
+fn is_string_type(data_type: &paimon::spec::DataType) -> bool {
+    matches!(
+        data_type,
+        paimon::spec::DataType::VarChar(_) | paimon::spec::DataType::Char(_)
+    )
+}
+
+fn rowkind_column(table: &paimon::table::Table, field: &str) -> Result<usize> {
+    let index = table
+        .schema()
+        .fields()
+        .iter()
+        .position(|column| column.name() == field)
+        .with_context(|| format!("la tabla no tiene la columna de rowkind '{field}'"))?;
+    let column = &table.schema().fields()[index];
+    if !is_string_type(column.data_type()) {
+        anyhow::bail!("rowkind '{field}' tiene que ser texto");
+    }
+    if table
+        .schema()
+        .primary_keys()
+        .iter()
+        .any(|key| key == field)
+    {
+        anyhow::bail!("rowkind '{field}' no puede ser parte de la clave");
+    }
+    Ok(index)
+}
+
+fn prepare_batch<'a>(
+    batch: &'a RecordBatch,
+    rowkind: &Option<(String, usize, RowkindWrite)>,
+) -> Result<std::borrow::Cow<'a, RecordBatch>> {
+    match rowkind {
+        Some((field, index, RowkindWrite::Stamp)) => {
+            Ok(std::borrow::Cow::Owned(stamp_rowkind(batch, field, *index)?))
+        }
+        Some((field, index, RowkindWrite::Native)) => {
+            check_rowkind_column(batch, field, *index)?;
+            Ok(std::borrow::Cow::Borrowed(batch))
+        }
+        None => Ok(std::borrow::Cow::Borrowed(batch)),
+    }
+}
+
+fn stamp_rowkind(batch: &RecordBatch, field: &str, index: usize) -> Result<RecordBatch> {
+    check_rowkind_column(batch, field, index)?;
+    if batch.num_rows() == 0 {
+        return Ok(batch.clone());
+    }
+    if batch.schema().column_with_name("_VALUE_KIND").is_some() {
+        anyhow::bail!("el batch ya trae _VALUE_KIND");
+    }
+    let strings = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("check_rowkind_column ya validó el texto");
+    let kinds: Vec<i8> = (0..strings.len())
+        .map(|row| rowkind_byte(strings.value(row)))
+        .collect();
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+        "_VALUE_KIND",
+        arrow::datatypes::DataType::Int8,
+        false,
+    )));
+    columns.push(std::sync::Arc::new(arrow::array::Int8Array::from(kinds)));
+    RecordBatch::try_new(std::sync::Arc::new(arrow::datatypes::Schema::new(fields)), columns)
+        .context("agregando _VALUE_KIND")
+}
+
+fn check_rowkind_column(batch: &RecordBatch, field: &str, index: usize) -> Result<()> {
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    let schema = batch.schema();
+    let column = schema
+        .fields()
+        .get(index)
+        .with_context(|| format!("el batch no tiene la columna de rowkind '{field}'"))?;
+    if column.name() != field {
+        anyhow::bail!(
+            "rowkind '{field}' va en la columna {index} del schema; el batch trae '{}' ahí",
+            column.name()
+        );
+    }
+    let strings = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .with_context(|| format!("rowkind '{field}' tiene que ser texto"))?;
+    for row in 0..strings.len() {
+        if strings.is_null(row) {
+            anyhow::bail!("rowkind '{field}' no puede ser null");
+        }
+        let value = strings.value(row);
+        if !is_rowkind(value) {
+            anyhow::bail!("rowkind '{field}' tiene '{value}'; los valores son +I, -U, +U y -D");
+        }
+    }
+    Ok(())
+}
+
+fn is_rowkind(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 2 {
+        return false;
+    }
+    matches!(
+        (bytes[0].to_ascii_uppercase(), bytes[1].to_ascii_uppercase()),
+        (b'+', b'I') | (b'-', b'U') | (b'+', b'U') | (b'-', b'D')
+    )
+}
+
+fn rowkind_byte(value: &str) -> i8 {
+    let bytes = value.as_bytes();
+    match (bytes[0].to_ascii_uppercase(), bytes[1].to_ascii_uppercase()) {
+        (b'+', b'I') => 0,
+        (b'-', b'U') => 1,
+        (b'+', b'U') => 2,
+        _ => 3,
+    }
+}
+
+/// Schema que publica la cola: las columnas pedidas y, si la tabla tiene
+/// changelog, `rowkind` adelante.
+pub fn stream_schema(
+    table: &paimon::table::Table,
+    columns: &[String],
+) -> Result<arrow::datatypes::Schema> {
+    let changelog = publishes_rowkind(table)?;
+    if changelog && columns.iter().any(|column| column == "rowkind") {
+        anyhow::bail!("la columna rowkind la agrega la cola; el SELECT no puede llamarla así");
+    }
+    let projected = projection_schema(table, columns)?;
+    if !changelog {
+        return Ok(projected);
+    }
+    let mut fields = Vec::with_capacity(projected.fields().len() + 1);
+    fields.push(arrow::datatypes::Field::new(
+        "rowkind",
+        arrow::datatypes::DataType::Utf8,
+        true,
+    ));
+    fields.extend(
+        projected
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone()),
+    );
+    Ok(arrow::datatypes::Schema::new(fields))
+}
+
+/// Lee los cambios en `(after, último]`.
+///
+/// Sin changelog: los APPEND. COMPACT y ANALYZE no traen filas y el cursor
+/// igual puede avanzar. Un OVERWRITE corta el rango: publicarlo como delta
+/// repetiría las filas del archivo reescrito.
+///
+/// Con changelog: cada fila trae `rowkind`. Un OVERWRITE no se publica; el
+/// cursor avanza porque el cambio ya salió en el changelog del snapshot que
+/// lo escribió.
 pub async fn tail_appends(
     table: &paimon::table::Table,
     after: i64,
@@ -819,6 +1111,11 @@ pub async fn tail_appends(
 ) -> Result<AppendTail> {
     if columns.is_empty() {
         anyhow::bail!("la proyección de la tabla está vacía");
+    }
+    let source = change_source(table)?;
+    let with_kind = source != ChangeRead::Append;
+    if with_kind && columns.iter().any(|column| column == "rowkind") {
+        anyhow::bail!("la columna rowkind la agrega la cola; el SELECT no puede llamarla así");
     }
     let manager = table.snapshot_manager();
     let Some(latest) = manager
@@ -852,7 +1149,6 @@ pub async fn tail_appends(
             "el cursor {after} quedó atrás del snapshot {earliest}; no se puede reanudar sin releer la tabla"
         );
     }
-
     let mut through = after;
     let mut blocked_at = None;
     for id in (after + 1)..=latest {
@@ -866,6 +1162,13 @@ pub async fn tail_appends(
                     snapshot = id,
                     kind = %snapshot.commit_kind(),
                     "snapshot de la cola"
+                );
+                through = id;
+            }
+            CommitKind::OVERWRITE if with_kind => {
+                tracing::info!(
+                    snapshot = id,
+                    "snapshot OVERWRITE; la cola avanza sin publicar el archivo reescrito"
                 );
                 through = id;
             }
@@ -889,7 +1192,12 @@ pub async fn tail_appends(
     builder
         .with_projection(&refs)
         .map_err(|err| anyhow::anyhow!("proyección: {err}"))?;
-    let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, after, through);
+    let mode = if source == ChangeRead::Changelog {
+        IncrementalScanMode::Changelog
+    } else {
+        IncrementalScanMode::Delta
+    };
+    let scan = builder.new_incremental_scan(mode, after, through);
     let plan = scan
         .plan()
         .await
@@ -904,9 +1212,13 @@ pub async fn tail_appends(
     let read = builder
         .new_read()
         .map_err(|err| anyhow::anyhow!("new_read: {err}"))?;
-    let stream = read
-        .to_incremental_arrow(&plan)
-        .map_err(|err| anyhow::anyhow!("leyendo el delta: {err}"))?;
+    let stream = if with_kind {
+        read.to_audit_log_arrow(&plan)
+            .map_err(|err| anyhow::anyhow!("leyendo el rowkind: {err}"))?
+    } else {
+        read.to_incremental_arrow(&plan)
+            .map_err(|err| anyhow::anyhow!("leyendo el delta: {err}"))?
+    };
     use futures::TryStreamExt;
     let batches: Vec<RecordBatch> = stream
         .try_collect()
@@ -1047,6 +1359,276 @@ mod tail_tests {
             .expect("cola");
         assert_eq!(again.through, second.through);
         assert!(again.batches.iter().all(|batch| batch.num_rows() == 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn change(rows: &[(i64, i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("order_id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+                Field::new("op", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch")
+    }
+
+    fn changes(batches: &[RecordBatch]) -> Vec<(String, i64, i64)> {
+        let mut out = Vec::new();
+        for batch in batches {
+            assert_eq!(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>(),
+                vec!["rowkind", "order_id", "amount"]
+            );
+            let kinds = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("rowkind");
+            let ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("order_id");
+            let amounts = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("amount");
+            for row in 0..batch.num_rows() {
+                out.push((kinds.value(row).to_string(), ids.value(row), amounts.value(row)));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn an_update_publishes_the_change_and_not_the_bucket() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-rowkind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("reloj")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("warehouse");
+        let warehouse = dir.to_string_lossy().to_string();
+        let op = PDataType::VarChar(VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap());
+        let table = create_test_table_with(
+            &warehouse,
+            "default",
+            "paid_orders",
+            &[
+                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+                ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+                ("op", op),
+            ],
+            &["order_id"],
+            1,
+            None,
+            &[("changelog-producer", "input")],
+        )
+        .await
+        .expect("tabla");
+        let columns = vec!["order_id".to_string(), "amount".to_string()];
+        let schema = stream_schema(&table, &columns).expect("schema");
+
+        let plain = create_test_table(
+            &warehouse,
+            "default",
+            "plain_orders",
+            &[
+                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+                ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+            ],
+            &["order_id"],
+            1,
+            None,
+        )
+        .await
+        .expect("tabla sin changelog");
+        let rejected = PaimonSink::from_table(plain, "order_id", 1, None)
+            .expect("sink")
+            .align_rowkind(Some("op"));
+        assert!(rejected.is_err(), "una tabla sin changelog no acepta rowkind");
+
+        let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None)
+            .expect("sink")
+            .align_rowkind(Some("op"))
+            .expect("rowkind");
+        sink.write(&change(&[(1, 10, "+I"), (2, 20, "+I")]))
+            .await
+            .expect("write");
+        sink.commit().await.expect("commit");
+        let first = tail_appends(&table, 0, &columns).await.expect("cola");
+        let first_kinds = kinds(&table).await;
+        assert!(first.blocked_at.is_none(), "{first_kinds}");
+        assert_eq!(
+            changes(&first.batches),
+            vec![
+                ("+I".to_string(), 1, 10),
+                ("+I".to_string(), 2, 20),
+            ],
+            "{first_kinds}"
+        );
+        let published = first.batches.first().expect("filas");
+        for (left, right) in published.schema().fields().iter().zip(schema.fields()) {
+            assert_eq!(left.name(), right.name());
+            assert_eq!(left.data_type(), right.data_type());
+            assert_eq!(left.is_nullable(), right.is_nullable());
+        }
+
+        let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None)
+            .expect("sink")
+            .align_rowkind(Some("op"))
+            .expect("rowkind");
+        let bad = sink.write(&change(&[(1, 30, "+X")])).await;
+        assert!(bad.is_err(), "un rowkind desconocido no se escribe");
+        sink.write(&change(&[(1, 10, "-U"), (1, 30, "+U")]))
+            .await
+            .expect("update");
+        sink.commit().await.expect("commit");
+        let second = tail_appends(&table, first.through, &columns)
+            .await
+            .expect("cola");
+        let second_kinds = kinds(&table).await;
+        assert!(second.blocked_at.is_none(), "{second_kinds}");
+        assert_eq!(
+            changes(&second.batches),
+            vec![
+                ("-U".to_string(), 1, 10),
+                ("+U".to_string(), 1, 30),
+            ],
+            "kinds={second_kinds} through={}",
+            second.through
+        );
+
+        let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None)
+            .expect("sink")
+            .align_rowkind(Some("op"))
+            .expect("rowkind");
+        sink.write(&change(&[(2, 20, "-D")])).await.expect("delete");
+        sink.commit().await.expect("commit");
+        let third = tail_appends(&table, second.through, &columns)
+            .await
+            .expect("cola");
+        let third_kinds = kinds(&table).await;
+        assert_eq!(
+            changes(&third.batches),
+            vec![("-D".to_string(), 2, 20)],
+            "{third_kinds}"
+        );
+
+        let stored = read_table_rows(&table).await.expect("lectura");
+        let mut alive = Vec::new();
+        for batch in &stored {
+            let ids = batch
+                .column_by_name("order_id")
+                .expect("order_id")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i64");
+            let amounts = batch
+                .column_by_name("amount")
+                .expect("amount")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i64");
+            for row in 0..batch.num_rows() {
+                alive.push((ids.value(row), amounts.value(row)));
+            }
+        }
+        alive.sort();
+        assert_eq!(alive, vec![(1, 30)], "{third_kinds}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_table_rowkind_field_publishes_the_update() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-rowkind-native-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("reloj")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("warehouse");
+        let warehouse = dir.to_string_lossy().to_string();
+        let op = PDataType::VarChar(
+            VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap(),
+        );
+        let table = create_test_table_with(
+            &warehouse,
+            "default",
+            "native_orders",
+            &[
+                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+                ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+                ("op", op),
+            ],
+            &["order_id"],
+            1,
+            None,
+            &[("rowkind.field", "op")],
+        )
+        .await
+        .expect("tabla");
+        let columns = vec!["order_id".to_string(), "amount".to_string()];
+        let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None)
+            .expect("sink")
+            .align_rowkind(Some("op"))
+            .expect("rowkind");
+        sink.write(&change(&[(1, 10, "+I"), (2, 20, "+I")]))
+            .await
+            .expect("write");
+        sink.commit().await.expect("commit");
+        let first = tail_appends(&table, 0, &columns).await.expect("cola");
+        let first_kinds = kinds(&table).await;
+        assert_eq!(
+            changes(&first.batches),
+            vec![
+                ("+I".to_string(), 1, 10),
+                ("+I".to_string(), 2, 20),
+            ],
+            "{first_kinds}"
+        );
+
+        let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None)
+            .expect("sink")
+            .align_rowkind(Some("op"))
+            .expect("rowkind");
+        sink.write(&change(&[(1, 30, "+U")])).await.expect("update");
+        sink.commit().await.expect("commit");
+        let second = tail_appends(&table, first.through, &columns)
+            .await
+            .expect("cola");
+        let second_kinds = kinds(&table).await;
+        assert!(second.blocked_at.is_none(), "{second_kinds}");
+        assert_eq!(
+            changes(&second.batches),
+            vec![("+U".to_string(), 1, 30)],
+            "{second_kinds}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

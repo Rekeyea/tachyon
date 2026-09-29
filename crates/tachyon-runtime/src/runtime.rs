@@ -161,7 +161,9 @@ impl Pipeline {
             self.config.output.sequence_field.as_deref(),
         )
         .await
-        .with_context(|| format!("abriendo sink Paimon para {table_id}"))?;
+        .with_context(|| format!("abriendo sink Paimon para {table_id}"))?
+        .align_rowkind(self.config.output.rowkind_field.as_deref())
+        .context("rowkind de la tabla")?;
 
         let options = RunOptions::from_config(&self.config);
         let metrics = Arc::new(InstanceMetrics::new());
