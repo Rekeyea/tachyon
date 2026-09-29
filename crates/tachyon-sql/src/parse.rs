@@ -15,8 +15,8 @@
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, JoinConstraint, JoinOperator, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableObject, Value,
-    WildcardAdditionalOptions,
+    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+    TableObject, Value, WildcardAdditionalOptions,
 };
 use tachyon_core::{AggKind, WindowKind};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -45,6 +45,16 @@ pub struct ParsedSql {
     /// `Some` si el `FROM` es un lookup: una igualdad contra una dimensión.
     /// Qué lado es la dimensión lo resuelve la config.
     pub lookup: Option<LookupShape>,
+    /// Ramas de un `UNION ALL`, en orden. Cada una es un `SELECT` de una tabla.
+    /// `None` si la query no concatena.
+    pub union_all: Option<Vec<UnionBranch>>,
+}
+
+/// Una rama de `UNION ALL`: el `SELECT` que planifica DataFusion y la tabla.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionBranch {
+    pub sql: String,
+    pub source: String,
 }
 
 /// Ventana reconocida en el `GROUP BY`, antes de que DataFusion vea la SQL.
@@ -167,6 +177,12 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
             "una query no puede ser ventana y lookup a la vez".to_string(),
         ));
     }
+    let union_all = union_branches(source)?;
+    if union_all.is_some() && (window.is_some() || join.is_some() || lookup.is_some()) {
+        return Err(Error::Sql(
+            "UNION ALL no se mezcla con una ventana, un join o un lookup".to_string(),
+        ));
+    }
 
     // La query SELECT ejecutable (sin el INSERT INTO <out>), serializada de
     // vuelta a string desde el AST. Esta es la que corre en DataFusion contra
@@ -182,6 +198,152 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         window,
         join,
         lookup,
+        union_all,
+    })
+}
+
+/// `Some` si el body es un `UNION ALL` (encadenado). El resto de los set
+/// operators se rechaza: Tachyon no deduplica ni intersecta streams.
+fn union_branches(query: &Query) -> Result<Option<Vec<UnionBranch>>, Error> {
+    let Some(expr) = find_union(query.body.as_ref(), query_limits_the_result(query))? else {
+        return Ok(None);
+    };
+    let mut branches = Vec::new();
+    flatten_union(expr, &mut branches)?;
+    if branches.len() < 2 {
+        return Err(Error::Sql(
+            "UNION ALL es un SELECT de una tabla por rama".to_string(),
+        ));
+    }
+    let mut seen = Vec::new();
+    for branch in &branches {
+        if seen.iter().any(|name: &String| name == &branch.source) {
+            return Err(Error::Sql(format!(
+                "UNION ALL usa '{}' una sola vez",
+                branch.source
+            )));
+        }
+        seen.push(branch.source.clone());
+    }
+    Ok(Some(branches))
+}
+
+fn query_limits_the_result(query: &Query) -> bool {
+    query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+}
+
+/// Baja por los paréntesis hasta un set operator. Un `SELECT` suelto no es
+/// unión, aunque tenga `LIMIT`: ese camino ya es pass-through.
+fn find_union(expr: &SetExpr, limited: bool) -> Result<Option<&SetExpr>, Error> {
+    match expr {
+        SetExpr::SetOperation { .. } => {
+            if limited {
+                return Err(Error::Sql(
+                    "UNION ALL no ordena ni limita el resultado".to_string(),
+                ));
+            }
+            Ok(Some(expr))
+        }
+        SetExpr::Query(inner) => {
+            find_union(inner.body.as_ref(), limited || query_limits_the_result(inner))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn flatten_union(expr: &SetExpr, out: &mut Vec<UnionBranch>) -> Result<(), Error> {
+    match expr {
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if *op != SetOperator::Union || *set_quantifier != SetQuantifier::All {
+                return Err(Error::Sql(
+                    "Tachyon concatena con UNION ALL".to_string(),
+                ));
+            }
+            flatten_union(left, out)?;
+            flatten_union(right, out)
+        }
+        SetExpr::Query(inner) => {
+            if query_limits_the_result(inner) {
+                return Err(Error::Sql(
+                    "UNION ALL no ordena ni limita el resultado".to_string(),
+                ));
+            }
+            flatten_union(inner.body.as_ref(), out)
+        }
+        SetExpr::Select(select) => {
+            out.push(plain_branch(select)?);
+            Ok(())
+        }
+        _ => Err(Error::Sql(
+            "UNION ALL es un SELECT de una tabla por rama".to_string(),
+        )),
+    }
+}
+
+fn plain_branch(select: &Select) -> Result<UnionBranch, Error> {
+    let grouped = match &select.group_by {
+        GroupByExpr::Expressions(exprs, mods) => !exprs.is_empty() || !mods.is_empty(),
+        GroupByExpr::All(_) => true,
+    };
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.having.is_some()
+        || select.qualify.is_some()
+        || select.prewhere.is_some()
+        || select.into.is_some()
+        || select.exclude.is_some()
+        || select.value_table_mode.is_some()
+        || !select.optimizer_hints.is_empty()
+        || !select.lateral_views.is_empty()
+        || !select.connect_by.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || grouped
+    {
+        return Err(Error::Sql(
+            "UNION ALL es un SELECT de una tabla por rama".to_string(),
+        ));
+    }
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Err(Error::Sql(
+            "UNION ALL es un SELECT de una tabla por rama".to_string(),
+        ));
+    }
+    let source = match &select.from[0].relation {
+        TableFactor::Table {
+            name, version, ..
+        } => {
+            if version.is_some() {
+                return Err(Error::Sql(
+                    "FOR SYSTEM_TIME AS OF queda para después".to_string(),
+                ));
+            }
+            table_name(name)
+        }
+        _ => {
+            return Err(Error::Sql(
+                "UNION ALL es un SELECT de una tabla por rama".to_string(),
+            ))
+        }
+    };
+    Ok(UnionBranch {
+        sql: select.to_string(),
+        source,
     })
 }
 
@@ -1335,6 +1497,77 @@ mod tests {
         assert_eq!(parsed.target, "orders_lake");
         assert_eq!(parsed.source_tables, vec!["orders"]);
         assert!(parsed.query.contains("SUM(amount)"));
+        assert!(parsed.union_all.is_none());
+    }
+
+    #[test]
+    fn union_all_keeps_each_branch_select() {
+        let sql = "INSERT INTO out \
+            SELECT order_id, amount FROM web WHERE amount > 15 \
+            UNION ALL \
+            SELECT order_id, amount FROM app \
+            UNION ALL \
+            SELECT order_id, amount FROM store";
+        let parsed = parse_sql(sql).unwrap();
+        let branches = parsed.union_all.expect("union");
+        assert_eq!(
+            branches
+                .iter()
+                .map(|branch| branch.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web", "app", "store"]
+        );
+        assert!(branches[0].sql.contains("WHERE"), "{}", branches[0].sql);
+        assert!(branches[0].sql.to_uppercase().starts_with("SELECT"));
+        assert!(parsed.window.is_none());
+        assert!(parsed.join.is_none());
+        assert!(parsed.lookup.is_none());
+        assert_eq!(parsed.source_tables, vec!["web", "app", "store"]);
+    }
+
+    #[test]
+    fn union_without_all_is_rejected() {
+        let err = parse_sql(
+            "INSERT INTO out SELECT order_id FROM web UNION SELECT order_id FROM app",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UNION ALL"), "{err}");
+        let err = parse_sql(
+            "INSERT INTO out SELECT order_id FROM web UNION DISTINCT SELECT order_id FROM app",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UNION ALL"), "{err}");
+        let err = parse_sql(
+            "INSERT INTO out SELECT order_id FROM web EXCEPT SELECT order_id FROM app",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UNION ALL"), "{err}");
+    }
+
+    #[test]
+    fn a_union_branch_is_one_table() {
+        let err = parse_sql(
+            "INSERT INTO out \
+             SELECT a.order_id FROM web a JOIN app b ON a.order_id = b.order_id \
+             UNION ALL SELECT order_id FROM store",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("una tabla por rama"), "{err}");
+        let err = parse_sql(
+            "INSERT INTO out SELECT order_id FROM web UNION ALL SELECT order_id FROM web",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("una sola vez"), "{err}");
+        let err = parse_sql(
+            "INSERT INTO out SELECT order_id FROM web UNION ALL SELECT order_id FROM app ORDER BY order_id",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no ordena"), "{err}");
+        let err = parse_sql(
+            "INSERT INTO out (SELECT order_id FROM web ORDER BY order_id) UNION ALL SELECT order_id FROM app",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no ordena"), "{err}");
     }
 
     #[test]

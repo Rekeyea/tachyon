@@ -19,6 +19,8 @@
 //!   mismo paso atómico que el snapshot de Paimon (identifier monótono bajo un
 //!   `commit_user` estable). Nunca se commitea la posición del consumer, que
 //!   va por delante de lo escrito (registros en vuelo en los canales).
+//! - `UNION ALL` no snapshotéa todos los trackers juntos: el batch sale de una
+//!   rama y los offsets que lo acompañan son solo los de esa rama.
 //! - Al arrancar, `PaimonSink::recover` devuelve los offsets del último
 //!   checkpoint y cada fuente se re-posiciona ahí (skip de lo ya escrito +
 //!   seek si el consumer group quedó adelante).
@@ -46,11 +48,12 @@ use tachyon_source::{
     register_topic_schema, SchemaCache,
 };
 use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
-use tachyon_sql::{LookupJoin, WindowShape};
+use tachyon_sql::{LookupJoin, UnionBranch, WindowShape};
 
 use crate::budget::StatelessBudget;
 use crate::execute::{ensure_passthrough, plan_query, InputSource, StreamTableFactory};
 use crate::lookup::{prepare_lookup, LookupStream, PreparedLookup};
+use crate::union::{UnionFeed, UnionSource};
 use crate::window::{
     batch_from_closed, inputs_from_batch, output_field_names, schema_with_partition,
     spec_from_shape, user_schema_without_partition, WindowOperator, PARTITION_COLUMN,
@@ -414,6 +417,7 @@ pub async fn run_pipeline(
         metrics,
         window,
         None,
+        None,
     )
     .await
 }
@@ -427,7 +431,11 @@ pub(crate) async fn run_pipeline_with_lookup(
     metrics: &Arc<InstanceMetrics>,
     window: Option<&WindowShape>,
     lookup: Option<&LookupJoin>,
+    union_branches: Option<&[UnionBranch]>,
 ) -> Result<PipelineHandle> {
+    if union_branches.is_some() && (window.is_some() || lookup.is_some()) {
+        anyhow::bail!("UNION ALL no se mezcla con una ventana, un join o un lookup");
+    }
     // Exactly-once no se desactiva: los offsets se commitean con el snapshot
     // de Paimon y un plan que retiene filas entre batches se rechaza abajo.
     // El paralelismo sale del pin (ver `StatelessBudget`).
@@ -502,6 +510,7 @@ pub(crate) async fn run_pipeline_with_lookup(
     let mut commit_sources: Vec<(String, Arc<RdkafkaSource>)> = Vec::new();
     let mut trackers: Vec<(String, OffsetTracker)> = Vec::new();
     let mut inputs: Vec<InputSource> = Vec::new();
+    let mut input_topics: Vec<(String, String)> = Vec::new();
     let mut name_to_sources: std::collections::HashMap<
         String,
         (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat),
@@ -553,6 +562,7 @@ pub(crate) async fn run_pipeline_with_lookup(
             "codec del input"
         );
         let topic = input_def.kafka_topic()?.to_string();
+        input_topics.push((input_def.name.clone(), topic.clone()));
         let schema = input_table_schema(
             prepared.schema.clone(),
             &input_def.name,
@@ -694,14 +704,32 @@ pub(crate) async fn run_pipeline_with_lookup(
     });
 
     // --- Ejecuta la transformación (validada como pass-through) ---
-    let (plan, task_ctx) = plan_query(&planned_sql, &inputs, &factory)
-        .await
-        .context("planificando la transformación")?;
-    ensure_passthrough(&plan).context("la transformación no admite exactly-once")?;
-    let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
-        .context("ejecutando la transformación")?;
+    // UNION ALL planifica cada rama aparte. El SQL completo iría a un
+    // UnionExec, que puede leer una rama por delante de lo publicado.
+    let mut union_feed = None;
+    let mut stream = None;
+    if let Some(branches) = union_branches {
+        let sources = assemble_union_sources(branches, &inputs, &trackers, &input_topics)?;
+        union_feed = Some(
+            UnionFeed::start(&sources, &factory)
+                .await
+                .context("armando UNION ALL")?,
+        );
+    } else {
+        let (plan, task_ctx) = plan_query(&planned_sql, &inputs, &factory)
+            .await
+            .context("planificando la transformación")?;
+        ensure_passthrough(&plan).context("la transformación no admite exactly-once")?;
+        stream = Some(
+            datafusion::physical_plan::execute_stream(plan, task_ctx)
+                .context("ejecutando la transformación")?,
+        );
+    }
 
     if let Some(shape) = window {
+        let stream = stream
+            .take()
+            .context("la ventana lee un solo stream")?;
         let user_schema = input_codecs
             .get(&shape.source)
             .with_context(|| format!("sin schema para '{}'", shape.source))?
@@ -865,19 +893,32 @@ pub(crate) async fn run_pipeline_with_lookup(
     // --- Loop de consumo: tira de DataFusion y envía batches al writer ---
     loop {
         let t_next = Instant::now();
-        let next = stream.next().await;
+        let next = if let Some(feed) = union_feed.as_mut() {
+            feed.next().await
+        } else {
+            let stream = stream.as_mut().context("el pipeline no tiene stream")?;
+            match stream.next().await {
+                Some(Ok(batch)) => {
+                    // Offsets que cubre este batch: con un plan pass-through,
+                    // todo lo que la fuente emitió hasta ahora ya produjo su
+                    // salida. UNION ALL no pasa por acá: su feed ya trae los
+                    // offsets de la única rama que emitió.
+                    let batch_offsets: SourceOffsets = trackers
+                        .iter()
+                        .map(|(topic, tracker)| (topic.clone(), tracker.snapshot()))
+                        .collect();
+                    Some(Ok((batch, batch_offsets)))
+                }
+                Some(Err(err)) => Some(Err(anyhow::anyhow!(err))),
+                None => None,
+            }
+        };
         metrics.add_source_next_ns(t_next.elapsed().as_nanos() as u64);
         match next {
-            Some(Ok(batch)) => {
+            Some(Ok((batch, batch_offsets))) => {
                 let rows = batch.num_rows() as u64;
                 tracing::debug!(rows, "batch de salida desde DataFusion");
                 metrics.inc_rows_read(rows);
-                // Offsets que cubre este batch: con un plan pass-through, todo
-                // lo que la fuente emitió hasta ahora ya produjo su salida.
-                let batch_offsets: SourceOffsets = trackers
-                    .iter()
-                    .map(|(topic, t)| (topic.clone(), t.snapshot()))
-                    .collect();
                 // Backpressure limitada: bloquea solo si el writer no da abasto.
                 let t_send = Instant::now();
                 batch_tx
@@ -886,7 +927,7 @@ pub(crate) async fn run_pipeline_with_lookup(
                     .context("enviando batch al writer")?;
                 metrics.add_send_wait_ns(t_send.elapsed().as_nanos() as u64);
             }
-            Some(Err(e)) => return Err(e).context("batch de salida"),
+            Some(Err(err)) => return Err(err).context("batch de salida"),
             None => break, // stream terminó
         }
     }
@@ -925,6 +966,7 @@ pub async fn run_topic_pipeline(
         input_codecs,
         metrics,
         None,
+        None,
     )
     .await
 }
@@ -938,7 +980,23 @@ pub(crate) async fn run_topic_pipeline_with_lookup(
     input_codecs: &std::collections::HashMap<String, PreparedInput>,
     metrics: &Arc<InstanceMetrics>,
     lookup: Option<&LookupJoin>,
+    union_branches: Option<&[UnionBranch]>,
 ) -> Result<PipelineHandle> {
+    if let Some(branches) = union_branches {
+        if lookup.is_some() {
+            anyhow::bail!("UNION ALL no se mezcla con una ventana, un join o un lookup");
+        }
+        return run_union_topic(
+            config,
+            branches,
+            options,
+            topic,
+            key,
+            input_codecs,
+            metrics,
+        )
+        .await;
+    }
     if config.inputs.len() != 1 {
         anyhow::bail!(
             "el sink a un topic tiene un solo input: la transacción commitea un consumer group"
@@ -1183,6 +1241,291 @@ async fn commit_topic_epoch(
         .context("adjuntando offsets a la transacción")?;
     sink.commit().await?;
     Ok(())
+}
+
+/// Una transacción, un `send_offsets_to_transaction` por consumer group. Los
+/// `GroupMetadata` viven hasta que `commit` vuelve: el puntero tiene que
+/// seguir siendo válido. Una rama que todavía no emitió no se manda; el grupo
+/// conserva el offset anterior.
+async fn commit_topic_groups(
+    sink: &RedpandaSink,
+    groups: &[(String, Arc<RdkafkaSource>)],
+    offsets: &SourceOffsets,
+) -> Result<()> {
+    let mut held = Vec::new();
+    for (topic, source) in groups {
+        let Some(parts) = offsets.get(topic) else {
+            continue;
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        let metadata = source
+            .group_metadata()
+            .await
+            .with_context(|| format!("metadata del grupo de '{topic}'"))?;
+        held.push((metadata, topic.clone(), parts.clone()));
+    }
+    if held.is_empty() {
+        anyhow::bail!("el epoch publicó filas y no tiene offsets de entrada");
+    }
+    for (metadata, topic, parts) in &held {
+        sink.send_input_offsets(metadata.as_ptr(), topic, parts)
+            .with_context(|| format!("adjuntando offsets de '{topic}'"))?;
+    }
+    sink.commit().await?;
+    Ok(())
+}
+
+fn assemble_union_sources(
+    branches: &[UnionBranch],
+    inputs: &[InputSource],
+    trackers: &[(String, OffsetTracker)],
+    input_topics: &[(String, String)],
+) -> Result<Vec<UnionSource>> {
+    let mut sources = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let topic = input_topics
+            .iter()
+            .find(|(name, _)| name == &branch.source)
+            .map(|(_, topic)| topic.clone())
+            .with_context(|| {
+                format!("UNION ALL lee topics y '{}' no es un input", branch.source)
+            })?;
+        let schema = inputs
+            .iter()
+            .find(|input| input.name == branch.source)
+            .with_context(|| format!("sin schema para '{}'", branch.source))?
+            .schema
+            .clone();
+        let tracker = trackers
+            .iter()
+            .find(|(name, _)| name == &topic)
+            .with_context(|| format!("sin tracker para '{topic}'"))?
+            .1
+            .clone();
+        sources.push(UnionSource {
+            name: branch.source.clone(),
+            sql: branch.sql.clone(),
+            topic,
+            schema,
+            tracker,
+        });
+    }
+    Ok(sources)
+}
+
+/// `UNION ALL` hacia un topic. Un consumidor por rama: la transacción adjunta
+/// el grupo de cada rama que ya publicó. No hay estado abierto, así que el
+/// topic alcanza; la fuente de verdad de los offsets es la transacción.
+async fn run_union_topic(
+    config: &PipelineConfig,
+    branches: &[UnionBranch],
+    options: &RunOptions,
+    topic: &str,
+    key: &str,
+    input_codecs: &std::collections::HashMap<String, PreparedInput>,
+    metrics: &Arc<InstanceMetrics>,
+) -> Result<PipelineHandle> {
+    if config
+        .deployment
+        .consumers_per_topic
+        .is_some_and(|count| count != 1)
+    {
+        anyhow::bail!(
+            "el sink a un topic usa un consumidor: la transacción commitea los offsets de ese miembro"
+        );
+    }
+    let budget = StatelessBudget::resolve(config).context("presupuesto del pipeline")?;
+    tracing::info!(
+        cpus = budget.cpus,
+        branches = branches.len(),
+        topic,
+        transactional_id = %options.commit_user,
+        "exactly-once activo (UNION ALL a topic); cada rama commitea su consumer group"
+    );
+
+    let metrics_addr = if let Some(bind) = options.metrics_bind {
+        let server = MetricsServer::new(bind, metrics.clone());
+        Some(server.start().await.context("arrancando métricas")?)
+    } else {
+        None
+    };
+
+    let brokers = config.connectors.redpanda.brokers.join(",");
+    ensure_topic_partitions(&brokers, topic, config.deployment.partitions).await?;
+
+    let mut groups: Vec<(String, Arc<RdkafkaSource>)> = Vec::new();
+    let mut inputs: Vec<InputSource> = Vec::new();
+    let mut trackers: Vec<(String, OffsetTracker)> = Vec::new();
+    let mut input_topics: Vec<(String, String)> = Vec::new();
+    let mut name_to_sources: std::collections::HashMap<
+        String,
+        (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat),
+    > = std::collections::HashMap::new();
+    let cc = source_client_config(config, &options.group_id, &budget);
+
+    for branch in branches {
+        let input_def = config
+            .inputs
+            .iter()
+            .find(|input| input.name == branch.source)
+            .with_context(|| {
+                format!("UNION ALL lee topics y '{}' no es un input", branch.source)
+            })?;
+        if input_def.paimon_table().is_some() {
+            anyhow::bail!("UNION ALL lee topics");
+        }
+        let prepared = input_codecs
+            .get(&input_def.name)
+            .cloned()
+            .with_context(|| format!("sin schema para el input '{}'", input_def.name))?;
+        if !format_matches(input_def.format, &prepared.format) {
+            anyhow::bail!(
+                "el input '{}' declara format {:?} pero el codec cargado no coincide",
+                input_def.name,
+                input_def.format
+            );
+        }
+        let input_topic = input_def.kafka_topic()?.to_string();
+        let source_group = format!("{}-{}", options.group_id, input_def.name);
+        let mut source_cc = cc.clone();
+        source_cc.set("group.id", &source_group);
+        let source = Arc::new(
+            RdkafkaSource::new(&source_cc, &input_topic)
+                .with_context(|| format!("creando source para '{}'", input_def.name))?
+                .with_max_batch(budget.batch_size),
+        );
+        let tracker = OffsetTracker::new();
+        groups.push((input_topic.clone(), source.clone()));
+        trackers.push((input_topic.clone(), tracker.clone()));
+        input_topics.push((input_def.name.clone(), input_topic));
+        name_to_sources.insert(
+            input_def.name.clone(),
+            (vec![source], tracker, prepared.format),
+        );
+        inputs.push(InputSource {
+            name: input_def.name.clone(),
+            schema: prepared.schema.clone(),
+        });
+    }
+
+    let batch_size = budget.batch_size;
+    let decode_parallelism = budget.decode_parallelism;
+    let factory: Box<StreamTableFactory> = Box::new(move |name, schema| {
+        let (input_sources, tracker, format) = name_to_sources
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("source no encontrado para '{name}'"))?;
+        let decoder = Decoder::new(schema.clone(), format);
+        let make_stream = Arc::new(move || {
+            let merged: tachyon_source::consumer::RecordStream =
+                Box::pin(futures::stream::select_all(
+                    input_sources.iter().map(|source| source.record_stream()),
+                ));
+            merged
+        });
+        let inner = RedpandaPartitionStream::new(0, schema.clone(), decoder, batch_size, make_stream)
+            .with_offset_tracker(tracker)
+            .with_decode_parallelism(decode_parallelism);
+        let table = datafusion::catalog::streaming::StreamingTable::try_new(
+            schema,
+            vec![Arc::new(inner)],
+        )
+        .map_err(|err| anyhow::anyhow!("creando StreamingTable: {err}"))?;
+        Ok(Arc::new(table.with_infinite_table(true)))
+    });
+
+    let sources = assemble_union_sources(branches, &inputs, &trackers, &input_topics)?;
+    let mut feed = UnionFeed::start(&sources, &factory)
+        .await
+        .context("armando UNION ALL")?;
+    let out_schema = feed.schema();
+    let key_field = out_schema
+        .field_with_name(key)
+        .map_err(|_| anyhow::anyhow!("la salida no tiene la clave '{key}'"))?;
+    match key_field.data_type() {
+        arrow::datatypes::DataType::Int64
+        | arrow::datatypes::DataType::Int32
+        | arrow::datatypes::DataType::Utf8 => {}
+        other => anyhow::bail!(
+            "la clave '{key}' es {other}; el topic la publica como Int64, Int32 o Utf8"
+        ),
+    }
+
+    let timeout_ms = (options.commit_interval.as_millis() as u64)
+        .saturating_mul(4)
+        .max(120_000);
+    let wire = match config.output.format {
+        PayloadFormat::Json => TopicWire::Json,
+        PayloadFormat::Avro => {
+            let url = config
+                .connectors
+                .schema_registry
+                .as_ref()
+                .context("format avro requiere connectors.schema_registry.url")?
+                .url
+                .clone();
+            let avsc = avro_json_from_arrow(out_schema.as_ref())?;
+            let schema = parse_avro_schema(&avsc)?;
+            let id = register_topic_schema(&url, topic, &avsc)
+                .context("registrando el schema de la salida")?;
+            tracing::info!(topic, schema_id = id, "schema de salida registrado");
+            TopicWire::Avro { schema, id }
+        }
+    };
+    let sink = RedpandaSink::open(&brokers, topic, key, &options.commit_user, timeout_ms).await?;
+
+    let mut tick = tokio::time::interval(options.commit_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    let mut offsets = SourceOffsets::new();
+    let mut in_txn = false;
+    loop {
+        tokio::select! {
+            batch = feed.next() => {
+                match batch {
+                    Some(Ok((batch, covered))) => {
+                        if !in_txn {
+                            sink.begin().await?;
+                            in_txn = true;
+                        }
+                        let rows = match &wire {
+                            TopicWire::Json => sink.write(&batch).await.context("publicando el batch")?,
+                            TopicWire::Avro { schema, id } => {
+                                let records = encode_envelopes(&batch, key, schema, *id)
+                                    .context("codificando Avro")?;
+                                sink.write_records(&records)
+                                    .await
+                                    .context("publicando el batch")?
+                            }
+                        };
+                        merge_offsets(&mut offsets, &covered);
+                        metrics.inc_rows_read(rows as u64);
+                        metrics.inc_rows_written(rows as u64);
+                    }
+                    Some(Err(err)) => return Err(err).context("batch de salida"),
+                    None => break,
+                }
+            }
+            _ = tick.tick() => {
+                if in_txn {
+                    commit_topic_groups(&sink, &groups, &offsets).await?;
+                    in_txn = false;
+                    metrics.inc_commits();
+                    tracing::info!(topic, "transacción de topic commiteada");
+                }
+            }
+        }
+    }
+    if in_txn {
+        commit_topic_groups(&sink, &groups, &offsets).await?;
+        metrics.inc_commits();
+    }
+    Ok(PipelineHandle {
+        metrics_addr,
+        metrics: metrics.clone(),
+    })
 }
 
 pub(crate) async fn ensure_topic_partitions(brokers: &str, topic: &str, expected: usize) -> Result<()> {

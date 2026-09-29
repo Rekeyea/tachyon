@@ -9,7 +9,7 @@ use tachyon_config::{validate_config, PipelineConfig};
 use tachyon_core::{OutputDef, PartitionKey, PipelinePlan, StreamDef};
 use tachyon_metrics::InstanceMetrics;
 use tachyon_sink::writer::PaimonSink;
-use tachyon_sql::{orient_lookup, parse_sql, LookupJoin, LookupShape, WindowShape};
+use tachyon_sql::{orient_lookup, parse_sql, LookupJoin, LookupShape, UnionBranch, WindowShape};
 
 use crate::join::run_join_pipeline;
 use crate::run::{
@@ -29,6 +29,7 @@ pub struct Pipeline {
     window: Option<WindowShape>,
     join: Option<tachyon_sql::IntervalJoin>,
     lookup: Option<LookupJoin>,
+    union_all: Option<Vec<UnionBranch>>,
 }
 
 impl Pipeline {
@@ -82,6 +83,7 @@ impl Pipeline {
             window: parsed.window,
             join: parsed.join,
             lookup,
+            union_all: parsed.union_all,
         })
     }
 
@@ -96,12 +98,20 @@ impl Pipeline {
         &self,
         input_codecs: &std::collections::HashMap<String, PreparedInput>,
     ) -> Result<PipelineHandle> {
+        if self.union_all.is_some()
+            && (self.window.is_some() || self.join.is_some() || self.lookup.is_some())
+        {
+            anyhow::bail!("UNION ALL no se mezcla con una ventana, un join o un lookup");
+        }
         if self
             .config
             .inputs
             .iter()
             .any(|input| input.paimon_table().is_some())
         {
+            if self.union_all.is_some() {
+                anyhow::bail!("UNION ALL lee topics");
+            }
             let topic = self
                 .config
                 .output
@@ -137,6 +147,7 @@ impl Pipeline {
                 input_codecs,
                 &metrics,
                 self.lookup.as_ref(),
+                self.union_all.as_deref(),
             )
             .await;
         }
@@ -197,6 +208,7 @@ impl Pipeline {
             &metrics,
             self.window.as_ref(),
             self.lookup.as_ref(),
+            self.union_all.as_deref(),
         )
         .await
     }
@@ -424,5 +436,22 @@ deployment:
         );
         let err = Pipeline::new(&load(&yaml), LOOKUP_SQL).unwrap_err();
         assert!(err.to_string().contains("un solo stream"), "{err}");
+    }
+
+    #[test]
+    fn a_union_all_binds_both_inputs() {
+        let yaml = valid_config_yaml().replace(
+            "    schema: avro/orders-v1\n",
+            "    schema: avro/orders-v1\n  - name: app\n    topic: app-topic\n    key: order_id\n    schema: avro/app\n",
+        );
+        let sql = "INSERT INTO orders_lake \
+            SELECT order_id FROM orders WHERE order_id > 0 \
+            UNION ALL \
+            SELECT order_id FROM app";
+        let pipeline = Pipeline::new(&load(&yaml), sql).expect("union");
+        assert_eq!(pipeline.plan.sql_source_tables, vec!["orders", "app"]);
+        let branches = pipeline.union_all.expect("ramas");
+        assert_eq!(branches[0].source, "orders");
+        assert_eq!(branches[1].source, "app");
     }
 }

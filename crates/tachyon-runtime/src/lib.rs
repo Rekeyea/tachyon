@@ -10,6 +10,7 @@ pub mod lookup;
 pub mod run;
 pub mod runtime;
 pub mod table_stream;
+pub mod union;
 pub mod window;
 
 pub use budget::StatelessBudget;
