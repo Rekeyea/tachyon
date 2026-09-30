@@ -40,7 +40,7 @@ use tachyon_core::{CheckpointBody, SourceOffsets};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
 use tachyon_sink::redpanda::RedpandaSink;
 use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, PartitionTickets, Recovered};
-use tachyon_source::consumer::RdkafkaSource;
+use tachyon_source::consumer::{CopiedCursor, LotRanges, RdkafkaSource};
 use tachyon_source::{StateRequest, WindowHandoff};
 use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
 use tachyon_source::{
@@ -51,13 +51,24 @@ use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
 use tachyon_sql::{LookupJoin, UnionBranch, WindowShape};
 
 use crate::budget::StatelessBudget;
-use crate::execute::{ensure_passthrough, plan_query, InputSource, StreamTableFactory};
+use crate::execute::{
+    ensure_passthrough, ensure_passthrough_lanes, plan_query, InputSource, StreamTableFactory,
+};
 use crate::lookup::{prepare_lookup, LookupStream, PreparedLookup};
 use crate::union::{UnionFeed, UnionSource};
 use crate::window::{
     batch_from_closed, inputs_from_batch, output_field_names, schema_with_partition,
-    spec_from_shape, user_schema_without_partition, WindowOperator, PARTITION_COLUMN,
+    spec_from_shape, user_schema_without_partition, KeyKind, PARTITION_COLUMN,
 };
+use crate::window_shards::ShardedWindow;
+
+/// Qué offsets cubre un batch que llega al writer.
+enum Progress {
+    /// Todo lo que las fuentes emitieron hasta este batch (un solo stream).
+    Snapshot(SourceOffsets),
+    /// Los tramos exactos que cubre el batch de un carril.
+    Ranges(Vec<tachyon_core::OffsetRange>),
+}
 
 /// Fusiona `update` en `offsets` (máximo por partición: el progreso nunca
 /// retrocede).
@@ -79,7 +90,7 @@ fn same_window(stored: &tachyon_core::WindowSpecId, current: &tachyon_core::Wind
 
 fn release_lost_partitions(
     handoff: &Option<Arc<WindowHandoff>>,
-    operator: &mut WindowOperator,
+    operator: &mut ShardedWindow,
     applied: &mut SourceOffsets,
 ) {
     let Some(handoff) = handoff else {
@@ -306,6 +317,12 @@ pub(crate) fn source_client_config(
     // mensajes sin transacción siguen llegando.
     cc.set("isolation.level", "read_committed");
     cc.set("session.timeout.ms", "10000");
+    // Los N consumidores del proceso entran al grupo de a uno y cada entrada
+    // rebalancea. Un miembro se entera del rebalance en su próximo
+    // heartbeat: con el default (3s) el arranque quedaba frenado 3s en la
+    // mitad de las corridas (el broker ya había armado la generación con
+    // los primeros). 500 ms lo acota sin cargar al coordinador.
+    cc.set("heartbeat.interval.ms", "500");
     // El broker acumula hasta `fetch.min.bytes` antes de responder. Con el
     // default de 1 byte cada round trip trae poquísimas filas y el throughput
     // queda acotado por la latencia de red. Los valores salen del presupuesto
@@ -321,7 +338,10 @@ pub(crate) fn source_client_config(
     // decode no vea el round trip. El default (100K mensajes / 64 MiB) se
     // queda corto cuando cada batch son 32K filas.
     cc.set("queued.min.messages", "1000000");
-    cc.set("queued.max.messages.kbytes", "262144");
+    cc.set(
+        "queued.max.messages.kbytes",
+        budget.queued_max_kbytes.to_string(),
+    );
     if let Some(sec) = &config.connectors.redpanda.security {
         if let Some(mech) = &sec.sasl_mechanism {
             cc.set("sasl.mechanism", mech);
@@ -513,7 +533,7 @@ pub(crate) async fn run_pipeline_with_lookup(
     let mut input_topics: Vec<(String, String)> = Vec::new();
     let mut name_to_sources: std::collections::HashMap<
         String,
-        (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat),
+        (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat, Vec<LotRanges>),
     > = std::collections::HashMap::new();
     let mut window_handoff: Option<Arc<WindowHandoff>> = None;
     let (adopt_tx, adopt_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -543,6 +563,26 @@ pub(crate) async fn run_pipeline_with_lookup(
     } else {
         select_sql.to_string()
     };
+
+    // Carriles: con un solo topic en pass-through, cada consumidor alimenta
+    // su propia partición de DataFusion (decode + filtro/proyección en
+    // paralelo, como los subtasks de Flink) y el writer junta los rangos de
+    // offsets de cada carril en una frontera exacta (ver `Frontier`). Un
+    // único stream ordenado que fundía los N consumidores era el techo del
+    // pipeline y la fuente de su variabilidad.
+    let use_lanes = union_branches.is_none()
+        && prepared_lookup.is_none()
+        && config.inputs.len() == 1
+        && n_consumers > 1;
+    let mut lane_outs: Vec<tachyon_source::LaneRanges> = Vec::new();
+    // Ventana: cada carril lleva su propio tracker (lo que emitió); el
+    // handoff impide que un carril se adelante a otro en una partición.
+    let lane_trackers: Vec<OffsetTracker> = if use_lanes && window.is_some() {
+        (0..n_consumers).map(|_| OffsetTracker::new()).collect()
+    } else {
+        Vec::new()
+    };
+    let mut lane_cursor: Option<(String, CopiedCursor)> = None;
 
     for input_def in &config.inputs {
         let prepared = input_codecs
@@ -575,6 +615,9 @@ pub(crate) async fn run_pipeline_with_lookup(
         source_cc.set("group.id", &source_group);
         let handoff = if window.is_some() {
             source_cc.set("session.timeout.ms", session_timeout_ms.to_string());
+            // Fin del log por partición: el watermark no deja idle a una
+            // partición que todavía tiene backlog.
+            source_cc.set("enable.partition.eof", "true");
             let topic_applied = restored_window
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.applied.get(&topic))
@@ -620,6 +663,15 @@ pub(crate) async fn run_pipeline_with_lookup(
             .and_then(|r| r.get(&topic))
             .cloned()
             .unwrap_or_default();
+        // Pass-through: los N consumidores del topic comparten lo copiado,
+        // así un rebalance entre ellos no relee (ver `CopiedCursor`).
+        let copied = CopiedCursor::new();
+        let lane_lots: Vec<LotRanges> = if use_lanes {
+            lane_cursor = Some((topic.clone(), copied.clone()));
+            (0..n_consumers).map(|_| LotRanges::new()).collect()
+        } else {
+            Vec::new()
+        };
         let input_sources: Vec<Arc<RdkafkaSource>> = (0..n_consumers)
             .map(|index| -> Result<Arc<RdkafkaSource>> {
                 let mut consumer_cc = source_cc.clone();
@@ -638,6 +690,11 @@ pub(crate) async fn run_pipeline_with_lookup(
                     .with_resume_offsets(topic_resume.clone());
                 if let Some(gate) = &handoff {
                     source = source.with_window_handoff(gate.clone());
+                } else {
+                    source = source.with_copied_cursor(copied.clone());
+                    if let Some(lots) = lane_lots.get(index) {
+                        source = source.with_lot_ranges(lots.clone());
+                    }
                 }
                 Ok(Arc::new(source))
             })
@@ -645,9 +702,14 @@ pub(crate) async fn run_pipeline_with_lookup(
         let tracker = OffsetTracker::new();
         commit_sources.push((topic.clone(), input_sources[0].clone()));
         trackers.push((topic.clone(), tracker.clone()));
+        if use_lanes {
+            // En ventana no se leen (el carril usa su tracker), pero el zip
+            // de la factory recorre uno por consumidor.
+            lane_outs = (0..n_consumers).map(|_| Default::default()).collect();
+        }
         name_to_sources.insert(
             input_def.name.clone(),
-            (input_sources, tracker, prepared.format),
+            (input_sources, tracker, prepared.format, lane_lots),
         );
         inputs.push(InputSource {
             name: input_def.name.clone(),
@@ -661,14 +723,56 @@ pub(crate) async fn run_pipeline_with_lookup(
     // broker se decodifica a un único `RecordBatch`.
     let batch_size = budget.batch_size;
     let decode_parallelism = budget.decode_parallelism;
+    let lanes_on = Arc::new(std::sync::atomic::AtomicBool::new(use_lanes));
+    let factory_lanes = lanes_on.clone();
+    let factory_outs = lane_outs.clone();
+    let factory_trackers = lane_trackers.clone();
     let factory: Box<StreamTableFactory> = Box::new(move |name, schema| {
-        let (input_sources, tracker, format) = name_to_sources
+        let (input_sources, tracker, format, lane_lots) = name_to_sources
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("source no encontrado para '{name}'"))?;
         let (decode_schema, inner_schema, row_partitions) =
             decode_plan(&schema, &prepared_lookup, name);
         let decoder = Decoder::new(decode_schema, format);
+        if factory_lanes.load(std::sync::atomic::Ordering::SeqCst) {
+            // Una partición por consumidor. Dos decodes en vuelo por carril:
+            // mientras uno decodifica, el loop junta el lote siguiente.
+            let per_lane = (decode_parallelism / input_sources.len().max(1)).max(2);
+            let lane_trackers = factory_trackers.clone();
+            let partitions: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>> =
+                input_sources
+                    .iter()
+                    .zip(lane_lots.iter())
+                    .zip(factory_outs.iter())
+                    .enumerate()
+                    .map(|(index, ((source, lots), out))| {
+                        let source = source.clone();
+                        let make_stream: Arc<dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync> =
+                            Arc::new(move || source.record_stream());
+                        let lane = RedpandaPartitionStream::new(
+                            index as i32,
+                            inner_schema.clone(),
+                            decoder.clone(),
+                            batch_size,
+                            make_stream,
+                        )
+                        .with_decode_parallelism(per_lane)
+                        .with_row_partitions(row_partitions);
+                        let lane = match lane_trackers.get(index) {
+                            Some(tracker) => lane.with_offset_tracker(tracker.clone()),
+                            None => lane.with_lane(lots.clone(), out.clone()),
+                        };
+                        Arc::new(lane) as Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
+                    })
+                    .collect();
+            let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
+                .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+            return Ok(Arc::new(table.with_infinite_table(true)));
+        }
+        for source in &input_sources {
+            source.drop_lot_ranges();
+        }
         // Un `record_stream()` por consumidor, fusionados con `select_all`:
         // el grupo reparte las particiones entre ellos y cada instancia
         // drena su propio buffer de fetch en paralelo. La factory se invoca
@@ -708,6 +812,7 @@ pub(crate) async fn run_pipeline_with_lookup(
     // UnionExec, que puede leer una rama por delante de lo publicado.
     let mut union_feed = None;
     let mut stream = None;
+    let mut lane_streams: Vec<datafusion::physical_plan::SendableRecordBatchStream> = Vec::new();
     if let Some(branches) = union_branches {
         let sources = assemble_union_sources(branches, &inputs, &trackers, &input_topics)?;
         union_feed = Some(
@@ -716,20 +821,54 @@ pub(crate) async fn run_pipeline_with_lookup(
                 .context("armando UNION ALL")?,
         );
     } else {
-        let (plan, task_ctx) = plan_query(&planned_sql, &inputs, &factory)
+        let (mut plan, mut task_ctx) = plan_query(&planned_sql, &inputs, &factory)
             .await
             .context("planificando la transformación")?;
-        ensure_passthrough(&plan).context("la transformación no admite exactly-once")?;
-        stream = Some(
-            datafusion::physical_plan::execute_stream(plan, task_ctx)
-                .context("ejecutando la transformación")?,
-        );
+        if use_lanes {
+            match ensure_passthrough_lanes(&plan, n_consumers) {
+                Ok(()) => {
+                    tracing::info!(lanes = n_consumers, "un carril por consumidor");
+                    for index in 0..n_consumers {
+                        lane_streams.push(
+                            plan.execute(index, task_ctx.clone())
+                                .context("ejecutando un carril de la transformación")?,
+                        );
+                    }
+                }
+                Err(e) => {
+                    // P. ej. un LIMIT: es global, no se reparte en carriles.
+                    tracing::info!(motivo = %e, "el plan no se reparte en carriles: un solo stream");
+                    lanes_on.store(false, std::sync::atomic::Ordering::SeqCst);
+                    (plan, task_ctx) = plan_query(&planned_sql, &inputs, &factory)
+                        .await
+                        .context("planificando la transformación")?;
+                }
+            }
+        }
+        if lane_streams.is_empty() {
+            ensure_passthrough(&plan).context("la transformación no admite exactly-once")?;
+            stream = Some(
+                datafusion::physical_plan::execute_stream(plan, task_ctx)
+                    .context("ejecutando la transformación")?,
+            );
+        }
     }
 
     if let Some(shape) = window {
-        let stream = stream
-            .take()
-            .context("la ventana lee un solo stream")?;
+        let window_lanes: Vec<(crate::execute::TransformOutput, OffsetTracker)> =
+            if lane_streams.is_empty() {
+                let stream = stream.take().context("la ventana lee un solo stream")?;
+                let tracker = trackers
+                    .first()
+                    .map(|(_, tracker)| tracker.clone())
+                    .context("la ventana lee un topic")?;
+                vec![(stream, tracker)]
+            } else {
+                std::mem::take(&mut lane_streams)
+                    .into_iter()
+                    .zip(lane_trackers.iter().cloned())
+                    .collect()
+            };
         let user_schema = input_codecs
             .get(&shape.source)
             .with_context(|| format!("sin schema para '{}'", shape.source))?
@@ -742,7 +881,7 @@ pub(crate) async fn run_pipeline_with_lookup(
             lag_ms,
             idle_ms,
             user_schema,
-            stream,
+            window_lanes,
             sink,
             trackers,
             commit_sources,
@@ -779,9 +918,13 @@ pub(crate) async fn run_pipeline_with_lookup(
     // commit de Paimon sin inflar el RSS de la instancia.
     let channel_batches = budget.channel_batches();
     let (batch_tx, mut batch_rx) =
-        tokio::sync::mpsc::channel::<(arrow::array::RecordBatch, SourceOffsets)>(channel_batches);
+        tokio::sync::mpsc::channel::<(arrow::array::RecordBatch, Progress)>(channel_batches);
 
-    let (mut sink_writer, mut sink_committer) = sink.split();
+    // Los buckets se reparten entre `sink_shards` writers: escritura y flush
+    // en paralelo (ver `tachyon_sink::shard`).
+    let (mut sink_writer, mut sink_committer) = sink
+        .split_sharded(budget.sink_shards)
+        .context("repartiendo el sink por bucket")?;
     let (epoch_tx, mut epoch_rx) = tokio::sync::mpsc::channel::<CheckpointEpoch>(1);
     let commit_metrics = metrics.clone();
     let commit_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
@@ -819,6 +962,11 @@ pub(crate) async fn run_pipeline_with_lookup(
         // Offsets del próximo checkpoint. Arranca en el checkpoint recuperado
         // para arrastrar las particiones que no avanzan en esta ejecución.
         let mut offsets: SourceOffsets = resume.unwrap_or_default();
+        // Carriles: la frontera por partición (arranca en el checkpoint).
+        let mut frontier = lane_cursor.map(|(topic, cursor)| {
+            let start = offsets.get(&topic).cloned().unwrap_or_default();
+            (topic, cursor, tachyon_core::Frontier::new(&start))
+        });
         let mut commit_timer = tokio::time::interval(commit_interval);
         commit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         commit_timer.tick().await; // primera tick inmediata
@@ -836,7 +984,18 @@ pub(crate) async fn run_pipeline_with_lookup(
                                 .await
                                 .context("escribiendo al sink Paimon")?;
                             writer_metrics.add_write_ns(t_write.elapsed().as_nanos() as u64);
-                            merge_offsets(&mut offsets, &batch_offsets);
+                            match batch_offsets {
+                                Progress::Snapshot(snapshot) => merge_offsets(&mut offsets, &snapshot),
+                                Progress::Ranges(ranges) => {
+                                    let (topic, cursor, frontier) = frontier
+                                        .as_mut()
+                                        .context("rangos de carril sin frontera")?;
+                                    for range in ranges {
+                                        frontier.cover(range, |p| cursor.origin(p));
+                                    }
+                                    offsets.insert(topic.clone(), frontier.offsets().clone());
+                                }
+                            }
                             writer_metrics.inc_rows_written(batch.num_rows() as u64);
                             dirty = true;
                         }
@@ -849,6 +1008,7 @@ pub(crate) async fn run_pipeline_with_lookup(
                         // background y se sigue escribiendo de inmediato.
                         let (identifier, full_writer) = sink_writer
                             .rotate()
+                            .await
                             .context("rotando el writer del sink")?;
                         let epoch = CheckpointEpoch {
                             writer: full_writer,
@@ -870,6 +1030,7 @@ pub(crate) async fn run_pipeline_with_lookup(
         if dirty && handoff_error.is_none() {
             let (identifier, full_writer) = sink_writer
                 .rotate()
+                .await
                 .context("rotando el writer del sink")?;
             let _ = epoch_tx
                 .send(CheckpointEpoch {
@@ -890,11 +1051,51 @@ pub(crate) async fn run_pipeline_with_lookup(
         }
     });
 
+    // --- Carriles: un task por partición, cada uno manda sus batches con
+    // los rangos de offsets que cubren ---
+    if !lane_streams.is_empty() {
+        let mut lanes = tokio::task::JoinSet::new();
+        for (mut lane, out) in lane_streams.into_iter().zip(lane_outs.into_iter()) {
+            let tx = batch_tx.clone();
+            let metrics = metrics.clone();
+            lanes.spawn(async move {
+                loop {
+                    let t_next = Instant::now();
+                    let next = lane.next().await;
+                    metrics.add_source_next_ns(t_next.elapsed().as_nanos() as u64);
+                    let Some(batch) = next else { break };
+                    let batch = batch.context("batch de salida")?;
+                    // Con un plan pass-through, lo que el carril emitió hasta
+                    // este batch ya salió en él o en uno anterior.
+                    let ranges = std::mem::take(&mut *out.lock().expect("lock de rangos del carril"));
+                    metrics.inc_rows_read(batch.num_rows() as u64);
+                    let t_send = Instant::now();
+                    tx.send((batch, Progress::Ranges(ranges)))
+                        .await
+                        .context("enviando batch al writer")?;
+                    metrics.add_send_wait_ns(t_send.elapsed().as_nanos() as u64);
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+        while let Some(done) = lanes.join_next().await {
+            done.context("un carril terminó con pánico")??;
+        }
+        drop(batch_tx);
+        writer.await.context("task del writer")??;
+        return Ok(PipelineHandle {
+            metrics_addr,
+            metrics: metrics.clone(),
+        });
+    }
+
     // --- Loop de consumo: tira de DataFusion y envía batches al writer ---
     loop {
         let t_next = Instant::now();
         let next = if let Some(feed) = union_feed.as_mut() {
-            feed.next().await
+            feed.next()
+                .await
+                .map(|item| item.map(|(batch, offsets)| (batch, Progress::Snapshot(offsets))))
         } else {
             let stream = stream.as_mut().context("el pipeline no tiene stream")?;
             match stream.next().await {
@@ -907,7 +1108,7 @@ pub(crate) async fn run_pipeline_with_lookup(
                         .iter()
                         .map(|(topic, tracker)| (topic.clone(), tracker.snapshot()))
                         .collect();
-                    Some(Ok((batch, batch_offsets)))
+                    Some(Ok((batch, Progress::Snapshot(batch_offsets))))
                 }
                 Some(Err(err)) => Some(Err(anyhow::anyhow!(err))),
                 None => None,
@@ -1631,7 +1832,7 @@ async fn drive_window(
     lag_ms: i64,
     idle_ms: i64,
     user_schema: arrow::datatypes::SchemaRef,
-    mut stream: crate::execute::TransformOutput,
+    lanes: Vec<(crate::execute::TransformOutput, OffsetTracker)>,
     sink: PaimonSink,
     trackers: Vec<(String, OffsetTracker)>,
     commit_sources: Vec<(String, Arc<RdkafkaSource>)>,
@@ -1645,15 +1846,32 @@ async fn drive_window(
     ticket_table: PartitionTickets,
 ) -> Result<PipelineHandle> {
     let spec = spec_from_shape(shape);
+    // Clave tipada: una sola columna de grupo Int64 (el caso común) evita el
+    // encoding binario y las allocs por fila en el operador.
+    let key_kind = if shape.group_columns.len() == 1
+        && user_schema
+            .field_with_name(&shape.group_columns[0])
+            .is_ok_and(|property| property.data_type() == &arrow::datatypes::DataType::Int64)
+    {
+        KeyKind::I64
+    } else {
+        KeyKind::Bytes
+    };
+    // Un shard del operador por consumidor: cada uno es dueño de
+    // `partición % shards` y aplica en paralelo (ver `ShardedWindow`).
+    let shards = n_consumers.max(1);
     let mut operator = match &restored {
         Some(checkpoint) => {
-            let mut op = WindowOperator::restore(
+            let mut op = ShardedWindow::restore(
                 spec,
                 lag_ms,
                 idle_ms,
                 checkpoint.state.clone(),
                 checkpoint.instance_watermark_ms,
-            );
+                key_kind,
+                shards,
+            )
+            .map_err(|e| anyhow::anyhow!("restaurando el estado de ventana: {e}"))?;
             let topic = trackers.first().map(|(topic, _)| topic.clone());
             if let Some(topic) = topic {
                 if let Some(parts) = checkpoint.progress.get(&topic) {
@@ -1666,7 +1884,7 @@ async fn drive_window(
             }
             op
         }
-        None => WindowOperator::new(spec, lag_ms, idle_ms),
+        None => ShardedWindow::new(spec, lag_ms, idle_ms, key_kind, shards),
     };
     let mut applied = restored
         .as_ref()
@@ -1719,7 +1937,8 @@ async fn drive_window(
                     if !dirty {
                         continue;
                     }
-                    let (identifier, full_writer) = sink_writer.rotate().context("rotando el writer")?;
+                    let (identifier, full_writer) =
+                        sink_writer.rotate().await.context("rotando el writer")?;
                     if epoch_tx
                         .send(CheckpointEpoch {
                             writer: full_writer,
@@ -1742,25 +1961,47 @@ async fn drive_window(
 
     // El futuro de `stream.next()` vive en otro task. El select de acá
     // espera un canal, así que un tick no cancela el batch de DataFusion.
-    let (batch_in_tx, mut batch_in_rx) = tokio::sync::mpsc::channel(1);
+    let (batch_in_tx, mut batch_in_rx) = tokio::sync::mpsc::channel(n_consumers.max(1));
     // Si el pipeline se aborta, esta tarea tiene que morir: si no, el stream
     // no se suelta, el poll no ve el canal cerrado y el consumidor se queda
     // en el grupo hasta el session timeout.
-    let stream_task = tokio::spawn(async move {
-        while let Some(item) = stream.next().await {
-            if batch_in_tx.send(item).await.is_err() {
-                break;
+    //
+    // El paso de Arrow a filas del operador también corre acá: es trabajo
+    // por fila y así no se suma al hilo del operador (pipeline de 2 etapas).
+    //
+    // Un task por carril (o uno solo). Cada uno pasa Arrow a filas del
+    // operador y toma el snapshot de su tracker al mandar el batch: lo que
+    // el carril emitió hasta ahí es justo lo que ese batch cubre. Antes el
+    // snapshot se tomaba en el loop después de aplicar, y el task del stream
+    // ya podía haber sacado el batch siguiente: el checkpoint declaraba
+    // aplicado un batch que todavía no estaba en el estado.
+    let mut stream_tasks = Vec::new();
+    for (mut stream, tracker) in lanes {
+        let convert_shape = shape.clone();
+        let batch_in_tx = batch_in_tx.clone();
+        let stream_task = tokio::spawn(async move {
+            while let Some(item) = stream.next().await {
+                let item = item.map_err(anyhow::Error::from).and_then(|record| {
+                    let rows = inputs_from_batch(&record, &convert_shape, key_kind)
+                        .context("leyendo el batch de ventana")?;
+                    Ok((record.num_rows(), rows, tracker.snapshot()))
+                });
+                if batch_in_tx.send(item).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
-    let _stop_stream = AbortOnDrop(stream_task);
+        });
+        stream_tasks.push(AbortOnDrop(stream_task));
+    }
+    drop(batch_in_tx);
+    let _stop_streams = stream_tasks;
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
     let mut last_commit = Instant::now();
     loop {
         enum Wake {
-            Batch(arrow::array::RecordBatch),
+            Batch((usize, Vec<crate::window::WindowInput>, BTreeMap<i32, i64>)),
             Tick,
             Adopt(StateRequest),
             End,
@@ -1794,32 +2035,40 @@ async fn drive_window(
                             ))
                         } else {
                             let offset = ticket.applied_offset;
-                            let closed = operator.adopt_partition(
+                            match operator.adopt_partition(
                                 ticket.partition,
                                 ticket.keys,
                                 ticket.max_event_time_ms,
                                 Instant::now(),
-                            );
-                            applied
-                                .entry(topic)
-                                .or_default()
-                                .insert(req.partition, offset);
-                            if let Some(gate) = &handoff {
-                                gate.note_adopted(req.partition, offset);
+                            ) {
+                                Ok(closed) => {
+                                    applied
+                                        .entry(topic)
+                                        .or_default()
+                                        .insert(req.partition, offset);
+                                    if let Some(gate) = &handoff {
+                                        gate.note_adopted(req.partition, offset);
+                                    }
+                                    if !closed.is_empty() {
+                                        let out =
+                                            batch_from_closed(&closed, shape, user_schema.as_ref())
+                                                .context("armando la salida adoptada")?;
+                                        tx.send(WindowMsg::Rows(out))
+                                            .await
+                                            .context("enviando filas adoptadas")?;
+                                    }
+                                    tracing::info!(
+                                        partition = req.partition,
+                                        offset,
+                                        "partición adoptada desde la ficha"
+                                    );
+                                    Ok(Some(offset))
+                                }
+                                Err(e) => Err(format!(
+                                    "la ficha de la partición {} no se pudo adoptar: {e}",
+                                    req.partition
+                                )),
                             }
-                            if !closed.is_empty() {
-                                let out = batch_from_closed(&closed, shape, user_schema.as_ref())
-                                    .context("armando la salida adoptada")?;
-                                tx.send(WindowMsg::Rows(out))
-                                    .await
-                                    .context("enviando filas adoptadas")?;
-                            }
-                            tracing::info!(
-                                partition = req.partition,
-                                offset,
-                                "partición adoptada desde la ficha"
-                            );
-                            Ok(Some(offset))
                         }
                     }
                     Ok(None) => Ok(None),
@@ -1827,14 +2076,15 @@ async fn drive_window(
                 };
                 let _ = req.ack.send(reply);
             }
-            Wake::Batch(record) => {
+            Wake::Batch((record_rows, rows, snap)) => {
                 release_lost_partitions(&handoff, &mut operator, &mut applied);
-                let rows = inputs_from_batch(&record, shape).context("leyendo el batch de ventana")?;
+                if let Some(gate) = &handoff {
+                    operator.set_backlog(gate.backlog());
+                }
                 let closed = operator
-                    .apply(&rows, Instant::now())
+                    .apply(rows, Instant::now())
                     .map_err(|e| anyhow::anyhow!(e))?;
-                for (topic, tracker) in &trackers {
-                    let snap = tracker.snapshot();
+                if let Some((topic, _)) = trackers.first() {
                     let entry = applied.entry(topic.clone()).or_default();
                     for (partition, next) in &snap {
                         if operator.is_released(*partition) {
@@ -1854,7 +2104,7 @@ async fn drive_window(
                         }
                     }
                 }
-                metrics.inc_rows_read(record.num_rows() as u64);
+                metrics.inc_rows_read(record_rows as u64);
                 if !closed.is_empty() {
                     let out = batch_from_closed(&closed, shape, user_schema.as_ref())
                         .context("armando la salida de la ventana")?;
@@ -1865,6 +2115,9 @@ async fn drive_window(
             }
             Wake::Tick => {
                 release_lost_partitions(&handoff, &mut operator, &mut applied);
+                if let Some(gate) = &handoff {
+                    operator.set_backlog(gate.backlog());
+                }
                 let closed = operator.on_tick(Instant::now());
                 if !closed.is_empty() {
                     let out = batch_from_closed(&closed, shape, user_schema.as_ref())?;

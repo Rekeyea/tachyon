@@ -68,6 +68,10 @@ struct Inner {
     pending_release: Vec<i32>,
     next_consumer: u64,
     fatal: Option<String>,
+    /// Particiones cuyo consumidor llegó al final del log (PARTITION_EOF de
+    /// librdkafka, que ya saltea los markers de transacción). Un mensaje
+    /// nuevo la saca.
+    at_end: HashSet<i32>,
 }
 
 /// Estado compartido del handoff. Un proceso, un input, N consumidores.
@@ -137,6 +141,7 @@ impl WindowHandoff {
                 pending_release: Vec::new(),
                 next_consumer: 0,
                 fatal: None,
+                at_end: HashSet::new(),
             }),
             bus: Mutex::new(None),
         }
@@ -201,7 +206,46 @@ impl WindowHandoff {
         member.revoking = false;
         member.reported = true;
         member.assigned = partitions.iter().copied().collect();
+        // Un dueño nuevo todavía no sabe si le queda log por leer.
+        for partition in partitions {
+            inner.at_end.remove(partition);
+        }
         recompute_owned(&mut inner);
+    }
+
+    /// El consumidor de `partition` llegó al final del log (`true`) o volvió
+    /// a recibir un mensaje (`false`).
+    pub fn note_end(&self, partition: i32, at_end: bool) {
+        let mut inner = self.lock();
+        if at_end {
+            inner.at_end.insert(partition);
+        } else {
+            inner.at_end.remove(&partition);
+        }
+    }
+
+    /// Particiones de este proceso con algo pendiente: el consumidor no llegó
+    /// al final del log, o lo copiado todavía no pasó por `apply`. Una
+    /// partición así no puede quedar idle: su event time está atrasado por
+    /// el drenado, no porque la fuente dejó de mandar. Si el watermark la
+    /// ignorara, sus eventos llegarían tarde y se perderían.
+    pub fn backlog(&self) -> HashSet<i32> {
+        let inner = self.lock();
+        let mut out = HashSet::new();
+        for member in inner.members.values() {
+            for &partition in &member.assigned {
+                let unread = !inner.at_end.contains(&partition);
+                let unapplied = match (inner.admitted.get(&partition), inner.applied.get(&partition)) {
+                    (Some(admitted), Some(applied)) => applied < admitted,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if unread || unapplied {
+                    out.insert(partition);
+                }
+            }
+        }
+        out
     }
 
     /// El revoke todavía no dice la asignación nueva. No se suelta nada hasta
@@ -597,4 +641,27 @@ mod tests {
         gate.note_assignment(b, &[1]);
         assert_eq!(gate.take_released(), vec![0]);
     }
+
+    #[test]
+    fn backlog_is_unread_or_unapplied_log() {
+        let gate = WindowHandoff::starting("g", "t", "u");
+        let a = gate.register_consumer();
+        gate.note_assignment(a, &[0, 1, 2]);
+        // Recién asignadas: no se sabe si queda log.
+        assert_eq!(gate.backlog(), [0, 1, 2].into_iter().collect());
+        gate.note_end(0, true);
+        gate.note_end(1, true);
+        gate.flush_admitted(a, &BTreeMap::from([(1, 50)]));
+        // La 0 está al final y vacía; la 1 copió 50 que todavía no se aplicaron.
+        assert_eq!(gate.backlog(), [1, 2].into_iter().collect());
+        gate.publish_applied(&BTreeMap::from([(1, 50)]));
+        assert_eq!(gate.backlog(), [2].into_iter().collect());
+        // Un mensaje nuevo la vuelve a poner en backlog.
+        gate.note_end(0, false);
+        assert_eq!(gate.backlog(), [0, 2].into_iter().collect());
+        // Reasignar olvida el fin: el dueño nuevo no sabe cuánto le queda.
+        gate.note_assignment(a, &[1]);
+        assert_eq!(gate.backlog(), [1].into_iter().collect());
+    }
+
 }

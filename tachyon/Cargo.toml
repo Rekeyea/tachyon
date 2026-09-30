@@ -22,3 +22,7 @@ arrow.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Allocator global: ~20 hilos (poll, decode, shards del sink) alocan batches
+# grandes todo el tiempo; con el malloc de glibc eso era ~7% del CPU entre
+# malloc/free y page faults.
+mimalloc = { version = "0.1", default-features = false }

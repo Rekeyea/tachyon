@@ -20,8 +20,10 @@ rdkafka-sys = "4.10"
 apache-avro = "0.21"
 ureq = { version = "2", default-features = false, features = ["json"] }
 arrow-json = "58"
-# Parseo JSON SIMD in-place para el fast path del decoder (schemas planos).
-simd-json = "0.18"
+# Decoder JSON plano (json_flat.rs): validación UTF-8 por mensaje y búsqueda
+# del cierre de strings.
+simdutf8 = "0.1"
+memchr = "2"
 futures = "0.3"
 async-stream = "0.3"
 tokio.workspace = true

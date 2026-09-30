@@ -108,8 +108,14 @@ fn pre_produce() {
 #[tokio::test]
 #[ignore = "requiere Redpanda local en localhost:9092"]
 async fn raw_consume_spike() {
-    ensure_topic().await;
-    pre_produce();
+    // `SPIKE_TOPIC` drena un topic ya cargado (p. ej. `bench-etl` de
+    // bench/run.sh) sin recrearlo ni pre-producir.
+    let spike_topic = std::env::var("SPIKE_TOPIC").ok();
+    let topic = spike_topic.clone().unwrap_or_else(|| TOPIC.to_string());
+    if spike_topic.is_none() {
+        ensure_topic().await;
+        pre_produce();
+    }
 
     // Mismo config que el runtime (run.rs: source_client_config).
     let group_id = format!(
@@ -140,8 +146,20 @@ async fn raw_consume_spike() {
     } else {
         cc.set("fetch.wait.max.ms", "1000");
     }
-    cc.set("queue.buffering.max.messages", "1000000");
-    cc.set("queue.buffering.max.kbytes", "65536");
+    // El resto, como `source_client_config` del runtime. Cada perilla se
+    // puede pisar con SPIKE_<NOMBRE> (p. ej. SPIKE_MAX_PARTITION_FETCH_BYTES).
+    for (key, default) in [
+        ("fetch.max.bytes", "67108864"),
+        ("max.partition.fetch.bytes", "4194304"),
+        ("queued.min.messages", "1000000"),
+        ("queued.max.messages.kbytes", "262144"),
+        ("isolation.level", "read_committed"),
+    ] {
+        let env = format!("SPIKE_{}", key.replace('.', "_").to_uppercase());
+        let value = std::env::var(&env).unwrap_or_else(|_| default.to_string());
+        println!("  {key}={value}");
+        cc.set(key, value);
+    }
     let consumers = std::env::var("SPIKE_CONSUMERS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -167,7 +185,7 @@ async fn raw_consume_spike() {
         >,
     > = Vec::new();
     for _ in 0..consumers {
-        let source = RdkafkaSource::new(&cc, TOPIC).expect("source");
+        let source = RdkafkaSource::new(&cc, &topic).expect("source");
         streams.push(source.record_stream());
     }
     // Select sobre todos los consumidores: el bucle de drenado no sabe (ni le
@@ -191,7 +209,10 @@ async fn raw_consume_spike() {
     let mut gap_max_ms = 0.0f64;
     let mut gap_hist: [u64; 6] = [0; 6]; // <1, 1-5, 5-20, 20-100, 100-500, >500 ms
     let mut sizes: Vec<u64> = Vec::new();
-    while Instant::now().duration_since(t0) < drain_for {
+    // Con `SPIKE_TOPIC` se corta al leer `SPIKE_EVENTS` filas: la tasa es
+    // filas/tiempo de drenado, no filas/ventana fija.
+    let stop_at = spike_topic.as_ref().map(|_| events());
+    while Instant::now().duration_since(t0) < drain_for && stop_at.map_or(true, |n| rows < n) {
         // `next()` acotado por timeout: si el primer lote no llega nunca, el
         // bucle no se cuelga (el timeout devuelve el control y la ventana de
         // tiempo sigue siendo efectiva). El timeout individual es de 5s: si un

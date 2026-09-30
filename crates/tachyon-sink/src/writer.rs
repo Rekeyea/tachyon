@@ -283,11 +283,36 @@ impl PaimonSink {
     /// rota el `TableWrite` en cada checkpoint (instantáneo) y sigue
     /// escribiendo; el flush+commit del epoch cerrado corre en el commit task.
     pub fn split(self) -> (PaimonWriterHalf, PaimonCommitterHalf) {
-        (
+        self.split_sharded(1)
+            .expect("un solo writer no arranca shards")
+    }
+
+    /// Como `split`, pero los buckets se reparten entre `shards` writers que
+    /// escriben y hacen el flush en paralelo (ver `shard`). Si la tabla no se
+    /// puede repartir (un bucket, buckets dinámicos, otra función de bucket)
+    /// queda un solo writer. Hay que llamarlo dentro de un runtime de Tokio.
+    pub fn split_sharded(self, shards: usize) -> Result<(PaimonWriterHalf, PaimonCommitterHalf)> {
+        let lanes = match crate::shard::BucketRouter::for_table(&self.table, shards) {
+            Some(router) => {
+                let shards = (0..router.shards())
+                    .map(|_| {
+                        crate::shard::spawn_shard(
+                            self.table.clone(),
+                            self.commit_user.clone(),
+                            self.rowkind.clone(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                tracing::info!(shards = shards.len(), "sink de Paimon repartido por bucket");
+                Lanes::Sharded { router, shards }
+            }
+            None => Lanes::Single(self.writer),
+        };
+        Ok((
             PaimonWriterHalf {
                 table: self.table.clone(),
                 commit_user: self.commit_user.clone(),
-                active: self.writer,
+                lanes,
                 next_identifier: self.next_identifier,
                 rowkind: self.rowkind.clone(),
             },
@@ -296,7 +321,7 @@ impl PaimonSink {
                 commit_user: self.commit_user,
                 committer: self.committer,
             },
-        )
+        ))
     }
 
     /// Escribe un `RecordBatch` de salida.
@@ -417,36 +442,98 @@ async fn commit_with_retries(
 pub struct PaimonWriterHalf {
     table: paimon::table::Table,
     commit_user: String,
-    active: paimon::table::TableWrite,
+    lanes: Lanes,
     /// Identifier del próximo checkpoint (monótono por `commit_user`).
     next_identifier: i64,
     /// Misma columna que `PaimonSink::rowkind`.
     rowkind: Option<(String, usize, RowkindWrite)>,
 }
 
+/// Un writer, o N shards por bucket con su router.
+enum Lanes {
+    Single(paimon::table::TableWrite),
+    Sharded {
+        router: crate::shard::BucketRouter,
+        shards: Vec<crate::shard::Shard>,
+    },
+}
+
 impl PaimonWriterHalf {
     /// Escribe un `RecordBatch` (mismas reglas de schema que `PaimonSink::write`).
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        let prepared = prepare_batch(batch, &self.rowkind)?;
-        self.active
-            .write_arrow_batch(&prepared)
-            .await
-            .context("write_arrow_batch")
+        match &mut self.lanes {
+            Lanes::Single(active) => {
+                let prepared = prepare_batch(batch, &self.rowkind)?;
+                active
+                    .write_arrow_batch(&prepared)
+                    .await
+                    .context("write_arrow_batch")
+            }
+            Lanes::Sharded { router, shards } => {
+                let parts = router.split(batch)?;
+                for (index, part) in parts.into_iter().enumerate() {
+                    let Some(part) = part else { continue };
+                    if shards[index]
+                        .tx
+                        .send(crate::shard::ShardMsg::Batch(part))
+                        .await
+                        .is_err()
+                    {
+                        return Err(shard_failure(&mut shards[index]).await);
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
-    /// Cierra el epoch actual: devuelve `(identifier, writer lleno)` y deja
-    /// un writer fresco listo para seguir escribiendo. O(1).
-    pub fn rotate(&mut self) -> Result<(i64, paimon::table::TableWrite)> {
-        let fresh = self
-            .table
-            .new_write_builder()
-            .with_commit_user(&self.commit_user)
-            .context("commit_user inválido")?
-            .new_write()
-            .context("new_write")?;
+    /// Cierra el epoch actual: devuelve `(identifier, writers llenos)` y deja
+    /// writers frescos listos para seguir escribiendo. Con shards espera a
+    /// que cada uno termine lo que tenía en cola (el corte del epoch es el
+    /// mismo para todos).
+    pub async fn rotate(&mut self) -> Result<(i64, crate::shard::EpochWrite)> {
+        let epoch = match &mut self.lanes {
+            Lanes::Single(active) => {
+                let fresh = self
+                    .table
+                    .new_write_builder()
+                    .with_commit_user(&self.commit_user)
+                    .context("commit_user inválido")?
+                    .new_write()
+                    .context("new_write")?;
+                crate::shard::EpochWrite::single(std::mem::replace(active, fresh))
+            }
+            Lanes::Sharded { shards, .. } => {
+                let mut replies = Vec::with_capacity(shards.len());
+                for shard in shards.iter_mut() {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if shard.tx.send(crate::shard::ShardMsg::Rotate(tx)).await.is_err() {
+                        return Err(shard_failure(shard).await);
+                    }
+                    replies.push(rx);
+                }
+                let mut writers = Vec::with_capacity(replies.len());
+                for (index, reply) in replies.into_iter().enumerate() {
+                    match reply.await {
+                        Ok(writer) => writers.push(writer),
+                        Err(_) => return Err(shard_failure(&mut shards[index]).await),
+                    }
+                }
+                crate::shard::sharded_epoch(writers)
+            }
+        };
         let identifier = self.next_identifier;
         self.next_identifier += 1;
-        Ok((identifier, std::mem::replace(&mut self.active, fresh)))
+        Ok((identifier, epoch))
+    }
+}
+
+/// El error con el que terminó un shard cuya cola se cerró.
+async fn shard_failure(shard: &mut crate::shard::Shard) -> anyhow::Error {
+    match (&mut shard.done).await {
+        Ok(Err(e)) => e.context("un shard del sink falló"),
+        Ok(Ok(())) => anyhow::anyhow!("un shard del sink terminó antes de tiempo"),
+        Err(e) => anyhow::anyhow!("un shard del sink terminó con pánico: {e}"),
     }
 }
 
@@ -466,13 +553,13 @@ impl PaimonCommitterHalf {
     /// epoch no produjo archivos nuevos.
     pub async fn commit_epoch(
         &mut self,
-        mut writer: paimon::table::TableWrite,
+        writer: crate::shard::EpochWrite,
         identifier: i64,
         body: &CheckpointBody,
     ) -> Result<Option<i64>> {
         let debug = std::env::var("TACHYON_DEBUG_COMMIT").is_ok();
         let t_prepare = std::time::Instant::now();
-        let messages = writer.prepare_commit().await.context("prepare_commit")?;
+        let messages = writer.prepare_commit().await?;
         let d_prepare = t_prepare.elapsed();
         if messages.is_empty() {
             return Ok(None);
@@ -574,7 +661,7 @@ async fn publish_checkpoint(
 /// Un epoch cerrado pendiente de commit: lo que el writer task entrega al
 /// commit task en cada checkpoint (commit desacoplado, ver `PaimonSink::split`).
 pub struct CheckpointEpoch {
-    pub writer: paimon::table::TableWrite,
+    pub writer: crate::shard::EpochWrite,
     pub identifier: i64,
     pub body: CheckpointBody,
 }
@@ -885,7 +972,7 @@ pub struct AppendTail {
 
 /// Quién copia la columna de rowkind a `_VALUE_KIND`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowkindWrite {
+pub(crate) enum RowkindWrite {
     /// `changelog-producer=input`: Tachyon agrega `_VALUE_KIND` y el changelog
     /// guarda cada fila.
     Stamp,
@@ -969,7 +1056,7 @@ fn rowkind_column(table: &paimon::table::Table, field: &str) -> Result<usize> {
     Ok(index)
 }
 
-fn prepare_batch<'a>(
+pub(crate) fn prepare_batch<'a>(
     batch: &'a RecordBatch,
     rowkind: &Option<(String, usize, RowkindWrite)>,
 ) -> Result<std::borrow::Cow<'a, RecordBatch>> {

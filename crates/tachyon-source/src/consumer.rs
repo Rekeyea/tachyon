@@ -23,6 +23,7 @@ use rdkafka_sys as rdsys;
 
 use crate::handoff::{CommittedObs, PartitionAction, WindowHandoff};
 use crate::record::SourceRecord;
+use tachyon_core::OffsetRange;
 
 /// Un stream de **lotes** de registros crudos (la abstracción que decoupla el
 /// broker). Cada elemento es un `Vec<SourceRecord>` (un lote drenado del buffer
@@ -59,6 +60,97 @@ pub struct RdkafkaSource {
     /// Handoff de ventana. `None` en el pass-through: el rebalance sigue
     /// asignando en el momento. El `u64` es el id de este consumidor.
     handoff: Mutex<Option<(Arc<WindowHandoff>, u64)>>,
+    /// Cursor compartido con los otros consumidores del topic (pass-through).
+    cursor: Mutex<Option<CopiedCursor>>,
+    /// Carril propio: los rangos de cada lote (ver `LotRanges`).
+    lot_ranges: Mutex<Option<LotRanges>>,
+}
+
+/// Hasta dónde copió cada partición algún consumidor de este proceso
+/// (partición -> próximo offset). Lo comparten los N consumidores de un
+/// topic en el pass-through.
+///
+/// Los consumidores del mismo proceso entran al grupo de a uno y cada
+/// entrada rebalancea. Sin esto, la partición que cambiaba de dueño se
+/// releía desde el offset commiteado (al arrancar, desde el principio):
+/// filas copiadas dos veces, el doble de decode y de escritura, y una tasa
+/// que dependía de cuántos rebalanceos hubo. El dueño nuevo arranca donde
+/// dejó el anterior. El anterior publica lo copiado después de cada poll y
+/// al revocar, antes de volver a entrar al grupo, así que el dueño nuevo
+/// nunca ve un valor viejo.
+#[derive(Debug, Clone, Default)]
+pub struct CopiedCursor(Arc<Mutex<CursorState>>);
+
+#[derive(Debug, Default)]
+struct CursorState {
+    /// Próximo offset después de lo copiado.
+    copied: HashMap<i32, i64>,
+    /// Dónde empezó a leer la partición el primer consumidor del proceso.
+    origin: HashMap<i32, i64>,
+}
+
+impl CopiedCursor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, partition: i32) -> Option<i64> {
+        self.0.lock().expect("lock del cursor").copied.get(&partition).copied()
+    }
+
+    /// Primer offset que este proceso leyó de `partition` (ver `Frontier`).
+    pub fn origin(&self, partition: i32) -> Option<i64> {
+        self.0.lock().expect("lock del cursor").origin.get(&partition).copied()
+    }
+
+    fn set_origin(&self, partition: i32, start: i64) {
+        self.0
+            .lock()
+            .expect("lock del cursor")
+            .origin
+            .entry(partition)
+            .or_insert(start);
+    }
+
+    /// Avanza con los registros copiados (el cursor nunca retrocede).
+    fn publish(&self, records: &[SourceRecord]) {
+        let mut high: Vec<(i32, i64)> = Vec::new();
+        for record in records {
+            match high.iter_mut().find(|(p, _)| *p == record.partition) {
+                Some((_, next)) => *next = (*next).max(record.offset + 1),
+                None => high.push((record.partition, record.offset + 1)),
+            }
+        }
+        if high.is_empty() {
+            return;
+        }
+        let mut state = self.0.lock().expect("lock del cursor");
+        for (partition, next) in high {
+            let slot = state.copied.entry(partition).or_insert(next);
+            *slot = (*slot).max(next);
+        }
+    }
+}
+
+/// Rangos de offsets de cada lote que manda un consumidor, en el mismo orden
+/// que los lotes (uno por lote, FIFO). Solo tiene sentido cuando un stream
+/// lee de un único consumidor: el carril de `RedpandaPartitionStream`.
+#[derive(Debug, Clone, Default)]
+pub struct LotRanges(Arc<Mutex<std::collections::VecDeque<Vec<OffsetRange>>>>);
+
+impl LotRanges {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&self, ranges: Vec<OffsetRange>) {
+        self.0.lock().expect("lock de rangos").push_back(ranges);
+    }
+
+    /// Los rangos del próximo lote recibido.
+    pub fn pop(&self) -> Option<Vec<OffsetRange>> {
+        self.0.lock().expect("lock de rangos").pop_front()
+    }
 }
 
 /// Comando hacia el task de poll, que es el dueño del `NativeConsumer`.
@@ -149,12 +241,20 @@ impl NativeConsumer {
             rkt: std::ptr::null_mut(),
             topic: topic_c.clone(),
             resume: ResumeFilter::new(BTreeMap::new()),
+            cursor: None,
+            verified: HashSet::new(),
+            expect: HashMap::new(),
+            lot_ranges: None,
+            chain: HashMap::new(),
+            ranged: 0,
+            staged: Vec::new(),
             batch: Vec::new(),
             max_batch: usize::MAX,
             fatal: None,
             handoff: None,
             consumer_id: 0,
             assigned: Vec::new(),
+            at_end: HashSet::new(),
             assign_gen: 0,
             serviced_gen: 0,
             live: HashSet::new(),
@@ -164,6 +264,7 @@ impl NativeConsumer {
             rdsys::rd_kafka_conf_set_rebalance_cb(conf.ptr(), Some(native_rebalance_cb));
             rdsys::rd_kafka_conf_set_offset_commit_cb(conf.ptr(), Some(native_commit_cb));
             rdsys::rd_kafka_conf_set_log_cb(conf.ptr(), Some(native_log_cb));
+            rdsys::rd_kafka_conf_set_error_cb(conf.ptr(), Some(native_error_cb));
             // Consumo por callback: `rd_kafka_poll` despacha cada mensaje a
             // `native_consume_cb` sin locks de cola (ver el task de poll).
             rdsys::rd_kafka_conf_set_consume_cb(conf.ptr(), Some(native_consume_cb));
@@ -361,6 +462,134 @@ fn ffi_committed_offset(
     }
 }
 
+/// Asignación actual del consumidor (FFI directo).
+fn ffi_assignment(rk: *mut rdsys::rd_kafka_t) -> Result<Vec<i32>, String> {
+    unsafe {
+        let mut tpl: *mut rdsys::rd_kafka_topic_partition_list_t = std::ptr::null_mut();
+        let err = rdsys::rd_kafka_assignment(rk, &mut tpl);
+        if err != rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
+            return Err(format!("assignment: {}", err_str(err)));
+        }
+        let ids = partition_ids(tpl);
+        rdsys::rd_kafka_topic_partition_list_destroy(tpl);
+        Ok(ids)
+    }
+}
+
+/// Lotes que el hilo de poll puede tener en cola hacia su carril.
+const LOT_QUEUE: usize = 4;
+/// Lotes en cola cuando varios consumidores alimentan un solo stream.
+const SHARED_LOT_QUEUE: usize = 16;
+
+/// Cuánto espera el hilo de poll a que el decoder libere lugar antes de
+/// pausar las particiones y volver a pollear. Muy por debajo del
+/// `max.poll.interval.ms` default (300s): un sink trabado no saca al miembro
+/// del grupo, y un rebalance espera como mucho esto a que se lo sirva.
+const BACKPRESSURE_PAUSE_AFTER: Duration = Duration::from_secs(10);
+/// Tramo de espera: entre tramos se sirven los commits pendientes, así el
+/// commit task nunca espera más que esto a este hilo.
+const BACKPRESSURE_SLICE: Duration = Duration::from_millis(50);
+
+enum Room {
+    Sent,
+    Closed,
+    Stalled(Vec<SourceRecord>),
+}
+
+/// Manda `batch` en cuanto el canal tenga lugar, esperando en tramos cortos
+/// hasta `BACKPRESSURE_PAUSE_AFTER`. Corre en el hilo de poll (blocking).
+fn wait_for_room(
+    tx: &tokio::sync::mpsc::Sender<std::result::Result<Vec<SourceRecord>, String>>,
+    batch: Vec<SourceRecord>,
+    consumer: &NativeConsumer,
+    commit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PollCommand>,
+) -> Room {
+    if tx.capacity() > 0 {
+        // Un solo emisor (este hilo): con capacidad, `try_send` no falla por lleno.
+        return match tx.try_send(Ok(batch)) {
+            Ok(()) => Room::Sent,
+            Err(_) => Room::Closed,
+        };
+    }
+    let handle = tokio::runtime::Handle::current();
+    let started = std::time::Instant::now();
+    while started.elapsed() < BACKPRESSURE_PAUSE_AFTER {
+        match handle.block_on(tokio::time::timeout(BACKPRESSURE_SLICE, tx.reserve())) {
+            Ok(Ok(permit)) => {
+                permit.send(Ok(batch));
+                return Room::Sent;
+            }
+            Ok(Err(_)) => return Room::Closed,
+            Err(_) => serve_poll_commands(consumer, commit_rx),
+        }
+    }
+    Room::Stalled(batch)
+}
+
+/// Sirve los comandos que el runtime le manda al hilo de poll (commit de
+/// offsets, metadata del grupo). No bloquea: el commit es async.
+fn serve_poll_commands(
+    consumer: &NativeConsumer,
+    commit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PollCommand>,
+) {
+    loop {
+        match commit_rx.try_recv() {
+            Ok(PollCommand::Commit { offsets, reply }) => {
+                let result = consumer.commit(&offsets);
+                let _ = reply.send(result);
+            }
+            Ok(PollCommand::GroupMetadata { reply }) => {
+                let ptr = unsafe { rdsys::rd_kafka_consumer_group_metadata(consumer.rk) };
+                let result = if ptr.is_null() {
+                    Err("el consumidor todavía no entró al grupo".to_string())
+                } else {
+                    Ok(GroupMetadata(ptr))
+                };
+                let _ = reply.send(result);
+            }
+            Err(_) => break, // Empty o Disconnected
+        }
+    }
+}
+
+/// Pausa el fetch de toda la asignación: el canal hacia el decoder está
+/// lleno y acumular más lotes solo infla la memoria. El poll sigue vivo
+/// (watchdog de max.poll.interval, rebalance, replies de commit) mientras
+/// tanto. Fallar acá no es fatal: en el peor caso el buffer de librdkafka
+/// crece hasta su propio tope (`queued.max.messages.kbytes`).
+fn pause_for_backpressure(rk: *mut rdsys::rd_kafka_t, drain: &DrainState) {
+    tracing::debug!("backpressure: el canal siguió lleno, se pausan las particiones");
+    match ffi_assignment(rk) {
+        Ok(parts) => {
+            if let Err(e) = ffi_set_paused(rk, &drain.topic, &parts, true) {
+                tracing::warn!(error = %e, "backpressure: no se pudieron pausar las particiones");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "backpressure: no se pudo leer la asignación"),
+    }
+}
+
+/// Reanuda el fetch tras el backpressure. Con handoff solo se reanudan las
+/// particiones ya admitidas (`live`): las demás siguen pausadas hasta que el
+/// gate las habilite (reanudarlas copiaría mensajes que el callback
+/// descarta, y el seek de admisión los relee).
+fn resume_after_backpressure(rk: *mut rdsys::rd_kafka_t, drain: &DrainState) {
+    let parts: Vec<i32> = if drain.handoff.is_some() {
+        drain.live.iter().copied().collect()
+    } else {
+        match ffi_assignment(rk) {
+            Ok(parts) => parts,
+            Err(e) => {
+                tracing::warn!(error = %e, "backpressure: no se pudo leer la asignación");
+                return;
+            }
+        }
+    };
+    if let Err(e) = ffi_set_paused(rk, &drain.topic, &parts, false) {
+        tracing::warn!(error = %e, "backpressure: no se pudieron reanudar las particiones");
+    }
+}
+
 /// Pausa o reanuda fetch. Es local: no va al broker.
 fn ffi_set_paused(
     rk: *mut rdsys::rd_kafka_t,
@@ -530,12 +759,24 @@ unsafe extern "C" fn native_rebalance_cb(
 ) {
     let state = &mut *(opaque as *mut DrainState);
     if state.handoff.is_none() {
+        // Lo copiado con la asignación que termina lleva sus rangos; la
+        // próxima empieza cadenas nuevas.
+        state.stage_ranges();
+        state.chain.clear();
+        state.verified.clear();
+        state.expect.clear();
         if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS {
             let n = if partitions.is_null() { 0 } else { (*partitions).cnt };
             tracing::info!(partitions = n, "rebalance: asignación de particiones");
+            position_assignment(state, partitions);
             rdsys::rd_kafka_assign(rk, partitions);
         } else {
             tracing::info!("rebalance: revocación de particiones");
+            // Lo copiado en este poll queda publicado antes de volver al
+            // grupo: el dueño nuevo arranca después.
+            if let Some(cursor) = &state.cursor {
+                cursor.publish(&state.batch);
+            }
             rdsys::rd_kafka_assign(rk, std::ptr::null_mut());
         }
         return;
@@ -543,6 +784,7 @@ unsafe extern "C" fn native_rebalance_cb(
     let ids = partition_ids(partitions);
     if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS {
         tracing::info!(partitions = ids.len(), "rebalance: asignación de particiones");
+        state.at_end.clear();
         rdsys::rd_kafka_assign(rk, partitions);
         // Pausa local hasta que el poll, entre llamadas, decida el seek.
         // Los fetches de esta asignación todavía no están en la cola.
@@ -565,6 +807,37 @@ unsafe extern "C" fn native_rebalance_cb(
         state.live.clear();
         state.assign_gen = state.assign_gen.wrapping_add(1);
         rdsys::rd_kafka_assign(rk, std::ptr::null_mut());
+    }
+}
+
+/// Pass-through: una partición asignada que nadie del proceso copió todavía
+/// arranca en el checkpoint, y recién si no hay en el offset del grupo. Antes el re-posicionamiento esperaba al
+/// primer mensaje (`ResumeFilter`): si el offset del grupo quedó adelante del
+/// checkpoint (el commit en Kafka va después del snapshot; un crash en el
+/// medio lo deja así) y apuntaba al final del topic, no llegaba ningún
+/// mensaje, nada disparaba el seek y ese tramo se perdía sin error.
+unsafe fn position_assignment(
+    state: &DrainState,
+    partitions: *mut rdsys::rd_kafka_topic_partition_list_t,
+) {
+    if partitions.is_null() {
+        return;
+    }
+    let list = &mut *partitions;
+    if list.cnt <= 0 || list.elems.is_null() {
+        return;
+    }
+    for i in 0..list.cnt as usize {
+        let elem = &mut *list.elems.add(i);
+        // Lo ya copiado en el proceso lo resuelve `align_with_cursor` (seek
+        // al primer mensaje: ahí siempre hay mensajes, el dueño anterior los
+        // estaba leyendo). Acá solo el checkpoint.
+        let copied = state.cursor.as_ref().and_then(|cursor| cursor.get(elem.partition));
+        if copied.is_none() {
+            if let Some(start) = state.resume.pending_for(elem.partition) {
+                elem.offset = start;
+            }
+        }
     }
 }
 
@@ -622,6 +895,44 @@ unsafe extern "C" fn native_log_cb(
     }
 }
 
+/// Errores de cliente de librdkafka (llegan por la cola principal, que está
+/// redirigida a la del consumidor: corre en el hilo de poll). El fin de
+/// partición no es un error. Un error fatal deja al cliente inservible
+/// (p. ej. FENCED_INSTANCE_ID de un miembro estático): antes solo se
+/// logueaba y el pipeline quedaba vivo sin consumir esas particiones. Ahora
+/// termina el stream con el motivo.
+unsafe extern "C" fn native_error_cb(
+    rk: *mut rdsys::rd_kafka_t,
+    err: i32,
+    reason: *const std::ffi::c_char,
+    opaque: *mut std::ffi::c_void,
+) {
+    if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__PARTITION_EOF as i32 {
+        return;
+    }
+    let reason = if reason.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(reason).to_string_lossy().into_owned()
+    };
+    if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__FATAL as i32 {
+        let mut buf = [0 as std::ffi::c_char; 512];
+        let code = rdsys::rd_kafka_fatal_error(rk, buf.as_mut_ptr(), buf.len());
+        let detail = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+        let msg = format!("error fatal de librdkafka ({}): {detail}", err_str(code));
+        tracing::error!("{msg}");
+        if !opaque.is_null() {
+            let state = &mut *(opaque as *mut DrainState);
+            if state.fatal.is_none() {
+                state.fatal = Some(msg);
+            }
+            rdsys::rd_kafka_yield(rk);
+        }
+        return;
+    }
+    tracing::warn!(target: "librdkafka", code = err, "{reason}");
+}
+
 /// Mensaje de error legible para un código de librdkafka.
 fn err_str(err: rdsys::rd_kafka_resp_err_t) -> String {
     unsafe { CStr::from_ptr(rdsys::rd_kafka_err2str(err)) }
@@ -643,7 +954,30 @@ impl RdkafkaSource {
             commit_rx: Mutex::new(Some(commit_rx)),
             max_batch: 32_768,
             handoff: Mutex::new(None),
+            cursor: Mutex::new(None),
+            lot_ranges: Mutex::new(None),
         })
+    }
+
+    /// Este consumidor alimenta un carril propio: cada lote sale con sus
+    /// rangos de offsets encadenados. Requiere `with_copied_cursor`.
+    pub fn with_lot_ranges(self, ranges: LotRanges) -> Self {
+        *self.lot_ranges.lock().expect("lock de rangos") = Some(ranges);
+        self
+    }
+
+    /// El consumidor termina en un stream compartido (sin carril): nadie
+    /// leería sus rangos. Hay que llamarlo antes de `record_stream`.
+    pub fn drop_lot_ranges(&self) {
+        self.lot_ranges.lock().expect("lock de rangos").take();
+    }
+
+    /// Comparte el cursor de lo copiado con los otros consumidores del topic
+    /// en este proceso (ver `CopiedCursor`). Hay que llamarlo antes de
+    /// `record_stream`. El camino de ventana usa el handoff, no esto.
+    pub fn with_copied_cursor(self, cursor: CopiedCursor) -> Self {
+        *self.cursor.lock().expect("lock del cursor") = Some(cursor);
+        self
     }
 
     /// Comparte el handoff de ventana con los otros consumidores del input
@@ -739,10 +1073,14 @@ impl RdkafkaSource {
         // stateless: un envío = un batch decodificado.
         let max_batch = self.max_batch;
         let state = self.consumer.clone();
-        // 16 lotes en vuelo por consumidor acotan el RSS (16 × 32K registros
-        // ≈ decenas de MB) sin ahogar al decoder: con el canal lleno el poll
-        // task se frena y el consumer deja de fetchear (backpressure natural).
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // Lotes en cola por consumidor. Cada registro lleva su payload en el
+        // heap: 16 lotes de 32K eran ~90 MB por consumidor. Con un carril por
+        // consumidor el pipelining ya está en el decode, y el prefetch de
+        // librdkafka absorbe el jitter del broker: con 4 alcanza.
+        // Un stream compartido (ventana, varios consumidores en un select)
+        // necesita la cola profunda: el que lo lee atiende a todos.
+        let lanes = self.lot_ranges.lock().expect("lock de rangos").is_some();
+        let (tx, rx) = tokio::sync::mpsc::channel(if lanes { LOT_QUEUE } else { SHARED_LOT_QUEUE });
         // El receiver del canal de commit se mueve al task de poll (no es Clone).
         let commit_rx = self
             .commit_rx
@@ -754,6 +1092,8 @@ impl RdkafkaSource {
             self.resume.lock().expect("lock de resume").take().unwrap_or_default(),
         );
         let handoff = self.handoff.lock().expect("lock del handoff").take();
+        let cursor = self.cursor.lock().expect("lock del cursor").take();
+        let lot_ranges = self.lot_ranges.lock().expect("lock de rangos").take();
 
         tokio::spawn(async move {
             // El consumer vive dentro del task de poll: se toma una sola vez
@@ -770,9 +1110,7 @@ impl RdkafkaSource {
                 // permite ver si el task de poll arranca, recibe mensajes y
                 // logra enviarlos por el canal mpsc.
                 let debug_poll = std::env::var("TACHYON_DEBUG_POLL").is_ok();
-                if debug_poll {
-                    eprintln!("[poll] task iniciado");
-                }
+                tracing::info!("hilo de poll arrancado");
                 let mut sent_batches = 0u64;
                 let mut sent_rows = 0u64;
                 let mut last_report = std::time::Instant::now();
@@ -788,6 +1126,9 @@ impl RdkafkaSource {
                     if let Some((handoff, id)) = handoff {
                         drain.handoff = Some(handoff);
                         drain.consumer_id = id;
+                    } else {
+                        drain.cursor = cursor;
+                        drain.lot_ranges = lot_ranges;
                     }
                 }
 
@@ -831,6 +1172,19 @@ impl RdkafkaSource {
                 // FETCH con err -> fatal. Los commits async fallidos se
                 // loguean en `native_commit_cb` (la fuente de verdad del
                 // progreso es el checkpoint en Paimon).
+                //
+                // Backpressure SIN dejar de pollear: si el canal hacia el
+                // decoder está lleno, el lote queda retenido en `pending` y
+                // las particiones se pausan, pero el loop sigue llamando a
+                // `rd_kafka_poll` (watchdog de max.poll.interval, rebalance y
+                // replies de commit). Con `blocking_send` acá, un sink
+                // frenado paraba el poll y el broker terminaba expulsando al
+                // consumidor del grupo (rebalance en el peor momento: con el
+                // sistema ya cargado). El canal es de un solo emisor (este
+                // task), así que `capacity() > 0` garantiza que `try_send`
+                // no falla por lleno.
+                let mut pending: Option<Vec<SourceRecord>> = None;
+                let mut bp_paused = false;
                 loop {
                     // Si el receiver se soltó (el stream de datos terminó),
                     // salir: dejar el consumidor en el suelo mantendría
@@ -842,28 +1196,7 @@ impl RdkafkaSource {
                     // Drenar comandos de commit pendientes. Async:
                     // el commit se encola y el ack llega en background; NO
                     // bloquea el poll (un Sync aquí paralizaba el consumo).
-                    loop {
-                        match commit_rx.try_recv() {
-                            Ok(PollCommand::Commit { offsets, reply }) => {
-                                let result = consumer.commit(&offsets);
-                                let _ = reply.send(result);
-                            }
-                            Ok(PollCommand::GroupMetadata { reply }) => {
-                                let ptr = unsafe {
-                                    rdsys::rd_kafka_consumer_group_metadata(consumer.rk)
-                                };
-                                let result = if ptr.is_null() {
-                                    Err(
-                                        "el consumidor todavía no entró al grupo".to_string(),
-                                    )
-                                } else {
-                                    Ok(GroupMetadata(ptr))
-                                };
-                                let _ = reply.send(result);
-                            }
-                            Err(_) => break, // Empty o Disconnected
-                        }
-                    }
+                    serve_poll_commands(&consumer, &mut commit_rx);
                     // Entre polls: la consulta de arranque y el seek del
                     // handoff. Dentro del callback de rebalance deadlockearían.
                     {
@@ -872,6 +1205,36 @@ impl RdkafkaSource {
                         if let Some(fatal) = service_handoff(rk, drain) {
                             let _ = tx.blocking_send(Err(fatal));
                             break;
+                        }
+                        // Un error fatal del callback (también de un poll
+                        // corto de backpressure) se entrega y termina.
+                        if let Some(e) = drain.fatal.take() {
+                            let _ = tx.blocking_send(Err(e));
+                            break;
+                        }
+                    }
+                    // Hay un lote retenido: solo se suelta cuando el canal
+                    // tiene lugar. Mientras tanto, particiones pausadas y
+                    // polls cortos para seguir sirviendo el grupo.
+                    if pending.is_some() {
+                        if tx.capacity() == 0 {
+                            if !bp_paused {
+                                pause_for_backpressure(consumer.rk, &consumer.drain);
+                                bp_paused = true;
+                            }
+                            let _ = unsafe { rdsys::rd_kafka_poll(consumer.rk, 50) };
+                            continue;
+                        }
+                        let lot = pending.take().expect("lote retenido presente");
+                        let lot_len = lot.len();
+                        if tx.try_send(Ok(lot)).is_err() {
+                            break; // receiver caído: nada más que hacer
+                        }
+                        sent_batches += 1;
+                        sent_rows += lot_len as u64;
+                        if bp_paused {
+                            resume_after_backpressure(consumer.rk, &consumer.drain);
+                            bp_paused = false;
                         }
                     }
                     // Una llamada = un lote: espera datos (hasta
@@ -885,7 +1248,19 @@ impl RdkafkaSource {
                         let _ = tx.blocking_send(Err(e));
                         break;
                     }
+                    drain.stage_ranges();
                     let batch = std::mem::replace(&mut drain.batch, Vec::with_capacity(max_batch));
+                    drain.ranged = 0;
+                    if let Some(cursor) = &drain.cursor {
+                        cursor.publish(&batch);
+                    }
+                    if !batch.is_empty() {
+                        if let Some(ranges) = &drain.lot_ranges {
+                            // Antes de mandar el lote: el stream saca los
+                            // rangos cuando lo recibe.
+                            ranges.push(std::mem::take(&mut drain.staged));
+                        }
+                    }
                     if batch.is_empty() {
                         if debug_poll
                             && last_report.elapsed() > std::time::Duration::from_secs(2)
@@ -898,11 +1273,31 @@ impl RdkafkaSource {
                         continue;
                     }
                     let batch_len = batch.len();
-                    if tx.blocking_send(Ok(batch)).is_err() {
-                        break; // receiver caído: nada más que hacer
+                    // Canal lleno: primero se espera lugar sin pollear. El
+                    // fetch de librdkafka sigue en su hilo hasta
+                    // `queued.max.messages.kbytes` (memoria acotada) y el
+                    // heartbeat también, así que un decoder un poco más
+                    // lento no le cuesta nada al grupo. Pausar acá, en
+                    // cambio, descarta lo pre-fetcheado (librdkafka sube la
+                    // versión de la partición) y el resume lo vuelve a pedir
+                    // al broker: con backpressure frecuente el consumo
+                    // quedaba esperando la red la mayor parte del tiempo.
+                    let batch = match wait_for_room(&tx, batch, &consumer, &mut commit_rx) {
+                        Room::Sent => {
+                            sent_batches += 1;
+                            sent_rows += batch_len as u64;
+                            None
+                        }
+                        Room::Closed => break, // receiver caído: nada más que hacer
+                        Room::Stalled(batch) => Some(batch),
+                    };
+                    if let Some(batch) = batch {
+                        // El canal siguió lleno más de `BACKPRESSURE_PAUSE_AFTER`:
+                        // el lote se retiene y la próxima vuelta pausa las
+                        // particiones y vuelve a pollear (watchdog de
+                        // max.poll.interval, rebalance y replies de commit).
+                        pending = Some(batch);
                     }
-                    sent_batches += 1;
-                    sent_rows += batch_len as u64;
                     if debug_poll && last_report.elapsed() > std::time::Duration::from_secs(2) {
                         eprintln!(
                             "[poll] {sent_batches} lotes / {sent_rows} filas enviados (media {:.0} filas/lote)",
@@ -1011,6 +1406,21 @@ impl ResumeFilter {
         Ok(false)
     }
 
+    /// Próximo offset a entregar de `partition` según el checkpoint, si
+    /// todavía no se llegó.
+    fn pending_for(&self, partition: i32) -> Option<i64> {
+        self.pending.get(&partition).copied()
+    }
+
+    /// Otro consumidor del proceso ya entregó `partition` hasta `copied`: si
+    /// el checkpoint pendiente es anterior, ya no hay que volver a él.
+    fn covered(&mut self, partition: i32, copied: i64) {
+        if self.pending.get(&partition).is_some_and(|&next| next <= copied) {
+            self.pending.remove(&partition);
+            self.seeked.remove(&partition);
+        }
+    }
+
     /// Fija el próximo offset a entregar. El seek anterior, si lo hubo, no
     /// cuenta: el handoff puede mover la partición después del arranque.
     fn arm(&mut self, partition: i32, next: i64) {
@@ -1107,6 +1517,21 @@ struct DrainState {
     topic: CString,
     /// Filtro de re-posicionamiento tras checkpoint.
     resume: ResumeFilter,
+    /// Pass-through con varios consumidores: lo copiado en el proceso.
+    cursor: Option<CopiedCursor>,
+    /// Particiones de la asignación actual ya alineadas con el cursor.
+    verified: HashSet<i32>,
+    /// Seek al cursor en curso: los mensajes anteriores al destino son del
+    /// buffer previo al seek y se descartan.
+    expect: HashMap<i32, i64>,
+    /// Carril propio: rangos de lo copiado (ver `LotRanges`).
+    lot_ranges: Option<LotRanges>,
+    /// Por partición de la asignación actual: dónde empieza el próximo rango.
+    chain: HashMap<i32, i64>,
+    /// Registros de `batch` que ya tienen rango.
+    ranged: usize,
+    /// Rangos del lote en construcción.
+    staged: Vec<OffsetRange>,
     /// Lote en construcción (lo retira el task de poll tras cada `rd_kafka_poll`).
     batch: Vec<SourceRecord>,
     /// Tope del lote; al alcanzarlo el callback hace `rd_kafka_yield`.
@@ -1118,6 +1543,9 @@ struct DrainState {
     consumer_id: u64,
     /// Particiones de la última asignación. Vacía después de un revoke.
     assigned: Vec<i32>,
+    /// Ventana: particiones que llegaron a PARTITION_EOF y no volvieron a
+    /// recibir mensajes (se publica al handoff solo en los cambios).
+    at_end: HashSet<i32>,
     assign_gen: u64,
     serviced_gen: u64,
     /// Particiones que este poll ya puede copiar sin consultar el gate.
@@ -1127,6 +1555,39 @@ struct DrainState {
 }
 
 impl DrainState {
+    /// El consumidor empezó a copiar `partition` en `start`: ahí arranca su
+    /// cadena de rangos. El primero del proceso fija el origen.
+    fn start_partition(&mut self, partition: i32, start: i64) {
+        if let Some(cursor) = &self.cursor {
+            cursor.set_origin(partition, start);
+        }
+        if self.lot_ranges.is_some() {
+            self.chain.insert(partition, start);
+        }
+    }
+
+    /// Rangos de los registros de `batch` que todavía no tienen uno. Cada
+    /// rango empieza donde terminó el anterior de su partición.
+    fn stage_ranges(&mut self) {
+        if self.lot_ranges.is_none() {
+            self.ranged = self.batch.len();
+            return;
+        }
+        let mut high: Vec<(i32, i64, i64)> = Vec::new(); // partición, primero, próximo
+        for record in &self.batch[self.ranged..] {
+            match high.iter_mut().find(|(p, _, _)| *p == record.partition) {
+                Some((_, _, next)) => *next = (*next).max(record.offset + 1),
+                None => high.push((record.partition, record.offset, record.offset + 1)),
+            }
+        }
+        for (partition, first, next) in high {
+            let from = self.chain.get(&partition).copied().unwrap_or(first);
+            self.staged.push(OffsetRange { partition, from, to: next });
+            self.chain.insert(partition, next);
+        }
+        self.ranged = self.batch.len();
+    }
+
     fn note_local(&mut self, partition: i32, next: i64) {
         let slot = self.local_admitted.entry(partition).or_insert(next);
         *slot = (*slot).max(next);
@@ -1161,6 +1622,21 @@ unsafe extern "C" fn native_consume_cb(
     if state.fatal.is_some() {
         return; // el stream ya está muriendo: descartar lo que siga
     }
+    if let Some(handoff) = &state.handoff {
+        // Fin del log / mensaje nuevo: el watermark de la ventana solo deja
+        // idle a una partición sin nada pendiente (ver `WindowHandoff::backlog`).
+        let msg = &*rkm;
+        let partition = msg.partition;
+        if msg.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__PARTITION_EOF {
+            if state.at_end.insert(partition) {
+                handoff.note_end(partition, true);
+            }
+        } else if msg.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
+            && state.at_end.remove(&partition)
+        {
+            handoff.note_end(partition, false);
+        }
+    }
     match rkm_extract(rkm) {
         Ok(Some((partition, offset, value))) => {
             if state.handoff.is_some() {
@@ -1181,6 +1657,17 @@ unsafe extern "C" fn native_consume_cb(
                             rdsys::rd_kafka_yield(state.rk);
                             return;
                         }
+                    }
+                }
+            }
+            if state.cursor.is_some() && !state.verified.contains(&partition) {
+                match align_with_cursor(state, partition, offset) {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(e) => {
+                        state.fatal = Some(e);
+                        rdsys::rd_kafka_yield(state.rk);
+                        return;
                     }
                 }
             }
@@ -1214,6 +1701,48 @@ unsafe extern "C" fn native_consume_cb(
     if state.batch.len() >= state.max_batch {
         rdsys::rd_kafka_yield(state.rk);
     }
+}
+
+/// Primer mensaje de `partition` desde la asignación: si otro consumidor del
+/// proceso ya la copió hasta `c`, el consumo sigue en `c` (seek) en vez de
+/// releer. `Ok(true)` entrega el mensaje; `Ok(false)` lo descarta.
+///
+/// Los offsets pueden saltear (markers de transacción, compaction), así que
+/// después del seek se acepta el primer offset `>= c`. Un offset mayor que
+/// `c` sin seek previo también vuelve a `c`: arrancar más adelante perdería
+/// filas en silencio.
+fn align_with_cursor(state: &mut DrainState, partition: i32, offset: i64) -> Result<bool, String> {
+    if let Some(&target) = state.expect.get(&partition) {
+        if offset < target {
+            return Ok(false);
+        }
+        state.expect.remove(&partition);
+        state.verified.insert(partition);
+        state.start_partition(partition, target);
+        return Ok(true);
+    }
+    let copied = state.cursor.as_ref().and_then(|cursor| cursor.get(partition));
+    let Some(copied) = copied else {
+        // Nadie del proceso la copió: se empieza en el checkpoint si hay
+        // (el filtro de resume reposiciona ahí), si no en este mensaje.
+        let start = state.resume.pending_for(partition).unwrap_or(offset);
+        state.verified.insert(partition);
+        state.start_partition(partition, start);
+        return Ok(true);
+    };
+    // El checkpoint de arranque ya quedó atrás de lo copiado en el proceso.
+    state.resume.covered(partition, copied);
+    if offset == copied {
+        state.verified.insert(partition);
+        state.start_partition(partition, copied);
+        return Ok(true);
+    }
+    ffi_seek(state.rkt, partition, copied, 10_000).map_err(|e| {
+        format!("seek a lo ya copiado falló (partición {partition}, offset {copied}): {e}")
+    })?;
+    tracing::info!(partition, from = offset, to = copied, "la partición cambió de consumidor: sigue donde quedó");
+    state.expect.insert(partition, copied);
+    Ok(false)
 }
 
 /// Fuente in-memory de registros (para tests y para emular el broker).

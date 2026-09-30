@@ -482,6 +482,7 @@ mod tests {
         match parse_checkpoint(&bytes).unwrap() {
             CheckpointBody::Offsets(got) => assert_eq!(got, offsets),
             CheckpointBody::Window(_) => panic!("v0 leído como ventana"),
+            CheckpointBody::Join(_) => panic!("v0 leído como join"),
         }
     }
 
@@ -512,12 +513,13 @@ mod tests {
         match parse_checkpoint(&bytes).unwrap() {
             CheckpointBody::Window(got) => assert_eq!(got, checkpoint),
             CheckpointBody::Offsets(_) => panic!("v1 leído como offsets"),
+            CheckpointBody::Join(_) => panic!("v1 leído como join"),
         }
     }
 
     #[test]
     fn unknown_version_is_rejected() {
-        let err = parse_checkpoint(br#"{"v":2}"#).unwrap_err();
+        let err = parse_checkpoint(br#"{"v":3}"#).unwrap_err();
         assert!(err.contains("desconocida"), "{err}");
     }
 }

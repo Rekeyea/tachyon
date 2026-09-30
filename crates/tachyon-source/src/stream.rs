@@ -21,8 +21,10 @@ use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 
-use crate::consumer::RecordStream;
+use crate::consumer::{LotRanges, RecordStream};
+use tachyon_core::OffsetRange;
 use crate::decode::Decoder;
+use crate::record::SourceRecord;
 use futures::stream::FuturesOrdered;
 
 /// Progreso de una fuente: partición -> próximo offset a consumir (último
@@ -79,7 +81,15 @@ pub struct RedpandaPartitionStream {
     /// Si el schema de la tabla termina en `_tachyon_partition`, cada fila
     /// lleva la partición de Kafka. El decoder no ve esa columna.
     row_partitions: bool,
+    /// Carril propio: los rangos que llegan con cada lote y adónde se
+    /// publican cuando su batch se emite (ver `with_lane`).
+    lane: Option<(LotRanges, LaneRanges)>,
 }
+
+/// Rangos de offsets de lo que un carril ya emitió y todavía no leyó quien
+/// consume el stream. Se vacía después de recibir cada batch: con un plan
+/// pass-through, todo lo emitido hasta ese batch ya salió.
+pub type LaneRanges = Arc<Mutex<Vec<OffsetRange>>>;
 
 impl RedpandaPartitionStream {
     pub fn new(
@@ -94,12 +104,20 @@ impl RedpandaPartitionStream {
             schema,
             decoder,
             batch_size,
-            max_batch_delay: Duration::from_secs(1),
+            max_batch_delay: DEFAULT_LINGER,
             make_stream,
             tracker: None,
             decode_parallelism: 1,
             row_partitions: false,
+            lane: None,
         }
+    }
+
+    /// Stream de un solo consumidor con `LotRanges`: al emitir cada batch
+    /// agrega a `out` los rangos de offsets que cubre.
+    pub fn with_lane(mut self, lots: LotRanges, out: LaneRanges) -> Self {
+        self.lane = Some((lots, out));
+        self
     }
 
     pub fn with_row_partitions(mut self, enabled: bool) -> Self {
@@ -155,6 +173,7 @@ impl PartitionStream for RedpandaPartitionStream {
         let tracker = self.tracker.clone();
         let decode_parallelism = self.decode_parallelism;
         let row_partitions = self.row_partitions;
+        let lane = self.lane.clone();
         let records = (self.make_stream)();
 
         // Batching por tamaño O tiempo: un lote se despacha a decodificar
@@ -174,73 +193,132 @@ impl PartitionStream for RedpandaPartitionStream {
         // offset de los registros acumulados. Se publica al emitir el batch.
         let batches = async_stream::stream! {
             let mut records = records;
-            let mut acc: Vec<(i32, Vec<u8>)> = Vec::new();
-            let mut offsets = BTreeMap::<i32, i64>::new();
+            // Lotes tal como llegan del poll: el loop no toca registro por
+            // registro (ni offsets, ni payloads). Todo eso lo hace el task de
+            // decode, en paralelo. Con el loop moviendo cada registro a un
+            // buffer propio y actualizando un `BTreeMap` por fila, este task
+            // era el techo del pipeline.
+            let mut acc: Vec<Vec<SourceRecord>> = Vec::new();
+            let mut acc_ranges: Vec<OffsetRange> = Vec::new();
+            let mut acc_rows = 0usize;
             let mut since_first: Option<Instant> = None;
             let mut in_flight = FuturesOrdered::<
-                tokio::task::JoinHandle<(BTreeMap<i32, i64>, DecodedLot)>,
+                tokio::task::JoinHandle<(BTreeMap<i32, i64>, Vec<OffsetRange>, DecodedLot)>,
             >::new();
 
+            // Diagnóstico (TACHYON_DEBUG_STREAM=1): cada 2s, cuánto esperó
+            // este loop a los consumidores, al decode y a quien lo consume.
+            let debug = std::env::var("TACHYON_DEBUG_STREAM").is_ok();
+            let mut waits = [0f64; 3];
+            let mut report_at = Instant::now();
             loop {
+                if debug && report_at.elapsed() >= Duration::from_secs(2) {
+                    eprintln!(
+                        "[stream] espera: lotes {:.2}s, decode {:.2}s, aguas abajo {:.2}s (en vuelo {})",
+                        waits[0], waits[1], waits[2], in_flight.len()
+                    );
+                    waits = [0.0; 3];
+                    report_at = Instant::now();
+                }
                 let mut emit = false;
-                if acc.len() >= batch_size {
-                    // (a) Lote lleno: despachar. Con el pool lleno, drenar el
-                    // más viejo antes de seguir acumulando.
-                    spawn_decode(&decoder, &schema.clone(), row_partitions, &mut acc, &mut offsets, &mut in_flight);
+                if acc_rows >= batch_size {
+                    in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges)));
+                    acc_rows = 0;
                     since_first = None;
                     emit = in_flight.len() >= decode_parallelism;
-                } else if !acc.is_empty()
+                } else if acc_rows > 0
                     && since_first.is_some_and(|t0| t0.elapsed() >= max_batch_delay)
                 {
-                    // (b) Límite de tiempo agotado: despachar el parcial y
-                    // drenar ya (latencia acotada por `max_batch_delay`).
-                    tracing::debug!(rows = acc.len(), "emitiendo batch parcial (flush time-based)");
-                    spawn_decode(&decoder, &schema.clone(), row_partitions, &mut acc, &mut offsets, &mut in_flight);
+                    tracing::debug!(rows = acc_rows, "emitiendo batch parcial (flush time-based)");
+                    in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges)));
+                    acc_rows = 0;
                     since_first = None;
-                    emit = true;
+                    // Como uno lleno: no frena el pipeline. Si no llega nada
+                    // más, `IDLE_RELEASE` lo suelta.
+                    emit = in_flight.len() >= decode_parallelism;
                 } else {
-                    // Esperar el siguiente lote (con timeout corto para
-                    // re-verificar el límite de tiempo).
-                    match tokio::time::timeout(Duration::from_millis(100), records.next()).await {
+                    // Batching adaptativo: con filas acumuladas se espera
+                    // poco al próximo lote. Con carga alta siempre hay otro
+                    // listo y el batch se llena; con carga baja (o cuando el
+                    // tráfico se corta) el batch sale enseguida en vez de
+                    // esperar `max_batch_delay` entero.
+                    let patience = match since_first {
+                        // Hasta que venza el linger del batch en curso.
+                        Some(t0) if acc_rows > 0 => max_batch_delay
+                            .saturating_sub(t0.elapsed())
+                            .max(Duration::from_millis(1)),
+                        // Batches decodificándose: soltarlos pronto si no
+                        // llega nada más.
+                        _ if !in_flight.is_empty() => IDLE_RELEASE,
+                        _ => Duration::from_millis(100),
+                    };
+                    let waited = Instant::now();
+                    let next = tokio::time::timeout(patience, records.next()).await;
+                    if debug {
+                        waits[0] += waited.elapsed().as_secs_f64();
+                    }
+                    match next {
                         Ok(Some(Ok(lot))) => {
+                            if lot.is_empty() {
+                                continue;
+                            }
                             if since_first.is_none() {
                                 since_first = Some(Instant::now());
                             }
-                            for record in lot {
-                                let next = offsets.entry(record.partition).or_insert(0);
-                                *next = (*next).max(record.offset + 1);
-                                acc.push((record.partition, record.value));
+                            acc_rows += lot.len();
+                            acc.push(lot);
+                            if let Some((lots, _)) = &lane {
+                                if let Some(ranges) = lots.pop() {
+                                    acc_ranges.extend(ranges);
+                                }
                             }
                         }
                         Ok(Some(Err(e))) => {
                             yield Err(DataFusionError::Execution(e.to_string()));
                         }
                         Ok(None) => {
-                            // (c) Stream terminado: flush de cola y drenado.
-                            if !acc.is_empty() {
-                                spawn_decode(&decoder, &schema.clone(), row_partitions, &mut acc, &mut offsets, &mut in_flight);
+                            if acc_rows > 0 {
+                                in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges)));
+                                acc_rows = 0;
                             }
                             if in_flight.is_empty() {
                                 return;
                             }
                             emit = true;
                         }
+                        // Venció el linger: la vuelta siguiente corta el
+                        // batch parcial (rama de arriba).
+                        Err(_) if acc_rows > 0 => {}
                         Err(_) => {
-                            // Timeout sin datos: si no hay nada que acumular,
-                            // drenar un decode en vuelo para hacer progreso.
-                            emit = acc.is_empty() && !in_flight.is_empty();
+                            // Sin lotes nuevos por un rato: soltar lo que ya
+                            // se está decodificando.
+                            emit = !in_flight.is_empty();
                         }
                     }
                 }
 
                 if emit {
-                    match in_flight.next().await {
-                        Some(Ok((offs, result))) => {
+                    let waited = Instant::now();
+                    let head = in_flight.next().await;
+                    if debug {
+                        waits[1] += waited.elapsed().as_secs_f64();
+                    }
+                    match head {
+                        Some(Ok((offs, ranges, result))) => {
                             if let Some(t) = &tracker {
                                 t.advance(&offs);
                             }
+                            if let Some((_, out)) = &lane {
+                                out.lock().expect("lock de rangos del carril").extend(ranges);
+                            }
                             match result {
-                                Ok(batch) => yield Ok(batch),
+                                Ok(batch) => {
+                                    let waited = Instant::now();
+                                    yield Ok(batch);
+                                    if debug {
+                                        waits[2] += waited.elapsed().as_secs_f64();
+                                    }
+                                }
                                 Err(e) => yield Err(e),
                             }
                         }
@@ -262,36 +340,68 @@ impl PartitionStream for RedpandaPartitionStream {
 /// El resultado de decodificar un lote (offsets que cubre + batch o error).
 type DecodedLot = Result<RecordBatch, DataFusionError>;
 
+/// Linger de un batch: cuánto espera, desde su primer lote, a llenarse.
+/// Con carga alta se llena antes; con carga baja es el techo de latencia que
+/// agrega el batching. Antes era 1s: el último batch antes de una pausa del
+/// tráfico esperaba 1s entero.
+pub const DEFAULT_LINGER: Duration = Duration::from_millis(50);
+
+/// Sin lotes nuevos: cuánto se espera antes de soltar lo ya decodificado.
+const IDLE_RELEASE: Duration = Duration::from_millis(5);
+
 /// Despacha el decode de un lote al pool de blocking de tokio (el parseo es
 /// CPU-bound puro). El lote viaja con sus offsets, que se publican en el
 /// tracker cuando el batch decodificado se emite (en orden de despacho).
+/// Decodifica `lots` en un hilo del pool de blocking. Devuelve el próximo
+/// offset por partición que cubre el batch (para el checkpoint) y el batch.
 fn spawn_decode(
     decoder: &Decoder,
     schema: &SchemaRef,
     row_partitions: bool,
-    acc: &mut Vec<(i32, Vec<u8>)>,
-    offsets: &mut BTreeMap<i32, i64>,
-    in_flight: &mut FuturesOrdered<tokio::task::JoinHandle<(BTreeMap<i32, i64>, DecodedLot)>>,
-) {
-    let staged = std::mem::take(acc);
-    let offs = std::mem::take(offsets);
+    lots: Vec<Vec<SourceRecord>>,
+    ranges: Vec<OffsetRange>,
+) -> tokio::task::JoinHandle<(BTreeMap<i32, i64>, Vec<OffsetRange>, DecodedLot)> {
     let decoder = decoder.clone();
     let schema = schema.clone();
-    in_flight.push_back(tokio::task::spawn_blocking(move || {
-        let partitions: Vec<i32> = staged.iter().map(|(p, _)| *p).collect();
-        let mut values: Vec<Vec<u8>> = staged.into_iter().map(|(_, v)| v).collect();
+    tokio::task::spawn_blocking(move || {
+        let rows: usize = lots.iter().map(Vec::len).sum();
+        let mut offsets = BTreeMap::<i32, i64>::new();
+        let mut payloads: Vec<&[u8]> = Vec::with_capacity(rows);
+        // Los registros de una partición llegan juntos: se cachea la última.
+        let mut current: Option<(i32, i64)> = None;
+        for record in lots.iter().flatten() {
+            payloads.push(&record.value);
+            match &mut current {
+                Some((partition, next)) if *partition == record.partition => {
+                    *next = (*next).max(record.offset + 1);
+                }
+                _ => {
+                    if let Some((partition, next)) = current {
+                        let slot = offsets.entry(partition).or_insert(next);
+                        *slot = (*slot).max(next);
+                    }
+                    current = Some((record.partition, record.offset + 1));
+                }
+            }
+        }
+        if let Some((partition, next)) = current {
+            let slot = offsets.entry(partition).or_insert(next);
+            *slot = (*slot).max(next);
+        }
         let result = decoder
-            .decode(&mut values)
+            .decode_payloads(&payloads)
             .map_err(|e| DataFusionError::Execution(e.to_string()))
             .and_then(|batch| {
                 if row_partitions {
+                    let partitions: Vec<i32> =
+                        lots.iter().flatten().map(|record| record.partition).collect();
                     append_partition_column(batch, &partitions, schema)
                 } else {
                     Ok(batch)
                 }
             });
-        (offs, result)
-    }));
+        (offsets, ranges, result)
+    })
 }
 
 fn append_partition_column(

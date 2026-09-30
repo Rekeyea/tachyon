@@ -20,6 +20,10 @@ arrow.workspace = true
 futures = "0.3"
 rdkafka = { version = "0.39", features = ["cmake-build"] }
 apache-avro = "0.21"
+# Mapa de claves del operador de ventanas (hash rápido, sin orden observable).
+hashbrown = "0.17"
+# Valores de agregado por fila inline (sin alloc por fila en la ventana).
+smallvec = "1"
 
 [dev-dependencies]
 tachyon-sink = { path = "../tachyon-sink" }

@@ -1,0 +1,5 @@
+# Harness del benchmark Tachyon vs Flink: produce, mide offsets commiteados,
+# lee snapshots de Paimon (manifests Avro + parquet) y el cgroup de cada motor.
+FROM python:3.12-slim
+RUN pip install --no-cache-dir confluent-kafka==2.* fastavro==1.* "pyarrow>=20" numpy==2.* backports.zstd zstandard
+WORKDIR /bench

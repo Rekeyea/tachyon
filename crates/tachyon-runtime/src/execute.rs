@@ -60,6 +60,12 @@ const PASSTHROUGH_OPERATORS: &[&str] = &[
 /// Agregaciones, joins, sorts o repartitions retienen filas entre batches:
 /// los offsets emitidos por la fuente ya no dicen qué filas llegaron al sink.
 pub fn ensure_passthrough(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
+    ensure_passthrough_lanes(plan, 1)
+}
+
+/// Como `ensure_passthrough`, con `lanes` particiones de punta a punta: cada
+/// carril (un consumidor) es una partición y nada las junta ni las reparte.
+pub fn ensure_passthrough_lanes(plan: &Arc<dyn ExecutionPlan>, lanes: usize) -> Result<()> {
     if !PASSTHROUGH_OPERATORS.contains(&plan.name()) {
         anyhow::bail!(
             "exactly-once solo soporta transformaciones por registro (filter/project/limit); \
@@ -67,15 +73,15 @@ pub fn ensure_passthrough(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
             plan.name()
         );
     }
-    if plan.output_partitioning().partition_count() != 1 {
+    if plan.output_partitioning().partition_count() != lanes {
         anyhow::bail!(
-            "exactly-once requiere un plan de 1 partición; '{}' tiene {}",
+            "exactly-once requiere un plan de {lanes} partición(es); '{}' tiene {}",
             plan.name(),
             plan.output_partitioning().partition_count()
         );
     }
     for child in plan.children() {
-        ensure_passthrough(child)?;
+        ensure_passthrough_lanes(child, lanes)?;
     }
     Ok(())
 }

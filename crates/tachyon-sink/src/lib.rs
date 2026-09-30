@@ -5,4 +5,5 @@
 pub mod compact;
 pub mod dimension;
 pub mod redpanda;
+pub mod shard;
 pub mod writer;

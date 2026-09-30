@@ -13,11 +13,14 @@
 pub mod consumer;
 pub mod decode;
 pub mod handoff;
+mod json_flat;
 pub mod record;
 pub mod schema_wire;
 pub mod stream;
 
-pub use consumer::{in_memory_stream, GroupMetadata, RdkafkaSource, RecordStream};
+pub use consumer::{
+    in_memory_stream, CopiedCursor, GroupMetadata, LotRanges, RdkafkaSource, RecordStream,
+};
 pub use handoff::{StateRequest, WindowHandoff};
 pub use decode::{parse_avro_schema, DecodeFormat, Decoder};
 pub use schema_wire::{
@@ -25,4 +28,4 @@ pub use schema_wire::{
     register_topic_schema, SchemaCache,
 };
 pub use record::SourceRecord;
-pub use stream::{OffsetTracker, RedpandaPartitionStream};
+pub use stream::{LaneRanges, OffsetTracker, RedpandaPartitionStream};

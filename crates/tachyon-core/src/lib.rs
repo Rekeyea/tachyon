@@ -6,6 +6,7 @@
 
 pub mod checkpoint;
 pub mod error;
+pub mod frontier;
 pub mod plan;
 pub mod types;
 
@@ -16,5 +17,6 @@ pub use checkpoint::{
     WindowCheckpointV1, WindowKind, WindowSpecId, MAX_SIDECAR_BYTES,
 };
 pub use error::Error;
+pub use frontier::{Frontier, OffsetRange};
 pub use plan::{OutputDef, PipelinePlan};
 pub use types::{Column, PartitionKey, SourceOffsets, StreamDef};

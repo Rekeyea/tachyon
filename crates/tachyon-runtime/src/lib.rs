@@ -12,6 +12,7 @@ pub mod runtime;
 pub mod table_stream;
 pub mod union;
 pub mod window;
+pub mod window_shards;
 
 pub use budget::StatelessBudget;
 pub use execute::{execute_query, InputSource, StreamTable, StreamTableFactory, TransformOutput};

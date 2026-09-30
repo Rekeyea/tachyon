@@ -18,6 +18,9 @@ use tachyon_runtime::{Pipeline, PreparedInput, StatelessBudget};
 use tachyon_sink::compact::compact_table;
 use tachyon_sink::writer::open_table;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Tachyon: motor de ejecución de pipelines streaming sobre lakehouse.
 #[derive(Parser, Debug)]
 #[command(version, about)]

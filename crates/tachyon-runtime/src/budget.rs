@@ -46,6 +46,13 @@ pub struct StatelessBudget {
     pub fetch_wait_max_ms: u32,
     /// Filas en vuelo entre la transformación y el writer.
     pub channel_rows: usize,
+    /// Writers de Paimon en paralelo (buckets repartidos por `bucket % N`).
+    /// Cada uno escribe y hace el flush de sus buckets en su propio hilo.
+    pub sink_shards: usize,
+    /// `queued.max.messages.kbytes` de librdkafka: el prefetch local de UN
+    /// consumidor (no es por partición). Acota la memoria del source a
+    /// `consumers_per_topic` veces esto.
+    pub queued_max_kbytes: u32,
 }
 
 /// Overrides explícitos del yaml. `None` = seguir la fórmula del pin.
@@ -67,8 +74,15 @@ impl StatelessBudget {
     /// Tope por partición dentro de ese fetch. 4 MiB son ~50K filas JSON
     /// chicas: un solo viaje llena más de un batch.
     pub const MAX_PARTITION_FETCH_BYTES: u32 = 4 * 1024 * 1024;
-    pub const FETCH_WAIT_MAX_MS: u32 = 1_000;
+    /// Con carga alta el broker responde apenas junta `FETCH_MIN_BYTES`;
+    /// este tope solo actúa con poco tráfico. Con 1s, a baja carga cada fetch
+    /// esperaba 1s entero y eso se sumaba a la latencia de cada fila.
+    pub const FETCH_WAIT_MAX_MS: u32 = 100;
     pub const CHANNEL_ROWS: usize = 1_000_000;
+    /// 64 MiB de prefetch por consumidor: a 1M filas/s de ~100 bytes son
+    /// ~0.6s de colchón por cliente, de sobra para el round trip del fetch.
+    /// Con 256 MiB, 4 consumidores inflaban el RSS a ~2.7 GB sin mover la tasa.
+    pub const QUEUED_MAX_KBYTES: u32 = 65_536;
 
     /// Fórmula pura. `cpus` y `partitions` se tratan como >= 1.
     pub fn derive(cpus: usize, partitions: usize, overrides: BudgetOverrides) -> Result<Self> {
@@ -92,6 +106,10 @@ impl StatelessBudget {
             max_partition_fetch_bytes: Self::MAX_PARTITION_FETCH_BYTES,
             fetch_wait_max_ms: Self::FETCH_WAIT_MAX_MS,
             channel_rows: Self::CHANNEL_ROWS,
+            queued_max_kbytes: Self::QUEUED_MAX_KBYTES,
+            // Un writer por CPU (el router lo acota a los buckets): el flush
+            // del epoch (sort + parquet + zstd) era un core entero.
+            sink_shards: cpus,
         })
     }
 
@@ -141,8 +159,11 @@ impl StatelessBudget {
     /// hasta `decode_parallelism`. El +2 es margen para I/O del sink. El
     /// default de Tokio (512) sobre-suscribe cualquier pin.
     pub fn max_blocking_threads(&self) -> usize {
+        // Cada shard del sink ocupa un hilo mientras vive y su flush otro
+        // por epoch: 2 por shard.
         self.consumers_per_topic
             .saturating_add(self.decode_parallelism)
+            .saturating_add(self.sink_shards.saturating_mul(2))
             .saturating_add(2)
             .max(1)
     }
