@@ -1,0 +1,28 @@
+pipeline:
+  name: orders-sqs-out
+  version: 1
+
+connectors:
+  sqs:
+    region: us-east-1
+    # endpoint: http://localhost:4566   # floCi
+    # profile: mi-perfil-aws            # opcional
+
+inputs:
+  - name: orders
+    sqs: orders-queue            # nombre de la cola de entrada (o URL completa)
+    key: order_id                # == state key
+    schema: json/orders          # schema Arrow (columnas que ve el SQL)
+    receive_wait: 20s            # long polling (default: 20s)
+
+# Salida a una cola de SQS: at-least-once. El mensaje es durable al
+# publicarse (SendMessageBatch); un reinicio repubica desde el inicio y el
+# consumidor dedup con la columna de secuencia (va en el payload JSON).
+output:
+  name: orders_out
+  sqs: orders-out-queue          # nombre de la cola de salida
+  key: order_id
+
+deployment:
+  partitions: 1
+  commit_interval: 5s

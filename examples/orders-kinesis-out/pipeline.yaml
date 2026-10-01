@@ -1,0 +1,28 @@
+pipeline:
+  name: orders-kinesis-out
+  version: 1
+
+connectors:
+  kinesis:
+    region: us-east-1
+    # endpoint: http://localhost:4566   # floCi
+    # profile: mi-perfil-aws            # opcional
+
+inputs:
+  - name: orders
+    kinesis: orders-stream       # nombre del stream de entrada
+    key: order_id                # == state key == partition key
+    schema: json/orders          # schema Arrow (columnas que ve el SQL)
+    start_from: trim_horizon     # trim_horizon | latest (default: latest)
+
+# Salida a un stream de Kinesis: at-least-once. El registro es durable al
+# publicarse (PutRecords); un reinicio repubica desde el inicio y el
+# consumidor dedup con la columna de secuencia (va en el payload JSON).
+output:
+  name: orders_out
+  kinesis: orders-out-stream     # nombre del stream de salida
+  key: order_id
+
+deployment:
+  partitions: 1
+  commit_interval: 5s

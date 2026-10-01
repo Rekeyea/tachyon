@@ -263,18 +263,27 @@ pub struct WatermarkConfig {
     pub idle: Option<String>,
 }
 
-/// La salida. Un pipeline tiene una: una tabla Paimon (`table`) o un topic
-/// de Redpanda (`topic`). El nombre lógico es el del `INSERT INTO`.
+/// La salida. Un pipeline tiene una: una tabla Paimon (`table`), un topic
+/// de Redpanda (`topic`), un stream de Kinesis (`kinesis`) o una cola de SQS
+/// (`sqs`). El nombre lógico es el del `INSERT INTO`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OutputConfig {
     pub name: String,
-    /// `db.tabla` en el warehouse. Excluyente con `topic`.
+    /// `db.tabla` en el warehouse. Excluyente con `topic`, `kinesis` y `sqs`.
     #[serde(default)]
     pub table: Option<String>,
     /// Topic de salida. La clave del mensaje es `key`, para que dos pipelines
     /// que escriben la misma clave caigan en la misma partición.
     #[serde(default)]
     pub topic: Option<String>,
+    /// Stream de Kinesis de salida. At-least-once: el registro es durable al
+    /// publicarse (`PutRecords`); un reinicio repubica desde el inicio.
+    #[serde(default)]
+    pub kinesis: Option<String>,
+    /// Cola de SQS de salida. At-least-once: `SendMessageBatch`; un reinicio
+    /// repubica desde el inicio.
+    #[serde(default)]
+    pub sqs: Option<String>,
     pub key: String,
     /// Buckets de la tabla. Obligatorio con `table`. `deployment.partitions`
     /// tiene que igualarlo.

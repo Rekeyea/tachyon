@@ -19,6 +19,11 @@ bytes = "1"
 rdkafka = { version = "0.39", features = ["cmake-build"] }
 rdkafka-sys = "4.10"
 tokio = { version = "1", features = ["rt"] }
+# Sinks de Kinesis y SQS (at-least-once). Mismas versiones que tachyon-source.
+aws-sdk-kinesis = "1"
+aws-sdk-sqs = "1"
+aws-config = "1"
+aws-types = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -13,8 +13,8 @@ use tachyon_sql::{orient_lookup, parse_sql, LookupJoin, LookupShape, UnionBranch
 
 use crate::join::run_join_pipeline;
 use crate::run::{
-    run_pipeline_with_lookup, run_topic_pipeline_with_lookup, PipelineHandle, PreparedInput,
-    RunOptions,
+    run_aws_pipeline, run_pipeline_with_lookup, run_topic_pipeline_with_lookup, AwsOutput,
+    PipelineHandle, PreparedInput, RunOptions,
 };
 use crate::table_stream::run_table_stream;
 
@@ -152,6 +152,58 @@ impl Pipeline {
                 &metrics,
                 self.lookup.as_ref(),
                 self.union_all.as_deref(),
+            )
+            .await;
+        }
+        if let Some(stream) = &self.config.output.kinesis {
+            if self.window.is_some() || self.join.is_some() {
+                anyhow::bail!(
+                    "una ventana o un join escriben en Paimon: kinesis no guarda el estado abierto"
+                );
+            }
+            if self.union_all.is_some() {
+                anyhow::bail!(
+                    "UNION ALL no escribe a kinesis: el sink tiene un solo input"
+                );
+            }
+            let options = RunOptions::from_config(&self.config);
+            let metrics = Arc::new(InstanceMetrics::new());
+            return run_aws_pipeline(
+                &self.config,
+                &self.select_sql,
+                &options,
+                input_codecs,
+                &metrics,
+                self.lookup.as_ref(),
+                AwsOutput::Kinesis {
+                    stream: stream.clone(),
+                },
+            )
+            .await;
+        }
+        if let Some(queue) = &self.config.output.sqs {
+            if self.window.is_some() || self.join.is_some() {
+                anyhow::bail!(
+                    "una ventana o un join escriben en Paimon: sqs no guarda el estado abierto"
+                );
+            }
+            if self.union_all.is_some() {
+                anyhow::bail!(
+                    "UNION ALL no escribe a sqs: el sink tiene un solo input"
+                );
+            }
+            let options = RunOptions::from_config(&self.config);
+            let metrics = Arc::new(InstanceMetrics::new());
+            return run_aws_pipeline(
+                &self.config,
+                &self.select_sql,
+                &options,
+                input_codecs,
+                &metrics,
+                self.lookup.as_ref(),
+                AwsOutput::Sqs {
+                    queue: queue.clone(),
+                },
             )
             .await;
         }

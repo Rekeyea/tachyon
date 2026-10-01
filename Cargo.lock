@@ -5450,6 +5450,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "aws-config",
+ "aws-sdk-kinesis",
+ "aws-sdk-sqs",
+ "aws-types",
  "bytes",
  "futures",
  "paimon",

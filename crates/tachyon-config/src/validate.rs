@@ -24,60 +24,81 @@ fn registry_url(cfg: &PipelineConfig) -> Option<&str> {
 }
 
 pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
-    match (&cfg.output.table, &cfg.output.topic) {
-        (Some(table), None) => {
-            if table.trim().is_empty() {
-                return Err(Error::Config(
-                    "output.table está vacío".to_string(),
-                ));
-            }
-            let Some(bucket) = cfg.output.bucket else {
-                return Err(Error::Config(
-                    "output.bucket es obligatorio cuando la salida es una tabla".to_string(),
-                ));
-            };
-            if cfg.deployment.partitions != bucket {
-                return Err(Error::Alignment {
-                    expected: cfg.deployment.partitions,
-                    found: bucket,
-                });
-            }
-            let warehouse = cfg
-                .connectors
-                .paimon
-                .as_ref()
-                .map(|p| p.warehouse.trim())
-                .unwrap_or("");
-            if warehouse.is_empty() {
-                return Err(Error::Config(
-                    "una salida a tabla requiere connectors.paimon.warehouse".to_string(),
-                ));
-            }
+    let outputs = [
+        cfg.output.table.is_some(),
+        cfg.output.topic.is_some(),
+        cfg.output.kinesis.is_some(),
+        cfg.output.sqs.is_some(),
+    ];
+    if outputs.iter().filter(|&&on| on).count() != 1 {
+        return Err(Error::Config(
+            "la salida necesita exactamente uno de output.table, output.topic, output.kinesis o output.sqs"
+                .to_string(),
+        ));
+    }
+    if let Some(table) = &cfg.output.table {
+        if table.trim().is_empty() {
+            return Err(Error::Config("output.table está vacío".to_string()));
         }
-        (None, Some(topic)) => {
-            if topic.trim().is_empty() {
-                return Err(Error::Config("output.topic está vacío".to_string()));
-            }
-            if cfg.output.bucket.is_some() {
-                return Err(Error::Config(
-                    "output.bucket pertenece a la tabla; un topic no lo usa".to_string(),
-                ));
-            }
-            if cfg.output.sequence_field.is_some() || cfg.output.rowkind_field.is_some() {
-                return Err(Error::Config(
-                    "sequence_field y rowkind_field pertenecen a la tabla Paimon"
-                        .to_string(),
-                ));
-            }
-        }
-        (Some(_), Some(_)) => {
+        let Some(bucket) = cfg.output.bucket else {
             return Err(Error::Config(
-                "la salida tiene table y topic; hace falta uno solo".to_string(),
+                "output.bucket es obligatorio cuando la salida es una tabla".to_string(),
+            ));
+        };
+        if cfg.deployment.partitions != bucket {
+            return Err(Error::Alignment {
+                expected: cfg.deployment.partitions,
+                found: bucket,
+            });
+        }
+        let warehouse = cfg
+            .connectors
+            .paimon
+            .as_ref()
+            .map(|p| p.warehouse.trim())
+            .unwrap_or("");
+        if warehouse.is_empty() {
+            return Err(Error::Config(
+                "una salida a tabla requiere connectors.paimon.warehouse".to_string(),
             ));
         }
-        (None, None) => {
+    }
+    // topic, kinesis y sqs son salidas de flujo: no usan bucket ni
+    // sequence_field/rowkind_field (eso pertenece a la tabla Paimon).
+    if cfg.output.topic.is_some() || cfg.output.kinesis.is_some() || cfg.output.sqs.is_some() {
+        if cfg.output.bucket.is_some() {
             return Err(Error::Config(
-                "la salida necesita output.table o output.topic".to_string(),
+                "output.bucket pertenece a la tabla; un topic, kinesis o sqs no lo usa".to_string(),
+            ));
+        }
+        if cfg.output.sequence_field.is_some() || cfg.output.rowkind_field.is_some() {
+            return Err(Error::Config(
+                "sequence_field y rowkind_field pertenecen a la tabla Paimon".to_string(),
+            ));
+        }
+    }
+    if let Some(topic) = &cfg.output.topic {
+        if topic.trim().is_empty() {
+            return Err(Error::Config("output.topic está vacío".to_string()));
+        }
+    }
+    if let Some(stream) = &cfg.output.kinesis {
+        if stream.trim().is_empty() {
+            return Err(Error::Config("output.kinesis está vacío".to_string()));
+        }
+        if cfg.connectors.kinesis.is_none() {
+            return Err(Error::Config(
+                "una salida a kinesis requiere connectors.kinesis.region".to_string(),
+            ));
+        }
+    }
+    if let Some(queue) = &cfg.output.sqs {
+        if queue.trim().is_empty() {
+            return Err(Error::Config("output.sqs está vacío".to_string()));
+        }
+        if cfg.connectors.sqs.is_none() {
+            return Err(Error::Config(
+                "una salida a sqs requiere connectors.sqs.region".to_string(),
             ));
         }
     }
@@ -611,7 +632,10 @@ deployment:
         let mut cfg = pipeline("");
         cfg.output.topic = Some("orders-by-customer".to_string());
         let err = validate_config(&cfg).unwrap_err();
-        assert!(err.to_string().contains("table y topic"), "{err}");
+        assert!(
+            err.to_string().contains("exactamente uno"),
+            "{err}"
+        );
     }
 
     #[test]

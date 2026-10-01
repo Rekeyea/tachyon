@@ -494,6 +494,16 @@ Además de topic de Redpanda, un input puede leer de **AWS Kinesis Data Streams*
 - **Conectores:** `connectors.kinesis` / `connectors.sqs` declaran `region` y opcionalmente `endpoint` (floCi/LocalStack) y `profile` (AWS Shared Config). Las credenciales salen de la cadena default de AWS (env, shared config, IMDS).
 - **Limitaciones v1:** un sink a topic exige inputs solo de topic (la transacción commitea consumer groups de Kafka); un window o un join rechaza inputs kinesis/sqs con un error explícito.
 
+### 8.6 Kinesis y SQS como salidas (sinks)
+
+Además de la tabla Paimon y el topic de Redpanda, la salida puede ser un **stream de Kinesis** (`output.kinesis`) o una **cola de SQS** (`output.sqs`). Son salidas de flujo **at-least-once**: AWS no tiene transacciones que grunen salida y offsets de entrada (como la de Redpanda), así que el registro es **durable al publicarse** (`PutRecords` / `SendMessageBatch`) y el commit del sink es un no-op.
+
+- **Payload:** cada fila se publica como un objeto JSON (todas las columnas de la salida) y la clave `output.key` viaja como partition key (Kinesis) o dentro del JSON (SQS). La columna de secuencia (`source_version` o la que declare la SQL) va en el payload: el consumidor dedup con ella.
+- **Reinicio:** el pipeline vuelve a leer desde la posición de arranque del input y repubica. La salida puede tener duplicados; el contrato es at-least-once y la deduplicación la hace el consumidor (secuencia).
+- **Progreso de entrada en el commit:** en cada `commit_interval` se persiste el progreso del input con el mismo orden que el camino Paimon, solo después de que el batch se publicó: topic → offsets al consumer group (acota la relectura en un reinicio); SQS → borrado de los receipt handles del input (`DeleteMessageBatch`); Kinesis → nada (no hay posición que persistir).
+- **Forma del pipeline:** un solo input (topic, Kinesis o SQS) y una transformación pass-through (filter/project/limit + lookup). Un window o un join se rechaza con un error explícito (el estado abierto vive en Paimon); `UNION ALL` se rechaza en el sink AWS.
+- **Conectores:** reusan `connectors.kinesis` / `connectors.sqs` (mismo `region`/`endpoint`/`profile` que los inputs). El sink no declara `bucket`, `sequence_field` ni `rowkind_field` (eso pertenece a la tabla Paimon).
+
 ---
 
 ## 9. Escalado y Fault Tolerance

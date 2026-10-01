@@ -42,7 +42,9 @@ use tachyon_core::{
     CheckpointBody, InputPosition, InputPositions, SourceOffsets, kafka_offsets, merge_positions,
 };
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
+use tachyon_sink::kinesis::KinesisSink;
 use tachyon_sink::redpanda::RedpandaSink;
+use tachyon_sink::sqs::SqsSink;
 use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, PartitionTickets, Recovered};
 use tachyon_source::consumer::{CopiedCursor, LotRanges, RdkafkaSource};
 use tachyon_source::kinesis::{KinesisSource, LotPositions, StartPosition};
@@ -2000,6 +2002,443 @@ async fn delete_sqs_messages(client: &aws_sdk_sqs::Client, queue: &str, handles:
                 "DeleteMessageBatch SQS falló; los mensajes se reentregan y el sink deduplica"
             );
         }
+    }
+}
+
+/// Destino del output AWS.
+pub(crate) enum AwsOutput {
+    Kinesis { stream: String },
+    Sqs { queue: String },
+}
+
+/// Source de entrada del pipeline AWS: de dónde tira el stream y qué persiste
+/// el paso de commit. Kinesis no persiste nada: un reinicio vuelve a leer
+/// desde la posición de arranque.
+enum AwsStreamState {
+    Topic {
+        source: Arc<RdkafkaSource>,
+        tracker: OffsetTracker,
+    },
+    Kinesis {
+        source: Arc<KinesisSource>,
+    },
+    Sqs {
+        source: Arc<SqsSource>,
+        client: aws_sdk_sqs::Client,
+        queue: String,
+        receipts: ReceiptsOut,
+    },
+}
+
+/// Progreso de entrada al emitir cada batch (at-least-once): los handles se
+/// pueblan en lockstep con el batch y se borran solo después de publicado.
+enum AwsProgress {
+    Offsets(BTreeMap<i32, i64>),
+    Receipts(Vec<String>),
+    None,
+}
+
+/// Qué persistir en cada intervalo de commit.
+enum AwsCommit {
+    Topic { source: Arc<RdkafkaSource> },
+    Sqs {
+        client: aws_sdk_sqs::Client,
+        queue: String,
+    },
+    Kinesis,
+}
+
+enum AwsSink {
+    Kinesis(KinesisSink),
+    Sqs(SqsSink),
+}
+
+impl AwsSink {
+    /// Publica el batch. Devuelve la cantidad de filas.
+    async fn write(&self, batch: &arrow::array::RecordBatch) -> Result<usize> {
+        match self {
+            AwsSink::Kinesis(sink) => sink.write(batch).await,
+            AwsSink::Sqs(sink) => sink.write(batch).await,
+        }
+    }
+}
+
+/// Pipeline de salida AWS (Kinesis o SQS): at-least-once.
+///
+/// El registro es durable al publicarse (`PutRecords` / `SendMessageBatch`),
+/// así que el commit del sink es un no-op. En cada intervalo de commit se
+/// persiste el progreso de entrada con el mismo orden que el camino Paimon:
+/// offsets al consumer group (topic) y borrado de receipts (SQS) solo después
+/// de que el batch se publicó. Un reinicio vuelve a leer desde la posición de
+/// arranque y repubica: la salida puede tener duplicados y el consumidor
+/// dedup con la columna de secuencia (el payload JSON la incluye).
+pub(crate) async fn run_aws_pipeline(
+    config: &PipelineConfig,
+    select_sql: &str,
+    options: &RunOptions,
+    input_codecs: &std::collections::HashMap<String, PreparedInput>,
+    metrics: &Arc<InstanceMetrics>,
+    lookup: Option<&LookupJoin>,
+    output: AwsOutput,
+) -> Result<PipelineHandle> {
+    if config.inputs.len() != 1 {
+        anyhow::bail!(
+            "el sink a kinesis/sqs tiene un solo input: la posición de arranque es por input"
+        );
+    }
+    if config
+        .deployment
+        .consumers_per_topic
+        .is_some_and(|count| count != 1)
+    {
+        anyhow::bail!("el sink a kinesis/sqs usa un consumidor");
+    }
+    let budget = StatelessBudget::resolve(config).context("presupuesto del pipeline")?;
+    tracing::info!(
+        cpus = budget.cpus,
+        batch_size = budget.batch_size,
+        "at-least-once activo (kinesis/sqs); el registro es durable al publicarse"
+    );
+
+    let metrics_addr = if let Some(bind) = options.metrics_bind {
+        let server = MetricsServer::new(bind, metrics.clone());
+        Some(server.start().await.context("arrancando métricas")?)
+    } else {
+        None
+    };
+
+    let input_def = &config.inputs[0];
+    let prepared = input_codecs
+        .get(&input_def.name)
+        .cloned()
+        .with_context(|| format!("sin schema para el input '{}'", input_def.name))?;
+    if !format_matches(input_def.format, &prepared.format) {
+        anyhow::bail!(
+            "el input '{}' declara format {:?} pero el codec cargado no coincide",
+            input_def.name,
+            input_def.format
+        );
+    }
+
+    // --- Source de entrada: topic, Kinesis o SQS ---
+    let state = match input_def.kind() {
+        InputKind::Topic => {
+            let topic = input_def.kafka_topic()?.to_string();
+            let source_group = format!("{}-{}", options.group_id, input_def.name);
+            let mut source_cc = source_client_config(config, &options.group_id, &budget)?;
+            source_cc.set("group.id", &source_group);
+            let source = Arc::new(
+                RdkafkaSource::new(&source_cc, &topic)
+                    .with_context(|| format!("creando source para '{}'", input_def.name))?
+                    .with_max_batch(budget.batch_size),
+            );
+            AwsStreamState::Topic {
+                source,
+                tracker: OffsetTracker::new(),
+            }
+        }
+        InputKind::Kinesis => {
+            let kinesis_cfg = config
+                .connectors
+                .kinesis
+                .as_ref()
+                .context("kinesis requiere connectors.kinesis.region")?;
+            let client = crate::aws::kinesis_client(kinesis_cfg).await?;
+            let stream_name = input_def
+                .kinesis_stream()
+                .expect("la validación garantiza un stream")
+                .to_string();
+            let start_from = match input_def.start_from {
+                Some(StartFrom::TrimHorizon) => StartPosition::TrimHorizon,
+                _ => StartPosition::Latest,
+            };
+            let source = KinesisSource::new(client, &stream_name, start_from)
+                .with_max_batch(budget.batch_size);
+            AwsStreamState::Kinesis {
+                source: Arc::new(source),
+            }
+        }
+        InputKind::Sqs => {
+            let sqs_cfg = config
+                .connectors
+                .sqs
+                .as_ref()
+                .context("sqs requiere connectors.sqs.region")?;
+            let client = crate::aws::sqs_client(sqs_cfg).await?;
+            let queue = crate::aws::queue_url(
+                &client,
+                input_def.sqs_queue().expect("la validación garantiza una cola"),
+            )
+            .await?;
+            let wait = input_def
+                .receive_wait
+                .as_deref()
+                .map(parse_fixed_duration)
+                .transpose()?
+                .map(|ms| Duration::from_millis(ms as u64))
+                .unwrap_or(SQS_DEFAULT_WAIT);
+            // El visibility timeout supera el intervalo de commit: un mensaje
+            // que vuelve a ser visible antes del commit se consume dos veces y
+            // el consumidor dedup.
+            let visibility = options.commit_interval + Duration::from_secs(60);
+            let source = SqsSource::new(client.clone(), &queue, wait)
+                .with_visibility_timeout(visibility);
+            AwsStreamState::Sqs {
+                source: Arc::new(source),
+                client,
+                queue,
+                receipts: fresh_receipts(),
+            }
+        }
+        InputKind::Table => {
+            anyhow::bail!(
+                "el input '{}' es una tabla Paimon y no entra al loop de streaming",
+                input_def.name
+            );
+        }
+    };
+
+    // Lockstep con los batches: el stream publica un lote de receipts por
+    // batch emitido (filtro o no), así el pop va con el batch de salida.
+    let snap_fn: Arc<dyn Fn() -> AwsProgress + Send + Sync> = match &state {
+        AwsStreamState::Topic { tracker, .. } => {
+            let tracker = tracker.clone();
+            Arc::new(move || AwsProgress::Offsets(tracker.snapshot()))
+        }
+        AwsStreamState::Sqs { receipts, .. } => {
+            let receipts = receipts.clone();
+            Arc::new(move || {
+                let handles = receipts.lock().unwrap().pop_front().unwrap_or_default();
+                AwsProgress::Receipts(handles)
+            })
+        }
+        AwsStreamState::Kinesis { .. } => Arc::new(|| AwsProgress::None),
+    };
+
+    // Qué persistir en cada commit (se clona antes de mover `state` a la
+    // factory).
+    let commit = match &state {
+        AwsStreamState::Topic { source, .. } => AwsCommit::Topic {
+            source: source.clone(),
+        },
+        AwsStreamState::Sqs { client, queue, .. } => AwsCommit::Sqs {
+            client: client.clone(),
+            queue: queue.clone(),
+        },
+        AwsStreamState::Kinesis { .. } => AwsCommit::Kinesis,
+    };
+
+    let prepared_lookup = match lookup {
+        Some(join) => {
+            if join.fact != input_def.name {
+                anyhow::bail!("el lookup enriquece '{}'", join.fact);
+            }
+            Some(prepare_lookup(config, join, select_sql, prepared.schema.clone()).await?)
+        }
+        None => None,
+    };
+    let input_schema = input_table_schema(
+        prepared.schema.clone(),
+        &input_def.name,
+        false,
+        &prepared_lookup,
+    )?;
+    let planned_sql = prepared_lookup
+        .as_ref()
+        .map(|item| item.sql.clone())
+        .unwrap_or_else(|| select_sql.to_string());
+    let input_name = input_def.name.clone();
+    let decoder_format = prepared.format.clone();
+    let batch_size = budget.batch_size;
+    let decode_parallelism = budget.decode_parallelism;
+    let factory: Box<StreamTableFactory> = Box::new(move |name, schema| {
+        if name != input_name {
+            anyhow::bail!("source no encontrado para '{name}'");
+        }
+        let (decode_schema, inner_schema, _row_partitions) =
+            decode_plan(&schema, &prepared_lookup, name);
+        let decoder = Decoder::new(decode_schema, decoder_format.clone());
+        let inner = match &state {
+            AwsStreamState::Topic { source, tracker } => {
+                let source = source.clone();
+                let make_stream: Arc<
+                    dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync,
+                > = Arc::new(move || source.record_stream());
+                RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
+                    .with_offset_tracker(tracker.clone())
+                    .with_decode_parallelism(decode_parallelism)
+            }
+            AwsStreamState::Kinesis { source } => {
+                let source = source.clone();
+                let make_stream: Arc<
+                    dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync,
+                > = Arc::new(move || source.record_stream());
+                RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
+                    .with_decode_parallelism(decode_parallelism)
+            }
+            AwsStreamState::Sqs { source, receipts, .. } => {
+                let source = source.clone();
+                let make_stream: Arc<
+                    dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync,
+                > = Arc::new(move || source.record_stream());
+                RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
+                    .with_receipts(receipts.clone())
+                    .with_decode_parallelism(decode_parallelism)
+            }
+        };
+        let ps = as_partition(inner, &prepared_lookup, name);
+        let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, vec![ps])
+            .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+        Ok(Arc::new(table.with_infinite_table(true)))
+    });
+    let inputs = vec![InputSource {
+        name: input_def.name.clone(),
+        schema: input_schema,
+    }];
+    let (plan, task_ctx) = plan_query(&planned_sql, &inputs, &factory)
+        .await
+        .context("planificando la transformación")?;
+    ensure_passthrough(&plan).context("la transformación no admite at-least-once")?;
+    let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
+        .context("ejecutando la transformación")?;
+    let out_schema = stream.schema();
+    let key = &config.output.key;
+    let key_field = out_schema
+        .field_with_name(key)
+        .map_err(|_| anyhow::anyhow!("la salida no tiene la clave '{key}'"))?;
+    match key_field.data_type() {
+        arrow::datatypes::DataType::Int64
+        | arrow::datatypes::DataType::Int32
+        | arrow::datatypes::DataType::Utf8 => {}
+        other => anyhow::bail!(
+            "la clave '{key}' es {other}; kinesis/sqs la publican como Int64, Int32 o Utf8"
+        ),
+    }
+
+    let sink = match &output {
+        AwsOutput::Kinesis { stream } => {
+            let kinesis_cfg = config
+                .connectors
+                .kinesis
+                .as_ref()
+                .context("kinesis requiere connectors.kinesis.region")?;
+            AwsSink::Kinesis(
+                KinesisSink::open(
+                    &kinesis_cfg.region,
+                    kinesis_cfg.endpoint.as_deref(),
+                    kinesis_cfg.profile.as_deref(),
+                    stream,
+                    key,
+                )
+                .await?,
+            )
+        }
+        AwsOutput::Sqs { queue } => {
+            let sqs_cfg = config
+                .connectors
+                .sqs
+                .as_ref()
+                .context("sqs requiere connectors.sqs.region")?;
+            AwsSink::Sqs(
+                SqsSink::open(
+                    &sqs_cfg.region,
+                    sqs_cfg.endpoint.as_deref(),
+                    sqs_cfg.profile.as_deref(),
+                    queue,
+                    key,
+                )
+                .await?,
+            )
+        }
+    };
+
+    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<(
+        Result<arrow::array::RecordBatch, datafusion::error::DataFusionError>,
+        AwsProgress,
+    )>(1);
+    let stream_task = tokio::spawn(async move {
+        while let Some(item) = stream.next().await {
+            let snap = snap_fn();
+            if batch_tx.send((item, snap)).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _stop_stream = AbortOnDrop(stream_task);
+
+    let mut tick = tokio::time::interval(options.commit_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    let mut topic_offsets: BTreeMap<i32, i64> = BTreeMap::new();
+    // Receipts de los batches publicados y todavía no borrados (se borran en
+    // el commit, después de que el batch salió).
+    let mut pending_receipts: Vec<String> = Vec::new();
+    loop {
+        tokio::select! {
+            batch = batch_rx.recv() => {
+                match batch {
+                    Some((batch, progress)) => {
+                        let batch = batch.context("batch de salida")?;
+                        let rows = sink.write(&batch).await.context("publicando el batch")?;
+                        match progress {
+                            AwsProgress::Offsets(snap) => {
+                                for (part, off) in snap {
+                                    topic_offsets
+                                        .entry(part)
+                                        .and_modify(|o| *o = (*o).max(off))
+                                        .or_insert(off);
+                                }
+                            }
+                            AwsProgress::Receipts(handles) => {
+                                pending_receipts.extend(handles);
+                            }
+                            AwsProgress::None => {}
+                        }
+                        metrics.inc_rows_read(rows as u64);
+                        metrics.inc_rows_written(rows as u64);
+                    }
+                    None => break,
+                }
+            }
+            _ = tick.tick() => {
+                commit_aws_epoch(&commit, &topic_offsets, &mut pending_receipts, metrics).await;
+                metrics.inc_commits();
+            }
+        }
+    }
+    Ok(PipelineHandle {
+        metrics_addr,
+        metrics: metrics.clone(),
+    })
+}
+
+/// Commit at-least-once: persiste el progreso de entrada después de que el
+/// batch de salida se publicó. Offsets al consumer group (topic) y borrado de
+/// receipts (SQS); Kinesis no persiste nada. Un fallo es un warn: el registro
+/// ya es durable y un reinicio repubica (el consumidor dedup con la columna de
+/// secuencia).
+async fn commit_aws_epoch(
+    commit: &AwsCommit,
+    topic_offsets: &BTreeMap<i32, i64>,
+    pending_receipts: &mut Vec<String>,
+    metrics: &InstanceMetrics,
+) {
+    match commit {
+        AwsCommit::Topic { source } => {
+            if !topic_offsets.is_empty() {
+                if let Err(e) = source.commit_offsets(topic_offsets).await {
+                    tracing::warn!(error = %e, "commit de offsets al consumer group");
+                    metrics.inc_errors();
+                }
+            }
+        }
+        AwsCommit::Sqs { client, queue } => {
+            let handles = std::mem::take(pending_receipts);
+            if !handles.is_empty() {
+                delete_sqs_messages(client, queue, &handles).await;
+            }
+        }
+        AwsCommit::Kinesis => {}
     }
 }
 
