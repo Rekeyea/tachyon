@@ -1,0 +1,7 @@
+[
+  {"name": "id", "type": "Int32", "nullable": false},
+  {"name": "order_status", "type": "Utf8"},
+  {"name": "ver", "type": "Float64"},
+  {"name": "total", "type": "Float64"},
+  {"name": "ts", "type": "Int32"}
+]

@@ -1,0 +1,29 @@
+# Todo lo que no está acá lo deriva Tachyon del pin de CPUs del contenedor.
+# Input SQS (floCi): N consumidores compiten por la cola con long polling.
+pipeline:
+  name: ${NAME}
+connectors:
+  sqs:
+    region: us-east-1
+    endpoint: http://localhost:4566   # floCi
+  paimon:
+    warehouse: /wh/tachyon
+inputs:
+  - name: orders
+    sqs: ${QUEUE}
+    key: order_id
+    schema: /bench/tachyon/schemas/etl.json
+    receive_wait: 20s
+output:
+  name: etl_lake
+  table: default.etl_lake
+  key: order_id
+  bucket: 8
+  sequence_field: source_version
+deployment:
+  partitions: 8
+  consumers_per_topic: 8
+  commit_interval: ${COMMIT}
+  metrics:
+    bind_addr: 127.0.0.1:9464
+${TACHYON_EXTRA}

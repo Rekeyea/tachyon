@@ -1,0 +1,31 @@
+# ETL con conversor de esquemas: dos topics con schemas distintos convergen
+# a un schema base. El conversor reordena columnas y coerciona tipos (Int32→Int64).
+pipeline:
+  name: ${NAME}
+connectors:
+  redpanda:
+    brokers: [localhost:9092]
+  paimon:
+    warehouse: /wh/tachyon
+inputs:
+  - name: web_orders
+    topic: ${TOPIC_WEB}
+    key: order_id
+    schema: /bench/tachyon/schemas/convert_web.json
+    convert_to: combined_orders
+  - name: app_orders
+    topic: ${TOPIC_APP}
+    key: order_id
+    schema: /bench/tachyon/schemas/convert_app.json
+    convert_to: combined_orders
+output:
+  name: convert_lake
+  table: default.convert_lake
+  key: order_id
+  bucket: 8
+  sequence_field: source_version
+deployment:
+  partitions: 8
+  commit_interval: ${COMMIT}
+  metrics:
+    bind_addr: 127.0.0.1:9465

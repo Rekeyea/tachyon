@@ -2,10 +2,10 @@
 
 Mide los dos motores desde afuera y de la misma forma:
 
-- throughput: pendiente de los offsets *commiteados* del consumer group entre
-  el 20% y el 80% del backlog. Los dos motores commitean en Kafka recién
-  después de que el snapshot de Paimon existe, así que es progreso
-  exactly-once visible, no filas leídas.
+- throughput: pendiente del progreso *commiteado* entre el 20% y el 95% del
+  backlog. En Redpanda son los offsets del consumer group; en Kinesis/SQS es
+  `totalRecordCount` del snapshot de Paimon (el commit atómico posición+snapshot
+  es la misma garantía exactly-once visible).
 - latencia: `timeMillis` del snapshot de Paimon que hace visible la fila menos
   su `event_time` (ETL) o su `window_end` (ventana). Se leen los manifests
   (Avro) y la columna de cada data file nuevo (parquet).
@@ -13,9 +13,12 @@ Mide los dos motores desde afuera y de la misma forma:
   en Flink, el proceso en Tachyon).
 
 Subcomandos:
-  preload  pre-carga un topic con N eventos (una vez; cada corrida lo relee)
-  drain    mide el drenado de un topic pre-cargado
+  preload  pre-carga un topic/stream/cola con N eventos
+  drain    mide el drenado de un backlog pre-cargado
   live     produce a tasa fija y mide latencia de punta a punta
+
+`--source` elige la fuente: redpanda (default), kinesis o sqs (estos dos usan
+floCi en localhost:4566 y el SDK boto3).
 """
 
 import argparse
@@ -31,6 +34,22 @@ import numpy as np
 
 PARTITIONS = 8
 BROKER = "localhost:9092"
+
+# AWS (floCi): el emulador corre en el netns compartido del bench
+# (localhost:4566). Credenciales falsas: floCi no las valida.
+AWS_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+RUN_DIR = "/bench/.run"
+
+
+def aws_client(service):
+    import boto3
+
+    return boto3.Session(
+        region_name=AWS_REGION,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    ).client(service, endpoint_url=AWS_ENDPOINT)
 
 
 def now_ms():
@@ -141,7 +160,15 @@ def create_topic(topic, partitions=PARTITIONS):
 
 
 def cmd_preload(a):
-    create_topic(a.topic)
+    if a.source == "redpanda":
+        create_topic(a.topic)
+        worker, target = _preload_worker, a.topic
+    elif a.source == "kinesis":
+        create_stream(a.stream, a.shards)
+        worker, target = _kinesis_worker, a.stream
+    else:
+        target = create_queue(a.queue)
+        worker = _sqs_worker
     procs = a.procs
     per_part = a.events // PARTITIONS
     base_ms = now_ms() - 3_600_000
@@ -150,15 +177,211 @@ def cmd_preload(a):
     t0 = time.time()
     for w in range(procs):
         parts = [x for x in range(PARTITIONS) if x % procs == w]
-        pr = mp.Process(target=_preload_worker, args=(a.topic, a.kind, parts, per_part, base_ms, q))
+        pr = mp.Process(target=worker, args=(target, a.kind, parts, per_part, base_ms, q))
         pr.start()
         workers.append(pr)
     total = sum(q.get() for _ in workers)
     for pr in workers:
         pr.join()
     dt = time.time() - t0
-    print(json.dumps({"topic": a.topic, "kind": a.kind, "events": total, "secs": round(dt, 1),
-                      "rate": round(total / dt)}))
+    out = {"source": a.source, "kind": a.kind, "events": total, "secs": round(dt, 1),
+           "rate": round(total / dt)}
+    if a.source == "redpanda":
+        out["topic"] = a.topic
+    elif a.source == "kinesis":
+        out["stream"] = a.stream
+        out["shards"] = a.shards
+    else:
+        out["queue"] = a.queue
+    _save_preload_meta(a.source, base_ms, a.events, total)
+    print(json.dumps(out))
+
+
+# --------------------------------------------------------------------------
+# AWS (floCi): Kinesis y SQS
+# --------------------------------------------------------------------------
+
+
+def create_stream(stream, shards):
+    """Stream fresco: borra el anterior (si existe) y espera a que quede ACTIVE."""
+    k = aws_client("kinesis")
+    try:
+        k.delete_stream(StreamName=stream)
+    except k.exceptions.ResourceNotFoundException:
+        pass
+    while True:
+        try:
+            k.describe_stream(StreamName=stream)
+            time.sleep(0.5)
+        except k.exceptions.ResourceNotFoundException:
+            break
+    k.create_stream(StreamName=stream, ShardCount=shards)
+    while k.describe_stream(StreamName=stream)["StreamDescription"]["StreamStatus"] != "ACTIVE":
+        time.sleep(0.5)
+
+
+def create_queue(queue):
+    """Cola fresca: la crea (o reutiliza) y devuelve su URL."""
+    q = aws_client("sqs")
+    return q.create_queue(QueueName=queue)["QueueUrl"]
+
+
+def ensure_stream(stream, shards):
+    """Stream para live: lo crea si no existe y espera ACTIVE. No borra uno
+    existente: borrarlo a mitad de corrida rompe los iteradores del motor."""
+    k = aws_client("kinesis")
+    try:
+        k.describe_stream(StreamName=stream)
+    except k.exceptions.ResourceNotFoundException:
+        k.create_stream(StreamName=stream, ShardCount=shards)
+    while k.describe_stream(StreamName=stream)["StreamDescription"]["StreamStatus"] != "ACTIVE":
+        time.sleep(0.5)
+
+
+def _put_records(k, stream, batch):
+    """PutRecords en lotes de 500; reintenta solo los registros que fallan."""
+    pending = list(batch)
+    while pending:
+        chunk = pending[:500]
+        resp = k.put_records(
+            Records=[{"Data": d, "PartitionKey": pk} for pk, d in chunk],
+            StreamName=stream,
+        )
+        if resp["FailedRecordCount"] == 0:
+            pending = pending[500:]
+        else:
+            pending = [(pk, d) for (pk, d), r in zip(chunk, resp["Records"]) if "ErrorCode" in r] \
+                + pending[500:]
+
+
+def _send_batch(q, queue_url, bodies):
+    """SendMessageBatch en lotes de 10; reintenta solo los que fallan."""
+    pending = list(bodies)
+    while pending:
+        chunk = pending[:10]
+        resp = q.send_message_batch(
+            QueueUrl=queue_url,
+            Entries=[{"Id": str(i), "MessageBody": b} for i, b in enumerate(chunk)],
+        )
+        failed = {f["Id"] for f in resp.get("Failed", [])}
+        if not failed:
+            pending = pending[10:]
+        else:
+            pending = [b for i, b in enumerate(chunk) if str(i) in failed] + pending[10:]
+
+
+def _gen(kind, parts, per_part, base_ms):
+    """Misma fórmula y mismo reparto de particiones que _preload_worker: el
+    conjunto de order_id es idéntico al de Redpanda para los mismos eventos."""
+    for j in range(per_part):
+        for part in parts:
+            if kind == "win":
+                et = base_ms + (j * PARTITIONS * 1000) // WIN_EVENTS_PER_SEC
+            else:
+                et = base_ms + j // 10_000
+            yield payload(kind, j, part, et)
+
+
+def _kinesis_worker(stream, kind, parts, per_part, base_ms, out):
+    k = aws_client("kinesis")
+    sent = 0
+    batch = []
+    for key, value in _gen(kind, parts, per_part, base_ms):
+        batch.append((str(key), value.encode()))
+        sent += 1
+        if len(batch) >= 500:
+            _put_records(k, stream, batch)
+            batch = []
+    if batch:
+        _put_records(k, stream, batch)
+    out.put(sent)
+
+
+def _sqs_worker(queue_url, kind, parts, per_part, base_ms, out):
+    q = aws_client("sqs")
+    sent = 0
+    batch = []
+    for key, value in _gen(kind, parts, per_part, base_ms):
+        batch.append(value)
+        sent += 1
+        if len(batch) >= 10:
+            _send_batch(q, queue_url, batch)
+            batch = []
+    if batch:
+        _send_batch(q, queue_url, batch)
+    out.put(sent)
+
+
+def _kinesis_live_worker(stream, kind, parts, rate_per_part, duration, start_at, out):
+    k = aws_client("kinesis")
+    while time.time() < start_at:
+        time.sleep(0.001)
+    sent = 0
+    j = 0
+    t0 = time.time()
+    end = t0 + duration
+    step = max(1, int(rate_per_part * len(parts) / 1000))  # ~1ms por tramo
+    batch = []
+    while True:
+        now = time.time()
+        if now >= end:
+            break
+        target = int((now - t0) * rate_per_part)
+        if j >= target:
+            time.sleep(0.0005)
+            continue
+        et = now_ms()
+        for _ in range(min(step, target - j + 1)):
+            for part in parts:
+                key, value = payload(kind, j, part, et)
+                batch.append((str(key), value.encode()))
+                sent += 1
+            j += 1
+        if batch:
+            _put_records(k, stream, batch)
+            batch = []
+    if batch:
+        _put_records(k, stream, batch)
+    out.put(sent)
+
+
+def _sqs_live_worker(queue_url, kind, parts, rate_per_part, duration, start_at, out):
+    q = aws_client("sqs")
+    while time.time() < start_at:
+        time.sleep(0.001)
+    sent = 0
+    j = 0
+    t0 = time.time()
+    end = t0 + duration
+    step = max(1, int(rate_per_part * len(parts) / 1000))  # ~1ms por tramo
+    batch = []
+    while True:
+        now = time.time()
+        if now >= end:
+            break
+        target = int((now - t0) * rate_per_part)
+        if j >= target:
+            time.sleep(0.0005)
+            continue
+        et = now_ms()
+        for _ in range(min(step, target - j + 1)):
+            for part in parts:
+                key, value = payload(kind, j, part, et)
+                batch.append(value)
+                sent += 1
+            j += 1
+        if batch:
+            _send_batch(q, queue_url, batch)
+            batch = []
+    if batch:
+        _send_batch(q, queue_url, batch)
+    out.put(sent)
+
+
+def _save_preload_meta(source, base_ms, events, total):
+    os.makedirs(RUN_DIR, exist_ok=True)
+    with open(os.path.join(RUN_DIR, f"preload-{source}.json"), "w") as f:
+        json.dump({"source": source, "base_ms": base_ms, "events": events, "total": total}, f)
 
 
 # --------------------------------------------------------------------------
@@ -168,13 +391,31 @@ def cmd_preload(a):
 
 class Cgroup:
     def __init__(self, container_id):
-        self.path = f"/cg/docker/{container_id}"
-        if not os.path.isdir(self.path):
-            raise SystemExit(f"no encuentro el cgroup {self.path}")
+        self.path = self._find_cgroup(container_id)
+        if self.path is None:
+            raise SystemExit(f"no encuentro el cgroup del contenedor {container_id}")
         self.peak_anon = 0
         self._stop = False
         self._t = threading.Thread(target=self._sample, daemon=True)
         self._t.start()
+
+    @staticmethod
+    def _find_cgroup(container_id):
+        """Ruta del cgroup del contenedor: directa (`/cg/docker/<id>`) o bajo
+        systemd (`/cg/system.slice/docker-<id>.scope`), según el host."""
+        candidates = [
+            f"/cg/docker/{container_id}",
+            f"/cg/system.slice/docker-{container_id}.scope",
+        ]
+        for path in candidates:
+            if os.path.isdir(path):
+                return path
+        # Último recurso: buscar cualquier directorio que contenga el id.
+        for root, dirs, _ in os.walk("/cg"):
+            for d in dirs:
+                if container_id in d or container_id[:12] in d:
+                    return os.path.join(root, d)
+        return None
 
     def cpu_s(self):
         with open(f"{self.path}/cpu.stat") as f:
@@ -205,7 +446,7 @@ class Cgroup:
 
 
 # --------------------------------------------------------------------------
-# Offsets commiteados
+# Progreso commiteado
 # --------------------------------------------------------------------------
 
 
@@ -228,6 +469,28 @@ class Committed:
         except Exception:
             return 0
         return sum(max(tp.offset, 0) for tp in got.topic_partitions)
+
+
+class PaimonProgress:
+    """`totalRecordCount` del último snapshot de una tabla Paimon: filas
+    commiteadas (el commit atómico posición+snapshot es la misma garantía
+    exactly-once visible que los offsets de Kafka). Sirve de señal de progreso
+    para Kinesis/SQS (y para Redpanda, para medir los tres motores a igual)."""
+
+    def __init__(self, table_path):
+        self.table = table_path
+        self._last = 0
+
+    def total(self):
+        sdir = os.path.join(self.table, "snapshot")
+        try:
+            latest = max(int(f.split("-")[1]) for f in os.listdir(sdir)
+                         if f.startswith("snapshot-"))
+            with open(os.path.join(sdir, f"snapshot-{latest}")) as f:
+                self._last = json.load(f)["totalRecordCount"]
+        except (OSError, ValueError, json.JSONDecodeError, KeyError):
+            pass  # escritura en curso o tabla aún vacía: se queda en el último valor
+        return self._last
 
 
 def end_offsets(topic):
@@ -371,8 +634,15 @@ def scrape(url):
 
 def cmd_drain(a):
     cg = Cgroup(a.container)
-    total = end_offsets(a.topic)
-    com = Committed(a.group, a.topic)
+    wait_table(a.table)
+    # Progreso = filas commiteadas en Paimon (igual señal para los tres motores
+    # y las tres fuentes). El backlog es el 90% de los eventos (el ETL filtra
+    # el 10% cancelado).
+    if a.source == "redpanda":
+        total = end_offsets(a.topic) * 9 // 10
+    else:
+        total = a.events * 9 // 10
+    prog = PaimonProgress(a.table)
     t_start = time.time()
     cpu_start = cg.cpu_s()
     samples = []
@@ -380,7 +650,7 @@ def cmd_drain(a):
     deadline = t_start + a.timeout
     first_commit = None
     while time.time() < deadline:
-        c = com.total()
+        c = prog.total()
         t = time.time()
         cpu = cg.cpu_s()
         samples.append((t, c, cpu))
@@ -500,10 +770,18 @@ def cmd_live(a):
     q = mp.Queue()
     procs = []
     per_part = a.rate / PARTITIONS
+    if a.source == "redpanda":
+        worker, target = _live_worker, a.topic
+    elif a.source == "kinesis":
+        ensure_stream(a.stream, a.shards)
+        worker, target = _kinesis_live_worker, a.stream
+    else:
+        target = create_queue(a.queue)
+        worker = _sqs_live_worker
     for w in range(a.procs):
         parts = [x for x in range(PARTITIONS) if x % a.procs == w]
-        pr = mp.Process(target=_live_worker,
-                        args=(a.topic, a.kind, parts, per_part, a.duration, start_at, q))
+        pr = mp.Process(target=worker,
+                        args=(target, a.kind, parts, per_part, a.duration, start_at, q))
         pr.start()
         procs.append(pr)
     time.sleep(max(0, start_at - time.time()))
@@ -535,8 +813,29 @@ def cmd_verify_etl(a):
     import verify
 
     got = verify.rows(a.table)
-    expected = end_offsets(a.topic) * 9 // 10
+    if a.source == "redpanda":
+        expected = end_offsets(a.topic) * 9 // 10
+    else:
+        expected = a.events * 9 // 10
     print(json.dumps({"rows": got["rows"], "expected": expected, "ok": got["rows"] == expected}))
+
+
+def cmd_etl_truth(a):
+    """ETL fila por fila: cada fila contra la fórmula del generador."""
+    import subprocess
+
+    out = subprocess.run(
+        [sys.executable, "/bench/harness/etl_truth.py", a.source, a.table, str(a.events)],
+        capture_output=True, text=True, check=False)
+    line = (out.stdout.strip().splitlines() or ["{}"])[-1]
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        r = {"error": (out.stderr or out.stdout)[-500:]}
+    r["ok"] = (r.get("missing") == 0 and r.get("extra") == 0
+              and r.get("wrong_values") == 0 and r.get("dup_versions") == 0)
+    r.pop("wrong_sample", None)
+    print(json.dumps(r))
 
 
 def cmd_truth_win(a):
@@ -560,15 +859,26 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("preload")
-    p.add_argument("--topic", required=True)
+    p.add_argument("--source", choices=["redpanda", "kinesis", "sqs"], default="redpanda")
+    p.add_argument("--topic", default=None)
+    p.add_argument("--stream", default=None)
+    p.add_argument("--queue", default=None)
     p.add_argument("--kind", choices=["etl", "win"], required=True)
     p.add_argument("--events", type=int, required=True)
     p.add_argument("--procs", type=int, default=4)
+    p.add_argument("--shards", type=int, default=16)
     p.set_defaults(fn=cmd_preload)
     p = sub.add_parser("verify_etl")
     p.add_argument("table")
     p.add_argument("topic")
+    p.add_argument("--source", choices=["redpanda", "kinesis", "sqs"], default="redpanda")
+    p.add_argument("--events", type=int, default=0)
     p.set_defaults(fn=cmd_verify_etl)
+    p = sub.add_parser("etl_truth")
+    p.add_argument("source", choices=["redpanda", "kinesis", "sqs"])
+    p.add_argument("table")
+    p.add_argument("events", type=int)
+    p.set_defaults(fn=cmd_etl_truth)
     p = sub.add_parser("truth_win")
     p.add_argument("topic")
     p.add_argument("table")
@@ -579,7 +889,13 @@ def main():
     p = sub.add_parser("drain")
     p.add_argument("--engine", required=True)
     p.add_argument("--kind", choices=["etl", "win"], required=True)
-    p.add_argument("--topic", required=True)
+    p.add_argument("--source", choices=["redpanda", "kinesis", "sqs"], default="redpanda")
+    p.add_argument("--topic", default=None)
+    p.add_argument("--stream", default=None)
+    p.add_argument("--queue", default=None)
+    p.add_argument("--events", type=int, default=0)
+    p.add_argument("--shards", type=int, default=16)
+    p.add_argument("--table", required=True)
     p.add_argument("--group", required=True)
     p.add_argument("--container", required=True)
     p.add_argument("--timeout", type=float, default=600)
@@ -588,7 +904,11 @@ def main():
     p = sub.add_parser("live")
     p.add_argument("--engine", required=True)
     p.add_argument("--kind", choices=["etl", "win"], required=True)
-    p.add_argument("--topic", required=True)
+    p.add_argument("--source", choices=["redpanda", "kinesis", "sqs"], default="redpanda")
+    p.add_argument("--topic", default=None)
+    p.add_argument("--stream", default=None)
+    p.add_argument("--queue", default=None)
+    p.add_argument("--shards", type=int, default=16)
     p.add_argument("--table", required=True)
     p.add_argument("--container", required=True)
     p.add_argument("--rate", type=int, required=True)

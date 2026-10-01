@@ -1,0 +1,29 @@
+# Ventana de sesión cruzando múltiples servicios (UNION ALL + window).
+# Los branches se unifican y la ventana opera sobre el stream combinado.
+pipeline:
+  name: ${NAME}
+connectors:
+  redpanda:
+    brokers: [localhost:9092]
+  paimon:
+    warehouse: /wh/tachyon
+inputs:
+  - name: service_a
+    topic: ${TOPIC_A}
+    key: order_id
+    schema: /bench/tachyon/schemas/multiwin.json
+  - name: service_b
+    topic: ${TOPIC_B}
+    key: order_id
+    schema: /bench/tachyon/schemas/multiwin.json
+output:
+  name: multiwin_lake
+  table: default.multiwin_lake
+  key: order_id
+  bucket: 8
+  sequence_field: source_version
+deployment:
+  partitions: 8
+  commit_interval: ${COMMIT}
+  metrics:
+    bind_addr: 127.0.0.1:9466

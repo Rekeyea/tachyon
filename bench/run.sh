@@ -20,9 +20,15 @@ LAG_MS="${LAG_MS:-1000}"
 DURATION="${DURATION:-30}"
 TACHYON_BIN="${TACHYON_BIN:-/work/target/benchfast/tachyon}"
 HARNESS_CPUS="${HARNESS_CPUS:-2-3,8-9}"
+SHARDS="${SHARDS:-16}"
+KINESIS_EVENTS="${KINESIS_EVENTS:-60000000}"
+SQS_EVENTS="${SQS_EVENTS:-500000}"
 ncpus() { python3 -c "import sys;s=sys.argv[1];print(sum((int(b)-int(a)+1) if '-' in r else 1 for r in s.split(',') for a,b in [r.split('-') if '-' in r else (r,r)]))" "$1"; }
 PARALLELISM="${PARALLELISM:-$(ncpus "$CPUS")}"
+# NET se elige por fuente en cada rama: redpanda usa el netns de Redpanda;
+# kinesis/sqs usan el de floCi (localhost:4566).
 NET="container:tachyon-redpanda"
+net_for() { [ "$1" = redpanda ] && echo "container:tachyon-redpanda" || echo "container:tachyon-floci"; }
 mkdir -p results .run
 OUT="results/$(date +%Y-%m-%d).jsonl"
 
@@ -52,15 +58,19 @@ stop_engines() {
   docker rm -f bench-flink bench-tachyon >/dev/null 2>&1 || true
 }
 
-start_engine() { # start_engine <engine> <kind> <topic>; exporta CID y GROUP
-  local engine=$1 kind=$2 topic=$3
-  export NAME="bench-$kind-$(date +%s)" TOPIC="$topic" COMMIT LAG_MS PARALLELISM
+start_engine() { # start_engine <engine> <kind> <source>; exporta CID y GROUP
+  local engine=$1 kind=$2 source=$3
+  export NAME="bench-$kind-$(date +%s)" COMMIT LAG_MS PARALLELISM
   stop_engines
   if [ "$engine" = flink ]; then
     export GROUP="flink-$NAME"
-    render "flink/$kind.sql" ".run/job.sql"
+    local tpl="flink/$kind.sql"
+    [ "$source" != redpanda ] && tpl="flink/$kind-$source.sql"
+    render "$tpl" ".run/job.sql"
     CID=$(docker run -d --name bench-flink --network "$NET" --cpuset-cpus "$CPUS" --memory "$MEM" \
-      -v tachyon-bench-wh:/wh -v "$BENCH":/bench --entrypoint bash tachyon-bench-flink \
+      -v tachyon-bench-wh:/wh -v "$BENCH":/bench \
+      -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test \
+      --entrypoint bash tachyon-bench-flink \
       -c 'bin/jobmanager.sh start && bin/taskmanager.sh start && sleep infinity')
     for _ in $(seq 60); do
       docker exec bench-flink curl -sf localhost:18081/overview 2>/dev/null | grep -q '"slots-total":[1-9]' && break
@@ -72,7 +82,9 @@ start_engine() { # start_engine <engine> <kind> <topic>; exporta CID y GROUP
     # Tachyon commitea en un grupo por input: tachyon-<pipeline>-<input>.
     local input; [ "$kind" = etl ] && input=orders || input=events
     export GROUP="tachyon-$NAME-$input"
-    render "tachyon/$kind.yaml" ".run/pipeline.yaml"
+    local tpl="tachyon/$kind.yaml"
+    [ "$source" != redpanda ] && tpl="tachyon/$kind-$source.yaml"
+    render "$tpl" ".run/pipeline.yaml"
     cp "tachyon/$kind.sql" .run/pipeline.sql
     # PROFILE=1: el mismo binario bajo `perf record` (imagen tachyon-prof).
     local image=tachyon-build entry=("$TACHYON_BIN") extra=()
@@ -84,6 +96,7 @@ start_engine() { # start_engine <engine> <kind> <topic>; exporta CID y GROUP
     for v in $(env | grep -o '^TACHYON_DEBUG_[A-Z_]*' || true); do extra+=(-e "$v=1"); done
     CID=$(docker run -d --name bench-tachyon --network "$NET" --cpuset-cpus "$CPUS" --memory "$MEM" \
       ${extra[@]+"${extra[@]}"} -e RUST_LOG="${RUST_LOG:-warn}" -e TACHYON_INSTANCE_ID=bench \
+      -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test \
       -v tachyon-bench-wh:/wh -v "$BENCH":/bench -v tachyon-target:/work/target:ro \
       --entrypoint "${entry[0]}" "$image" "${entry[@]:1}" \
       --config /bench/.run/pipeline.yaml --sql /bench/.run/pipeline.sql)
@@ -92,7 +105,7 @@ start_engine() { # start_engine <engine> <kind> <topic>; exporta CID y GROUP
 }
 
 meta() { # contexto de la corrida para el jsonl
-  python3 -c 'import json,sys,os; r=json.loads(sys.stdin.read()); r.update({"cpus":os.environ["CPUS"],"mem":os.environ["MEM"],"commit":os.environ["COMMIT"],"parallelism":int(os.environ["PARALLELISM"]),"lag_ms":int(os.environ["LAG_MS"]),"tag":os.environ.get("TAG",""),"tachyon_bin":os.environ["TACHYON_BIN"],"ts":int(__import__("time").time())}); print(json.dumps(r))'
+  python3 -c 'import json,sys,os; r=json.loads(sys.stdin.read()); r.update({"source":os.environ.get("SOURCE","redpanda"),"cpus":os.environ["CPUS"],"mem":os.environ["MEM"],"commit":os.environ["COMMIT"],"parallelism":int(os.environ["PARALLELISM"]),"lag_ms":int(os.environ["LAG_MS"]),"tag":os.environ.get("TAG",""),"tachyon_bin":os.environ["TACHYON_BIN"],"ts":int(__import__("time").time())}); print(json.dumps(r))'
 }
 LAG_S=$(python3 -c "print(f'{${LAG_MS}/1000:.3f}')")
 # Líneas extra de `deployment:` para experimentos (p. ej. "  decode_parallelism: 8").
@@ -101,14 +114,39 @@ export CPUS MEM COMMIT PARALLELISM LAG_MS LAG_S TACHYON_EXTRA TACHYON_BIN
 
 case "${1:-}" in
   preload)
-    harness preload --topic bench-etl --kind etl --events "${ETL_EVENTS:-60000000}"
-    harness preload --topic bench-win --kind win --events "${WIN_EVENTS:-60000000}"
+    source="${2:-redpanda}"
+    export SOURCE="$source"
+    NET=$(net_for "$source")
+    case "$source" in
+      redpanda)
+        harness preload --source redpanda --topic bench-etl --kind etl --events "${ETL_EVENTS:-60000000}"
+        harness preload --source redpanda --topic bench-win --kind win --events "${WIN_EVENTS:-60000000}"
+        ;;
+      kinesis)
+        harness preload --source kinesis --stream bench-etl --shards "$SHARDS" --kind etl --events "$KINESIS_EVENTS"
+        ;;
+      sqs)
+        harness preload --source sqs --queue bench-etl --kind etl --events "$SQS_EVENTS"
+        ;;
+    esac
     ;;
   drain)
-    engine=$2 kind=$3
+    engine=$2 kind=$3 source="${4:-redpanda}"
+    export SOURCE="$source"
+    NET=$(net_for "$source")
+    export TOPIC="bench-$kind" STREAM="bench-$kind" QUEUE="bench-$kind"
+    case "$source" in
+      redpanda) EVENTS=0 ;;
+      kinesis) EVENTS="$KINESIS_EVENTS" ;;
+      sqs) EVENTS="$SQS_EVENTS" ;;
+    esac
+    # SQS: cola destructiva -> precarga fresca justo antes del motor.
+    [ "$source" = sqs ] && harness preload --source sqs --queue "$QUEUE" --kind "$kind" --events "$SQS_EVENTS"
     stop_engines; reset_table "$engine" "$kind"
-    start_engine "$engine" "$kind" "bench-$kind"
-    harness drain --engine "$engine" --kind "$kind" --topic "bench-$kind" --group "$GROUP" \
+    start_engine "$engine" "$kind" "$source"
+    harness drain --engine "$engine" --kind "$kind" --source "$source" \
+      --topic "$TOPIC" --stream "$STREAM" --queue "$QUEUE" --events "$EVENTS" \
+      --table "/wh/$engine/default.db/${kind}_lake" --group "$GROUP" \
       --container "$CID" --timeout "${TIMEOUT:-600}" \
       $( [ "$engine" = tachyon ] && echo --metrics http://127.0.0.1:9464/metrics ) | meta > .run/drain.json
     # Deja cerrar el último epoch y verifica la salida: una tasa sin salida
@@ -118,21 +156,33 @@ case "${1:-}" in
     stop_engines
     table="/wh/$engine/default.db/${kind}_lake"
     if [ "$kind" = etl ]; then
-      harness verify_etl "$table" bench-etl > .run/verify.json
+      if [ "$source" = redpanda ]; then
+        harness verify_etl "$table" "$TOPIC" > .run/verify.json
+      else
+        harness etl_truth "$source" "$table" "$EVENTS" > .run/verify.json
+      fi
     else
-      harness truth_win bench-win "$table" > .run/verify.json
+      harness truth_win "$TOPIC" "$table" > .run/verify.json
     fi
     python3 -c 'import json; r=json.load(open(".run/drain.json")); v=json.loads(open(".run/verify.json").read().strip().splitlines()[-1]); r["verify"]=v; print(json.dumps(r))' | tee -a "$OUT"
     ;;
   live)
-    engine=$2 kind=$3 rate=$4
-    topic="bench-live-$kind"
+    engine=$2 kind=$3 rate=$4 source="${5:-redpanda}"
+    export SOURCE="$source"
+    NET=$(net_for "$source")
+    export TOPIC="bench-live-$kind" STREAM="bench-live-$kind" QUEUE="bench-live-$kind"
     stop_engines; reset_table "$engine" "$kind"
-    harness mktopic --topic "$topic"
-    start_engine "$engine" "$kind" "$topic"
+    [ "$source" = redpanda ] && harness mktopic --topic "$TOPIC"
+    # Kinesis/SQS: el motor exige que el stream/queue exista al arrancar.
+    case "$source" in
+      kinesis) harness preload --source kinesis --stream "$STREAM" --shards "$SHARDS" --kind "$kind" --events 0 ;;
+      sqs) harness preload --source sqs --queue "$QUEUE" --kind "$kind" --events 0 ;;
+    esac
+    start_engine "$engine" "$kind" "$source"
     sleep "${WARMUP:-10}"
-    harness live --engine "$engine" --kind "$kind" --topic "$topic" --container "$CID" \
-      --table "/wh/$engine/default.db/${kind}_lake" --rate "$rate" --duration "$DURATION" \
+    harness live --engine "$engine" --kind "$kind" --source "$source" \
+      --topic "$TOPIC" --stream "$STREAM" --queue "$QUEUE" --shards "$SHARDS" \
+      --container "$CID" --table "/wh/$engine/default.db/${kind}_lake" --rate "$rate" --duration "$DURATION" \
       | meta | tee -a "$OUT"
     docker logs "$CID" > ".run/$engine-$kind-live.log" 2>&1 || true
     stop_engines

@@ -1,0 +1,28 @@
+# Todo lo que no está acá lo deriva Tachyon del pin de CPUs del contenedor.
+# Input Kinesis (floCi): un consumidor por stream, todos los shards en paralelo.
+pipeline:
+  name: ${NAME}
+connectors:
+  kinesis:
+    region: us-east-1
+    endpoint: http://localhost:4566   # floCi
+  paimon:
+    warehouse: /wh/tachyon
+inputs:
+  - name: orders
+    kinesis: ${STREAM}
+    key: order_id
+    schema: /bench/tachyon/schemas/etl.json
+    start_from: trim_horizon
+output:
+  name: etl_lake
+  table: default.etl_lake
+  key: order_id
+  bucket: 8
+  sequence_field: source_version
+deployment:
+  partitions: 8
+  commit_interval: ${COMMIT}
+  metrics:
+    bind_addr: 127.0.0.1:9464
+${TACHYON_EXTRA}
