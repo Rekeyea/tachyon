@@ -1,0 +1,30 @@
+pipeline:
+  name: orders-kinesis
+  version: 1
+
+connectors:
+  paimon:
+    warehouse: ./warehouse
+    catalog: local
+  kinesis:
+    region: us-east-1
+    # endpoint: http://localhost:4566   # floCi
+    # profile: mi-perfil-aws            # opcional
+
+inputs:
+  - name: orders
+    kinesis: orders-stream       # nombre del stream
+    key: order_id                # == state key == bucket key
+    schema: json/orders          # schema Arrow (columnas que ve el SQL)
+    start_from: trim_horizon     # trim_horizon | latest (default: latest)
+
+output:
+  name: orders_lake
+  table: default.orders_lake
+  key: order_id
+  bucket: 1
+  sequence_field: source_version
+
+deployment:
+  partitions: 1
+  commit_interval: 5s

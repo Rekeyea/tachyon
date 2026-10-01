@@ -12,25 +12,24 @@ use futures::channel::mpsc;
 use futures::stream::{SelectAll, StreamExt};
 use futures::SinkExt;
 use tachyon_core::SourceOffsets;
-use tachyon_source::OffsetTracker;
 
 use crate::execute::{ensure_passthrough, plan_query, InputSource, StreamTableFactory};
+use crate::run::{InputProgress, InputProgressSource, Progress};
 
-/// Una rama lista para planificar: su `SELECT`, el topic físico y el tracker
-/// que avanza cuando esa fuente emite.
+/// Una rama lista para planificar: su `SELECT` y el mecanismo de progreso de
+/// su input (offsets de topic, posiciones Kinesis o receipts SQS).
 pub(crate) struct UnionSource {
     pub name: String,
     pub sql: String,
-    pub topic: String,
     pub schema: SchemaRef,
-    pub tracker: OffsetTracker,
+    pub progress: InputProgressSource,
 }
 
-/// Fusión justa de las ramas. Cada `next` es un batch de una sola rama y los
-/// offsets que ese batch cubre.
+/// Fusión justa de las ramas. Cada `next` es un batch de una sola rama y el
+/// progreso que ese batch cubre.
 pub(crate) struct UnionFeed {
     schema: SchemaRef,
-    incoming: SelectAll<mpsc::Receiver<Result<(RecordBatch, SourceOffsets)>>>,
+    incoming: SelectAll<mpsc::Receiver<Result<(RecordBatch, Progress)>>>,
     // Abortar las tareas al dropear el feed.
     _tasks: AbortTasks,
 }
@@ -50,7 +49,7 @@ impl UnionFeed {
         self.schema.clone()
     }
 
-    pub(crate) async fn next(&mut self) -> Option<Result<(RecordBatch, SourceOffsets)>> {
+    pub(crate) async fn next(&mut self) -> Option<Result<(RecordBatch, Progress)>> {
         self.incoming.next().await
     }
 
@@ -62,15 +61,15 @@ impl UnionFeed {
         if sources.len() < 2 {
             anyhow::bail!("UNION ALL es un SELECT de una tabla por rama");
         }
-        let mut seen_topics = Vec::new();
+        let mut seen = Vec::new();
         for source in sources {
-            if seen_topics.iter().any(|topic: &String| topic == &source.topic) {
+            if seen.iter().any(|name: &String| name == &source.name) {
                 anyhow::bail!(
-                    "UNION ALL lee el topic '{}' en una sola rama",
-                    source.topic
+                    "UNION ALL lee el input '{}' en una sola rama",
+                    source.name
                 );
             }
-            seen_topics.push(source.topic.clone());
+            seen.push(source.name.clone());
         }
 
         let mut planned = Vec::with_capacity(sources.len());
@@ -105,23 +104,59 @@ impl UnionFeed {
                 .with_context(|| format!("ejecutando la rama '{}'", source.name))?;
             let (tx, rx) = mpsc::channel(1);
             receivers.push(rx);
-            let topic = source.topic.clone();
-            let tracker = source.tracker.clone();
+            let name = source.name.clone();
+            let progress = source.progress.clone();
             tasks.0.push(tokio::spawn(async move {
                 let mut stream = stream;
                 let mut tx = tx;
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(batch) => {
-                            // Un batch vacío ya avanzó el tracker (la fila se
-                            // filtró). El próximo batch con filas arrastra ese
-                            // offset; no se publica solo.
-                            if batch.num_rows() == 0 {
-                                continue;
-                            }
-                            let mut covered = SourceOffsets::new();
-                            covered.insert(topic.clone(), tracker.snapshot());
-                            if tx.send(Ok((batch, covered))).await.is_err() {
+                            let progress = match &progress {
+                                InputProgressSource::Offsets { topic, tracker } => {
+                                    // Un batch vacío ya avanzó el tracker (la
+                                    // fila se filtró). El próximo batch con
+                                    // filas arrastra ese offset; no se publica
+                                    // solo.
+                                    if batch.num_rows() == 0 {
+                                        continue;
+                                    }
+                                    let mut covered = SourceOffsets::new();
+                                    covered.insert(topic.clone(), tracker.snapshot());
+                                    InputProgress::Offsets(covered)
+                                }
+                                InputProgressSource::Positions(tracker) => {
+                                    if batch.num_rows() == 0 {
+                                        continue;
+                                    }
+                                    InputProgress::Positions(tracker.snapshot())
+                                }
+                                InputProgressSource::Receipts { queue, out } => {
+                                    // El pop va antes del skip: el stream
+                                    // publica un lote de receipts por batch
+                                    // emitido, filtro o no.
+                                    let handles = out
+                                        .lock()
+                                        .expect("lock de receipts")
+                                        .pop_front()
+                                        .unwrap_or_default();
+                                    InputProgress::Receipts {
+                                        queue: queue.clone(),
+                                        handles,
+                                    }
+                                }
+                            };
+                            if tx
+                                .send(Ok((
+                                    batch,
+                                    Progress::Input {
+                                        name: name.clone(),
+                                        progress,
+                                    },
+                                )))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -168,6 +203,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::physical_plan::streaming::PartitionStream;
     use datafusion::physical_plan::SendableRecordBatchStream;
+    use tachyon_source::OffsetTracker;
     use tachyon_sql::parse_sql;
 
     struct OnceBatch {
@@ -240,9 +276,11 @@ mod tests {
         UnionSource {
             name: name.to_string(),
             sql: sql.to_string(),
-            topic: topic.to_string(),
             schema: schema(),
-            tracker: OffsetTracker::new(),
+            progress: InputProgressSource::Offsets {
+                topic: topic.to_string(),
+                tracker: OffsetTracker::new(),
+            },
         }
     }
 
@@ -290,7 +328,14 @@ mod tests {
             .expect("feed");
         let mut rows = Vec::new();
         while let Some(item) = feed.next().await {
-            let (batch, offsets) = item.expect("batch");
+            let (batch, progress) = item.expect("batch");
+            let Progress::Input {
+                progress: InputProgress::Offsets(offsets),
+                ..
+            } = progress
+            else {
+                panic!("el batch de una rama de topic trae offsets");
+            };
             assert_eq!(offsets.len(), 1, "el batch cubre una sola rama: {offsets:?}");
             let topic = offsets.keys().next().expect("topic").clone();
             let ids = ids_of(&batch);

@@ -19,4 +19,7 @@ pub use checkpoint::{
 pub use error::Error;
 pub use frontier::{Frontier, OffsetRange};
 pub use plan::{OutputDef, PipelinePlan};
-pub use types::{Column, PartitionKey, SourceOffsets, StreamDef};
+pub use types::{
+    Column, InputPosition, InputPositions, PartitionKey, SourceOffsets, StreamDef,
+    kinesis_seq_le, kafka_offsets, merge_positions,
+};

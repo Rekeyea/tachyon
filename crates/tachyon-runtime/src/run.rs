@@ -35,19 +35,25 @@ use datafusion::physical_plan::streaming::PartitionStream;
 use futures::StreamExt;
 use rdkafka::consumer::Consumer;
 use rdkafka::ClientConfig;
-use tachyon_config::{parse_fixed_duration, PayloadFormat, PipelineConfig};
-use tachyon_core::{CheckpointBody, SourceOffsets};
+use tachyon_config::{
+    parse_fixed_duration, InputKind, PayloadFormat, PipelineConfig, StartFrom,
+};
+use tachyon_core::{
+    CheckpointBody, InputPosition, InputPositions, SourceOffsets, kafka_offsets, merge_positions,
+};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
 use tachyon_sink::redpanda::RedpandaSink;
 use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, PartitionTickets, Recovered};
 use tachyon_source::consumer::{CopiedCursor, LotRanges, RdkafkaSource};
+use tachyon_source::kinesis::{KinesisSource, LotPositions, StartPosition};
+use tachyon_source::sqs::SqsSource;
+use tachyon_source::stream::{OffsetTracker, PositionTracker, ReceiptsOut, RedpandaPartitionStream};
 use tachyon_source::{StateRequest, WindowHandoff};
 use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
 use tachyon_source::{
     arrow_from_avro, avro_json_from_arrow, encode_envelopes, latest_topic_schema,
     register_topic_schema, SchemaCache,
 };
-use tachyon_source::stream::{OffsetTracker, RedpandaPartitionStream};
 use tachyon_sql::{LookupJoin, UnionBranch, WindowShape};
 
 use crate::budget::StatelessBudget;
@@ -63,12 +69,70 @@ use crate::window::{
 use crate::window_shards::ShardedWindow;
 
 /// Qué offsets cubre un batch que llega al writer.
-enum Progress {
+pub(crate) enum Progress {
     /// Todo lo que las fuentes emitieron hasta este batch (un solo stream).
     Snapshot(SourceOffsets),
     /// Los tramos exactos que cubre el batch de un carril.
     Ranges(Vec<tachyon_core::OffsetRange>),
+    /// Progreso de un input en una pipeline mixta (topic/kinesis/sqs).
+    Input { name: String, progress: InputProgress },
 }
+
+/// Progreso que publica un input por batch.
+pub(crate) enum InputProgress {
+    /// Topic: próximo offset por partición del topic de la rama.
+    Offsets(SourceOffsets),
+    /// Kinesis: último sequence number emitido por shard.
+    Positions(BTreeMap<String, String>),
+    /// SQS: receipt handles de los mensajes del batch.
+    Receipts { queue: String, handles: Vec<String> },
+}
+
+/// Dónde publica cada input su progreso (nombre lógico -> mecanismo).
+#[derive(Clone)]
+pub(crate) enum InputProgressSource {
+    Offsets { topic: String, tracker: OffsetTracker },
+    Positions(PositionTracker),
+    Receipts { queue: String, out: ReceiptsOut },
+}
+
+/// Salida de un carril hacia el writer: rangos de topic o receipts SQS.
+#[derive(Clone)]
+enum LaneOutput {
+    Ranges(tachyon_source::LaneRanges),
+    Receipts { queue: String, out: ReceiptsOut },
+}
+
+/// Carril de receipts SQS fresco (uno por batch emitido, FIFO).
+fn fresh_receipts() -> ReceiptsOut {
+    Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// Fuente de un input para la factory (una por nombre lógico).
+#[derive(Clone)]
+enum InputSources {
+    Topic {
+        sources: Vec<Arc<RdkafkaSource>>,
+        tracker: OffsetTracker,
+        format: DecodeFormat,
+        lane_lots: Vec<LotRanges>,
+    },
+    Kinesis {
+        source: Arc<KinesisSource>,
+        tracker: PositionTracker,
+        format: DecodeFormat,
+    },
+    Sqs {
+        sources: Vec<Arc<SqsSource>>,
+        format: DecodeFormat,
+        /// Carril de receipts del modo fusionado (select_all). En carriles
+        /// cada lane tiene el suyo (ver `LaneOutput::Receipts`).
+        receipts: ReceiptsOut,
+    },
+}
+
+/// Espera del long polling SQS cuando la config no fija `receive_wait`.
+const SQS_DEFAULT_WAIT: Duration = Duration::from_secs(20);
 
 /// Fusiona `update` en `offsets` (máximo por partición: el progreso nunca
 /// retrocede).
@@ -307,9 +371,9 @@ pub(crate) fn source_client_config(
     config: &PipelineConfig,
     group_id: &str,
     budget: &StatelessBudget,
-) -> ClientConfig {
+) -> Result<ClientConfig> {
     let mut cc = ClientConfig::new();
-    cc.set("bootstrap.servers", config.connectors.redpanda.brokers.join(","));
+    cc.set("bootstrap.servers", config.redpanda()?.brokers.join(","));
     cc.set("group.id", group_id);
     cc.set("auto.offset.reset", "earliest");
     cc.set("enable.auto.commit", "false");
@@ -342,7 +406,7 @@ pub(crate) fn source_client_config(
         "queued.max.messages.kbytes",
         budget.queued_max_kbytes.to_string(),
     );
-    if let Some(sec) = &config.connectors.redpanda.security {
+    if let Some(sec) = &config.redpanda()?.security {
         if let Some(mech) = &sec.sasl_mechanism {
             cc.set("sasl.mechanism", mech);
         }
@@ -353,7 +417,7 @@ pub(crate) fn source_client_config(
             cc.set("sasl.password", pass);
         }
     }
-    cc
+    Ok(cc)
 }
 
 /// Schema Arrow de un input y la codificación de los bytes del topic.
@@ -482,9 +546,20 @@ pub(crate) async fn run_pipeline_with_lookup(
         .with_commit_user(&options.commit_user)
         .context("fijando el commit_user del sink")?;
     let recovered = sink.recover().await.context("recuperando el último checkpoint")?;
-    let (resume, restored_window) = match (&recovered, window) {
-        (Recovered::None, _) => (None, None),
-        (Recovered::PassThrough { offsets, .. }, None) => (Some(offsets.clone()), None),
+    let (resume, resume_positions, restored_window) = match (&recovered, window) {
+        (Recovered::None, _) => (None, None, None),
+        (Recovered::PassThrough { offsets, .. }, None) => (Some(offsets.clone()), None, None),
+        (Recovered::Positions { positions, .. }, None) => (
+            Some(kafka_offsets(positions)),
+            Some(positions.clone()),
+            None,
+        ),
+        (Recovered::Positions { identifier, .. }, Some(_)) => {
+            anyhow::bail!(
+                "checkpoint {identifier} de '{}' es de inputs mixtos y el plan es de ventana; se rechaza",
+                options.commit_user
+            );
+        }
         (Recovered::PassThrough { identifier, .. }, Some(_)) => {
             anyhow::bail!(
                 "checkpoint {identifier} de '{}' es pass-through y el plan es de ventana; se rechaza",
@@ -513,7 +588,7 @@ pub(crate) async fn run_pipeline_with_lookup(
                     options.commit_user
                 );
             }
-            (Some(checkpoint.applied.clone()), Some(checkpoint.clone()))
+            (Some(checkpoint.applied.clone()), None, Some(checkpoint.clone()))
         }
     };
     let resume = resume;
@@ -531,14 +606,24 @@ pub(crate) async fn run_pipeline_with_lookup(
     let mut trackers: Vec<(String, OffsetTracker)> = Vec::new();
     let mut inputs: Vec<InputSource> = Vec::new();
     let mut input_topics: Vec<(String, String)> = Vec::new();
-    let mut name_to_sources: std::collections::HashMap<
-        String,
-        (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat, Vec<LotRanges>),
-    > = std::collections::HashMap::new();
+    let mut progress_sources: Vec<(String, InputProgressSource)> = Vec::new();
+    let mut sqs_deleters: Vec<(aws_sdk_sqs::Client, String)> = Vec::new();
+    let mut name_to_sources: std::collections::HashMap<String, InputSources> =
+        std::collections::HashMap::new();
     let mut window_handoff: Option<Arc<WindowHandoff>> = None;
     let (adopt_tx, adopt_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut adopt_rx = if window.is_some() { Some(adopt_rx) } else { None };
-    let cc = source_client_config(config, &options.group_id, &budget);
+    // El client de Redpanda solo se necesita si hay algún input de topic;
+    // una pipeline de kinesis/sqs no declara connectors.redpanda.
+    let cc = if config
+        .inputs
+        .iter()
+        .any(|input| input.kind() == InputKind::Topic)
+    {
+        Some(source_client_config(config, &options.group_id, &budget)?)
+    } else {
+        None
+    };
     // Ventana y pass-through usan el mismo presupuesto: min(particiones, CPUs)
     // salvo override. El handoff evita aplicar dos veces una partición que
     // cambia de consumidor dentro del proceso.
@@ -556,6 +641,19 @@ pub(crate) async fn run_pipeline_with_lookup(
         }
         _ => None,
     };
+    if let Some(prepared) = &prepared_lookup {
+        let fact_kind = config
+            .inputs
+            .iter()
+            .find(|input| input.name == prepared.fact)
+            .map(|input| input.kind());
+        if fact_kind != Some(InputKind::Topic) {
+            anyhow::bail!(
+                "el lookup enriquece un input de topic; '{}' es kinesis o sqs",
+                prepared.fact
+            );
+        }
+    }
     let planned_sql = if let Some(shape) = window {
         shape.rewrite_sql()
     } else if let Some(prepared) = &prepared_lookup {
@@ -573,8 +671,9 @@ pub(crate) async fn run_pipeline_with_lookup(
     let use_lanes = union_branches.is_none()
         && prepared_lookup.is_none()
         && config.inputs.len() == 1
-        && n_consumers > 1;
-    let mut lane_outs: Vec<tachyon_source::LaneRanges> = Vec::new();
+        && n_consumers > 1
+        && matches!(config.inputs[0].kind(), InputKind::Topic | InputKind::Sqs);
+    let mut lane_outs: Vec<LaneOutput> = Vec::new();
     // Ventana: cada carril lleva su propio tracker (lo que emitió); el
     // handoff impide que un carril se adelante a otro en una partición.
     let lane_trackers: Vec<OffsetTracker> = if use_lanes && window.is_some() {
@@ -601,116 +700,252 @@ pub(crate) async fn run_pipeline_with_lookup(
             format = ?input_def.format,
             "codec del input"
         );
-        let topic = input_def.kafka_topic()?.to_string();
-        input_topics.push((input_def.name.clone(), topic.clone()));
         let schema = input_table_schema(
             prepared.schema.clone(),
             &input_def.name,
             window.is_some(),
             &prepared_lookup,
         )?;
+        match input_def.kind() {
+            InputKind::Topic => {
+                let topic = input_def.kafka_topic()?.to_string();
+                input_topics.push((input_def.name.clone(), topic.clone()));
 
-        let source_group = format!("{}-{}", options.group_id, input_def.name);
-        let mut source_cc = cc.clone();
-        source_cc.set("group.id", &source_group);
-        let handoff = if window.is_some() {
-            source_cc.set("session.timeout.ms", session_timeout_ms.to_string());
-            // Fin del log por partición: el watermark no deja idle a una
-            // partición que todavía tiene backlog.
-            source_cc.set("enable.partition.eof", "true");
-            let topic_applied = restored_window
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.applied.get(&topic))
-                .cloned()
-                .unwrap_or_default();
-            let gate = match &restored_window {
-                Some(checkpoint) => Arc::new(WindowHandoff::restored(
-                    &source_group,
-                    &topic,
-                    &options.commit_user,
-                    checkpoint.commit_identifier,
-                    topic_applied,
-                )),
-                None => Arc::new(WindowHandoff::starting(
-                    &source_group,
-                    &topic,
-                    &options.commit_user,
-                )),
-            };
-            gate.bind_state_bus(adopt_tx.clone());
-            window_handoff = Some(gate.clone());
-            // El id estático incluye el commit_user: dos procesos en la misma
-            // máquina no se pisan el membership, y un restart del mismo
-            // proceso conserva el id.
-            let ids: Vec<String> = (0..n_consumers)
-                .map(|index| format!("{}-{index}", options.commit_user))
-                .collect();
-            tracing::info!(
-                input = %input_def.name,
-                group = %source_group,
-                session_timeout_ms,
-                instances = ?ids,
-                "ventana: un operador y N consumidores"
-            );
-            Some(gate)
-        } else {
-            None
-        };
-        // Cada consumidor recibe el mapa completo del checkpoint: el filtro de
-        // resume ignora las particiones que no le asigna el grupo.
-        let topic_resume = resume
-            .as_ref()
-            .and_then(|r| r.get(&topic))
-            .cloned()
-            .unwrap_or_default();
-        // Pass-through: los N consumidores del topic comparten lo copiado,
-        // así un rebalance entre ellos no relee (ver `CopiedCursor`).
-        let copied = CopiedCursor::new();
-        let lane_lots: Vec<LotRanges> = if use_lanes {
-            lane_cursor = Some((topic.clone(), copied.clone()));
-            (0..n_consumers).map(|_| LotRanges::new()).collect()
-        } else {
-            Vec::new()
-        };
-        let input_sources: Vec<Arc<RdkafkaSource>> = (0..n_consumers)
-            .map(|index| -> Result<Arc<RdkafkaSource>> {
-                let mut consumer_cc = source_cc.clone();
+                let source_group = format!("{}-{}", options.group_id, input_def.name);
+                let cc = cc
+                    .as_ref()
+                    .expect("un input de topic requiere connectors.redpanda");
+                let mut source_cc = cc.clone();
+                source_cc.set("group.id", &source_group);
+                let handoff = if window.is_some() {
+                    source_cc.set("session.timeout.ms", session_timeout_ms.to_string());
+                    // Fin del log por partición: el watermark no deja idle a una
+                    // partición que todavía tiene backlog.
+                    source_cc.set("enable.partition.eof", "true");
+                    let topic_applied = restored_window
+                        .as_ref()
+                        .and_then(|checkpoint| checkpoint.applied.get(&topic))
+                        .cloned()
+                        .unwrap_or_default();
+                    let gate = match &restored_window {
+                        Some(checkpoint) => Arc::new(WindowHandoff::restored(
+                            &source_group,
+                            &topic,
+                            &options.commit_user,
+                            checkpoint.commit_identifier,
+                            topic_applied,
+                        )),
+                        None => Arc::new(WindowHandoff::starting(
+                            &source_group,
+                            &topic,
+                            &options.commit_user,
+                        )),
+                    };
+                    gate.bind_state_bus(adopt_tx.clone());
+                    window_handoff = Some(gate.clone());
+                    // El id estático incluye el commit_user: dos procesos en la
+                    // misma máquina no se pisan el membership, y un restart del
+                    // mismo proceso conserva el id.
+                    let ids: Vec<String> = (0..n_consumers)
+                        .map(|index| format!("{}-{index}", options.commit_user))
+                        .collect();
+                    tracing::info!(
+                        input = %input_def.name,
+                        group = %source_group,
+                        session_timeout_ms,
+                        instances = ?ids,
+                        "ventana: un operador y N consumidores"
+                    );
+                    Some(gate)
+                } else {
+                    None
+                };
+                // Cada consumidor recibe el mapa completo del checkpoint: el
+                // filtro de resume ignora las particiones que no le asigna el
+                // grupo.
+                let topic_resume = resume
+                    .as_ref()
+                    .and_then(|r| r.get(&topic))
+                    .cloned()
+                    .unwrap_or_default();
+                // Pass-through: los N consumidores del topic comparten lo
+                // copiado, así un rebalance entre ellos no relee (ver
+                // `CopiedCursor`).
+                let copied = CopiedCursor::new();
+                let lane_lots: Vec<LotRanges> = if use_lanes {
+                    lane_cursor = Some((topic.clone(), copied.clone()));
+                    (0..n_consumers).map(|_| LotRanges::new()).collect()
+                } else {
+                    Vec::new()
+                };
+                let input_sources: Vec<Arc<RdkafkaSource>> = (0..n_consumers)
+                    .map(|index| -> Result<Arc<RdkafkaSource>> {
+                        let mut consumer_cc = source_cc.clone();
+                        if window.is_some() {
+                            // KIP-345: un id distinto por miembro. No va en el
+                            // config compartido, porque el segundo join con el
+                            // mismo id echa al primero.
+                            consumer_cc.set(
+                                "group.instance.id",
+                                format!("{}-{index}", options.commit_user),
+                            );
+                        }
+                        let mut source = RdkafkaSource::new(&consumer_cc, &topic)
+                            .with_context(|| format!("creando source para '{}'", input_def.name))?
+                            .with_max_batch(budget.batch_size)
+                            .with_resume_offsets(topic_resume.clone());
+                        if let Some(gate) = &handoff {
+                            source = source.with_window_handoff(gate.clone());
+                        } else {
+                            source = source.with_copied_cursor(copied.clone());
+                            if let Some(lots) = lane_lots.get(index) {
+                                source = source.with_lot_ranges(lots.clone());
+                            }
+                        }
+                        Ok(Arc::new(source))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let tracker = OffsetTracker::new();
+                commit_sources.push((topic.clone(), input_sources[0].clone()));
+                trackers.push((topic.clone(), tracker.clone()));
+                if use_lanes {
+                    // En ventana no se leen (el carril usa su tracker), pero el
+                    // zip de la factory recorre uno por consumidor.
+                    lane_outs = (0..n_consumers)
+                        .map(|_| LaneOutput::Ranges(Default::default()))
+                        .collect();
+                }
+                name_to_sources.insert(
+                    input_def.name.clone(),
+                    InputSources::Topic {
+                        sources: input_sources,
+                        tracker: tracker.clone(),
+                        format: prepared.format,
+                        lane_lots,
+                    },
+                );
+                progress_sources.push((
+                    input_def.name.clone(),
+                    InputProgressSource::Offsets {
+                        topic: topic.clone(),
+                        tracker,
+                    },
+                ));
+            }
+            InputKind::Kinesis => {
                 if window.is_some() {
-                    // KIP-345: un id distinto por miembro. No va en el config
-                    // compartido, porque el segundo join con el mismo id echa
-                    // al primero.
-                    consumer_cc.set(
-                        "group.instance.id",
-                        format!("{}-{index}", options.commit_user),
+                    anyhow::bail!(
+                        "una ventana lee un topic; el input '{}' es kinesis",
+                        input_def.name
                     );
                 }
-                let mut source = RdkafkaSource::new(&consumer_cc, &topic)
-                    .with_context(|| format!("creando source para '{}'", input_def.name))?
-                    .with_max_batch(budget.batch_size)
-                    .with_resume_offsets(topic_resume.clone());
-                if let Some(gate) = &handoff {
-                    source = source.with_window_handoff(gate.clone());
-                } else {
-                    source = source.with_copied_cursor(copied.clone());
-                    if let Some(lots) = lane_lots.get(index) {
-                        source = source.with_lot_ranges(lots.clone());
-                    }
+                let kinesis_cfg = config
+                    .connectors
+                    .kinesis
+                    .as_ref()
+                    .context("kinesis requiere connectors.kinesis.region")?;
+                let client = crate::aws::kinesis_client(kinesis_cfg).await?;
+                let stream_name = input_def
+                    .kinesis_stream()
+                    .expect("la validación garantiza un stream")
+                    .to_string();
+                let start_from = match input_def.start_from {
+                    Some(StartFrom::TrimHorizon) => StartPosition::TrimHorizon,
+                    _ => StartPosition::Latest,
+                };
+                let mut source =
+                    KinesisSource::new(client, &stream_name, start_from)
+                        .with_max_batch(budget.batch_size);
+                if let Some(resume_seq) = resume_positions
+                    .as_ref()
+                    .and_then(|positions| positions.get(&input_def.name))
+                    .and_then(|position| match position {
+                        InputPosition::Kinesis(map) => Some(map.clone()),
+                        _ => None,
+                    })
+                {
+                    source = source.with_resume_positions(resume_seq);
                 }
-                Ok(Arc::new(source))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let tracker = OffsetTracker::new();
-        commit_sources.push((topic.clone(), input_sources[0].clone()));
-        trackers.push((topic.clone(), tracker.clone()));
-        if use_lanes {
-            // En ventana no se leen (el carril usa su tracker), pero el zip
-            // de la factory recorre uno por consumidor.
-            lane_outs = (0..n_consumers).map(|_| Default::default()).collect();
+                let tracker = PositionTracker::new();
+                name_to_sources.insert(
+                    input_def.name.clone(),
+                    InputSources::Kinesis {
+                        source: Arc::new(source),
+                        tracker: tracker.clone(),
+                        format: prepared.format,
+                    },
+                );
+                progress_sources.push((
+                    input_def.name.clone(),
+                    InputProgressSource::Positions(tracker),
+                ));
+            }
+            InputKind::Sqs => {
+                if window.is_some() {
+                    anyhow::bail!(
+                        "una ventana lee un topic; el input '{}' es sqs",
+                        input_def.name
+                    );
+                }
+                let sqs_cfg = config
+                    .connectors
+                    .sqs
+                    .as_ref()
+                    .context("sqs requiere connectors.sqs.region")?;
+                let client = crate::aws::sqs_client(sqs_cfg).await?;
+                let queue = crate::aws::queue_url(
+                    &client,
+                    input_def.sqs_queue().expect("la validación garantiza una cola"),
+                )
+                .await?;
+                let wait = input_def
+                    .receive_wait
+                    .as_deref()
+                    .map(parse_fixed_duration)
+                    .transpose()?
+                    .map(|ms| Duration::from_millis(ms as u64))
+                    .unwrap_or(SQS_DEFAULT_WAIT);
+                // El visibility timeout supera el intervalo de commit: un
+                // mensaje que vuelve a ser visible antes del commit se consume
+                // dos veces y el sink lo deduplica (PK + sequence.field).
+                let visibility = options.commit_interval + Duration::from_secs(60);
+                let source = SqsSource::new(client.clone(), &queue, wait)
+                    .with_visibility_timeout(visibility);
+                let sources: Vec<Arc<SqsSource>> =
+                    (0..n_consumers).map(|_| Arc::new(source.clone())).collect();
+                let receipts = fresh_receipts();
+                if use_lanes {
+                    lane_outs = (0..n_consumers)
+                        .map(|_| LaneOutput::Receipts {
+                            queue: queue.clone(),
+                            out: fresh_receipts(),
+                        })
+                        .collect();
+                }
+                name_to_sources.insert(
+                    input_def.name.clone(),
+                    InputSources::Sqs {
+                        sources,
+                        format: prepared.format,
+                        receipts: receipts.clone(),
+                    },
+                );
+                progress_sources.push((
+                    input_def.name.clone(),
+                    InputProgressSource::Receipts {
+                        queue: queue.clone(),
+                        out: receipts,
+                    },
+                ));
+                sqs_deleters.push((client, queue));
+            }
+            InputKind::Table => {
+                anyhow::bail!(
+                    "el input '{}' es una tabla Paimon y no entra al loop de streaming",
+                    input_def.name
+                );
+            }
         }
-        name_to_sources.insert(
-            input_def.name.clone(),
-            (input_sources, tracker, prepared.format, lane_lots),
-        );
         inputs.push(InputSource {
             name: input_def.name.clone(),
             schema: schema.clone(),
@@ -728,83 +963,202 @@ pub(crate) async fn run_pipeline_with_lookup(
     let factory_outs = lane_outs.clone();
     let factory_trackers = lane_trackers.clone();
     let factory: Box<StreamTableFactory> = Box::new(move |name, schema| {
-        let (input_sources, tracker, format, lane_lots) = name_to_sources
+        let entry = name_to_sources
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("source no encontrado para '{name}'"))?;
         let (decode_schema, inner_schema, row_partitions) =
             decode_plan(&schema, &prepared_lookup, name);
-        let decoder = Decoder::new(decode_schema, format);
-        if factory_lanes.load(std::sync::atomic::Ordering::SeqCst) {
-            // Una partición por consumidor. Dos decodes en vuelo por carril:
-            // mientras uno decodifica, el loop junta el lote siguiente.
-            let per_lane = (decode_parallelism / input_sources.len().max(1)).max(2);
-            let lane_trackers = factory_trackers.clone();
-            let partitions: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>> =
-                input_sources
-                    .iter()
-                    .zip(lane_lots.iter())
-                    .zip(factory_outs.iter())
-                    .enumerate()
-                    .map(|(index, ((source, lots), out))| {
-                        let source = source.clone();
-                        let make_stream: Arc<dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync> =
-                            Arc::new(move || source.record_stream());
-                        let lane = RedpandaPartitionStream::new(
-                            index as i32,
-                            inner_schema.clone(),
-                            decoder.clone(),
-                            batch_size,
-                            make_stream,
-                        )
-                        .with_decode_parallelism(per_lane)
-                        .with_row_partitions(row_partitions);
-                        let lane = match lane_trackers.get(index) {
-                            Some(tracker) => lane.with_offset_tracker(tracker.clone()),
-                            None => lane.with_lane(lots.clone(), out.clone()),
-                        };
-                        Arc::new(lane) as Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
-                    })
-                    .collect();
-            let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
+        match entry {
+            InputSources::Topic {
+                sources,
+                tracker,
+                format,
+                lane_lots,
+            } => {
+                let decoder = Decoder::new(decode_schema, format);
+                if factory_lanes.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Una partición por consumidor. Dos decodes en vuelo por
+                    // carril: mientras uno decodifica, el loop junta el lote
+                    // siguiente.
+                    let per_lane = (decode_parallelism / sources.len().max(1)).max(2);
+                    let lane_trackers = factory_trackers.clone();
+                    let partitions: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>> =
+                        sources
+                            .iter()
+                            .zip(lane_lots.iter())
+                            .zip(factory_outs.iter())
+                            .enumerate()
+                            .map(|(index, ((source, lots), out))| {
+                                let source = source.clone();
+                                let make_stream: Arc<dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync> =
+                                    Arc::new(move || source.record_stream());
+                                let lane = RedpandaPartitionStream::new(
+                                    index as i32,
+                                    inner_schema.clone(),
+                                    decoder.clone(),
+                                    batch_size,
+                                    make_stream,
+                                )
+                                .with_decode_parallelism(per_lane)
+                                .with_row_partitions(row_partitions);
+                                let lane = match lane_trackers.get(index) {
+                                    Some(tracker) => lane.with_offset_tracker(tracker.clone()),
+                                    None => {
+                                        let LaneOutput::Ranges(out) = out else {
+                                            unreachable!("un carril de topic publica rangos")
+                                        };
+                                        lane.with_lane(lots.clone(), out.clone())
+                                    }
+                                };
+                                Arc::new(lane) as Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
+                            })
+                            .collect();
+                    let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
+                        .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+                    return Ok(Arc::new(table.with_infinite_table(true)));
+                }
+                for source in &sources {
+                    source.drop_lot_ranges();
+                }
+                // Un `record_stream()` por consumidor, fusionados con
+                // `select_all`: el grupo reparte las particiones entre ellos y
+                // cada instancia drena su propio buffer de fetch en paralelo.
+                // La factory se invoca una vez por ejecución, así que cada
+                // consumidor se `take()`a una vez.
+                let make_stream = Arc::new(move || {
+                    let streams: Vec<tachyon_source::consumer::RecordStream> = sources
+                        .iter()
+                        .map(|s| s.record_stream())
+                        .collect();
+                    // Coerción explícita a `RecordStream` (el `SelectAll`
+                    // concreto no se coercea solo a `Pin<Box<dyn Stream>>` en
+                    // posición de retorno).
+                    let merged: tachyon_source::consumer::RecordStream =
+                        Box::pin(futures::stream::select_all(streams));
+                    merged
+                });
+                let inner = RedpandaPartitionStream::new(
+                    0,
+                    inner_schema,
+                    decoder,
+                    batch_size,
+                    make_stream,
+                )
+                .with_offset_tracker(tracker)
+                .with_decode_parallelism(decode_parallelism)
+                .with_row_partitions(row_partitions);
+                let ps = as_partition(inner, &prepared_lookup, name);
+                let table = datafusion::catalog::streaming::StreamingTable::try_new(
+                    schema,
+                    vec![ps],
+                )
                 .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
-            return Ok(Arc::new(table.with_infinite_table(true)));
+                Ok(Arc::new(table.with_infinite_table(true)))
+            }
+            InputSources::Kinesis {
+                source,
+                tracker,
+                format,
+            } => {
+                let decoder = Decoder::new(decode_schema, format);
+                // Un consumidor por stream: el poll loop lee todos los shards
+                // en paralelo y las posiciones llegan por lote en
+                // `LotPositions` (ver `tachyon-source::kinesis`).
+                let positions = LotPositions::new();
+                let owned = (*source).clone().with_lot_positions(positions.clone());
+                let make_stream: Arc<dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync> =
+                    Arc::new(move || owned.record_stream());
+                let inner = RedpandaPartitionStream::new(
+                    0,
+                    inner_schema,
+                    decoder,
+                    batch_size,
+                    make_stream,
+                )
+                .with_position_tracker(tracker, positions)
+                .with_decode_parallelism(decode_parallelism)
+                .with_row_partitions(row_partitions);
+                let table = datafusion::catalog::streaming::StreamingTable::try_new(
+                    schema,
+                    vec![Arc::new(inner)],
+                )
+                .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+                Ok(Arc::new(table.with_infinite_table(true)))
+            }
+            InputSources::Sqs {
+                sources,
+                format,
+                receipts,
+                ..
+            } => {
+                let decoder = Decoder::new(decode_schema, format);
+                if factory_lanes.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Un consumidor por carril; cada carril publica sus
+                    // receipts en su propio `ReceiptsOut`.
+                    let per_lane = (decode_parallelism / sources.len().max(1)).max(2);
+                    let partitions: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>> =
+                        sources
+                            .iter()
+                            .enumerate()
+                            .map(|(index, source)| {
+                                let source = source.clone();
+                                let make_stream: Arc<dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync> =
+                                    Arc::new(move || source.record_stream());
+                                let lane = RedpandaPartitionStream::new(
+                                    index as i32,
+                                    inner_schema.clone(),
+                                    decoder.clone(),
+                                    batch_size,
+                                    make_stream,
+                                )
+                                .with_decode_parallelism(per_lane)
+                                .with_row_partitions(row_partitions);
+                                let lane = match &factory_outs[index] {
+                                    LaneOutput::Receipts { out, .. } => {
+                                        lane.with_receipts(out.clone())
+                                    }
+                                    LaneOutput::Ranges(_) => {
+                                        unreachable!("un carril SQS publica receipts")
+                                    }
+                                };
+                                Arc::new(lane) as Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
+                            })
+                            .collect();
+                    let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
+                        .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+                    return Ok(Arc::new(table.with_infinite_table(true)));
+                }
+                // N consumidores compitiendo, fusionados con `select_all`: los
+                // receipts viajan con los registros (`position`) y el decode
+                // los extrae por batch.
+                let make_stream = Arc::new(move || {
+                    let streams: Vec<tachyon_source::consumer::RecordStream> = sources
+                        .iter()
+                        .map(|s| s.record_stream())
+                        .collect();
+                    let merged: tachyon_source::consumer::RecordStream =
+                        Box::pin(futures::stream::select_all(streams));
+                    merged
+                });
+                let inner = RedpandaPartitionStream::new(
+                    0,
+                    inner_schema,
+                    decoder,
+                    batch_size,
+                    make_stream,
+                )
+                .with_receipts(receipts)
+                .with_decode_parallelism(decode_parallelism)
+                .with_row_partitions(row_partitions);
+                let table = datafusion::catalog::streaming::StreamingTable::try_new(
+                    schema,
+                    vec![Arc::new(inner)],
+                )
+                .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+                Ok(Arc::new(table.with_infinite_table(true)))
+            }
         }
-        for source in &input_sources {
-            source.drop_lot_ranges();
-        }
-        // Un `record_stream()` por consumidor, fusionados con `select_all`:
-        // el grupo reparte las particiones entre ellos y cada instancia
-        // drena su propio buffer de fetch en paralelo. La factory se invoca
-        // una vez por ejecución, así que cada consumidor se `take()`a una vez.
-        let make_stream = Arc::new(move || {
-            let streams: Vec<tachyon_source::consumer::RecordStream> = input_sources
-                .iter()
-                .map(|s| s.record_stream())
-                .collect();
-            // Coerción explícita a `RecordStream` (el `SelectAll` concreto no
-            // se coercea solo a `Pin<Box<dyn Stream>>` en posición de retorno).
-            let merged: tachyon_source::consumer::RecordStream =
-                Box::pin(futures::stream::select_all(streams));
-            merged
-        });
-        let inner = RedpandaPartitionStream::new(
-            0,
-            inner_schema,
-            decoder,
-            batch_size,
-            make_stream,
-        )
-        .with_offset_tracker(tracker)
-        .with_decode_parallelism(decode_parallelism)
-        .with_row_partitions(row_partitions);
-        let ps = as_partition(inner, &prepared_lookup, name);
-        let table = datafusion::catalog::streaming::StreamingTable::try_new(
-            schema,
-            vec![ps],
-        )
-        .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
-        Ok(Arc::new(table.with_infinite_table(true)))
     });
 
     // --- Ejecuta la transformación (validada como pass-through) ---
@@ -814,7 +1168,7 @@ pub(crate) async fn run_pipeline_with_lookup(
     let mut stream = None;
     let mut lane_streams: Vec<datafusion::physical_plan::SendableRecordBatchStream> = Vec::new();
     if let Some(branches) = union_branches {
-        let sources = assemble_union_sources(branches, &inputs, &trackers, &input_topics)?;
+        let sources = assemble_union_sources(branches, &inputs, &progress_sources)?;
         union_feed = Some(
             UnionFeed::start(&sources, &factory)
                 .await
@@ -932,13 +1286,20 @@ pub(crate) async fn run_pipeline_with_lookup(
             // Commit task: procesa los epochs EN ORDEN (FIFO del canal).
             while let Some(epoch) = epoch_rx.recv().await {
                 let t_commit = Instant::now();
-                let kafka_offsets = epoch.body.applied_offsets().clone();
+                let kafka_offsets = epoch.body.applied_offsets();
                 let result = sink_committer
                     .commit_epoch(epoch.writer, epoch.identifier, &epoch.body)
                     .await;
                 commit_metrics.add_commit_ns(t_commit.elapsed().as_nanos() as u64);
                 let Some(identifier) = result.context("checkpoint del sink")? else {
-                    continue; // epoch sin archivos nuevos
+                    // Epoch sin archivos nuevos: los receipts del tramo se
+                    // consumieron igual (sus filas, si las hubo, salieron
+                    // filtradas), así que se borran de todos modos.
+                    for (client, queue) in &sqs_deleters {
+                        let handles = epoch.receipts.get(queue).cloned().unwrap_or_default();
+                        delete_sqs_messages(client, queue, &handles).await;
+                    }
+                    continue;
                 };
                 tracing::debug!(identifier, "checkpoint commiteado");
                 commit_metrics.inc_commits();
@@ -953,15 +1314,33 @@ pub(crate) async fn run_pipeline_with_lookup(
                         }
                     }
                 }
+                // SQS: borrado SOLO después del commit (at-least-once). Un
+                // fallo es un warn: el mensaje se reentrega y el sink
+                // deduplica (PK + sequence.field).
+                for (client, queue) in &sqs_deleters {
+                    let handles = epoch.receipts.get(queue).cloned().unwrap_or_default();
+                    delete_sqs_messages(client, queue, &handles).await;
+                }
             }
             Ok(())
         });
 
     let writer_metrics = metrics.clone();
+    // Pipeline mixta: el sidecar es v3 (posiciones por input) en vez de los
+    // offsets crudos v0.
+    let mixed = config
+        .inputs
+        .iter()
+        .any(|input| input.kind() != InputKind::Topic);
     let writer: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
         // Offsets del próximo checkpoint. Arranca en el checkpoint recuperado
         // para arrastrar las particiones que no avanzan en esta ejecución.
         let mut offsets: SourceOffsets = resume.unwrap_or_default();
+        // Posiciones por input (sidecar v3): arrancan en el checkpoint
+        // recuperado. Solo se commitean cuando hay un input no-Kafka.
+        let mut positions: InputPositions = resume_positions.unwrap_or_default();
+        // Receipts SQS pendientes de borrado (se borran tras el commit).
+        let mut pending_receipts: BTreeMap<String, Vec<String>> = BTreeMap::new();
         // Carriles: la frontera por partición (arranca en el checkpoint).
         let mut frontier = lane_cursor.map(|(topic, cursor)| {
             let start = offsets.get(&topic).cloned().unwrap_or_default();
@@ -995,6 +1374,38 @@ pub(crate) async fn run_pipeline_with_lookup(
                                     }
                                     offsets.insert(topic.clone(), frontier.offsets().clone());
                                 }
+                                Progress::Input { name, progress } => {
+                                    match progress {
+                                        InputProgress::Offsets(o) => {
+                                            merge_offsets(&mut offsets, &o);
+                                            if let Some((_, parts)) = o.iter().next() {
+                                                let update = BTreeMap::from([(
+                                                    name.clone(),
+                                                    InputPosition::Kafka(parts.clone()),
+                                                )]);
+                                                merge_positions(&mut positions, &update);
+                                            }
+                                        }
+                                        InputProgress::Positions(p) => {
+                                            let update = BTreeMap::from([(
+                                                name.clone(),
+                                                InputPosition::Kinesis(p),
+                                            )]);
+                                            merge_positions(&mut positions, &update);
+                                        }
+                                        InputProgress::Receipts { queue, handles } => {
+                                            if !handles.is_empty() {
+                                                pending_receipts
+                                                    .entry(queue)
+                                                    .or_default()
+                                                    .extend(handles);
+                                            }
+                                            if !positions.contains_key(&name) {
+                                                positions.insert(name.clone(), InputPosition::Sqs);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             writer_metrics.inc_rows_written(batch.num_rows() as u64);
                             dirty = true;
@@ -1010,10 +1421,17 @@ pub(crate) async fn run_pipeline_with_lookup(
                             .rotate()
                             .await
                             .context("rotando el writer del sink")?;
+                        let body = if mixed {
+                            CheckpointBody::Positions(positions.clone())
+                        } else {
+                            CheckpointBody::Offsets(offsets.clone())
+                        };
+                        let receipts = std::mem::take(&mut pending_receipts);
                         let epoch = CheckpointEpoch {
                             writer: full_writer,
                             identifier,
-                            body: CheckpointBody::Offsets(offsets.clone()),
+                            body,
+                            receipts,
                         };
                         if epoch_tx.send(epoch).await.is_err() {
                             handoff_error = Some(anyhow::anyhow!(
@@ -1032,11 +1450,18 @@ pub(crate) async fn run_pipeline_with_lookup(
                 .rotate()
                 .await
                 .context("rotando el writer del sink")?;
+            let body = if mixed {
+                CheckpointBody::Positions(positions.clone())
+            } else {
+                CheckpointBody::Offsets(offsets.clone())
+            };
+            let receipts = std::mem::take(&mut pending_receipts);
             let _ = epoch_tx
                 .send(CheckpointEpoch {
                     writer: full_writer,
                     identifier,
-                    body: CheckpointBody::Offsets(offsets.clone()),
+                    body,
+                    receipts,
                 })
                 .await;
         }
@@ -1052,12 +1477,14 @@ pub(crate) async fn run_pipeline_with_lookup(
     });
 
     // --- Carriles: un task por partición, cada uno manda sus batches con
-    // los rangos de offsets que cubren ---
+    // los rangos de offsets (topic) o los receipts (SQS) que cubren ---
     if !lane_streams.is_empty() {
         let mut lanes = tokio::task::JoinSet::new();
+        let lane_name = config.inputs[0].name.clone();
         for (mut lane, out) in lane_streams.into_iter().zip(lane_outs.into_iter()) {
             let tx = batch_tx.clone();
             let metrics = metrics.clone();
+            let name = lane_name.clone();
             lanes.spawn(async move {
                 loop {
                     let t_next = Instant::now();
@@ -1067,10 +1494,30 @@ pub(crate) async fn run_pipeline_with_lookup(
                     let batch = batch.context("batch de salida")?;
                     // Con un plan pass-through, lo que el carril emitió hasta
                     // este batch ya salió en él o en uno anterior.
-                    let ranges = std::mem::take(&mut *out.lock().expect("lock de rangos del carril"));
+                    let progress = match &out {
+                        LaneOutput::Ranges(out) => {
+                            let ranges =
+                                std::mem::take(&mut *out.lock().expect("lock de rangos del carril"));
+                            Progress::Ranges(ranges)
+                        }
+                        LaneOutput::Receipts { queue, out } => {
+                            let handles = out
+                                .lock()
+                                .expect("lock de receipts")
+                                .pop_front()
+                                .unwrap_or_default();
+                            Progress::Input {
+                                name: name.clone(),
+                                progress: InputProgress::Receipts {
+                                    queue: queue.clone(),
+                                    handles,
+                                },
+                            }
+                        }
+                    };
                     metrics.inc_rows_read(batch.num_rows() as u64);
                     let t_send = Instant::now();
-                    tx.send((batch, Progress::Ranges(ranges)))
+                    tx.send((batch, progress))
                         .await
                         .context("enviando batch al writer")?;
                     metrics.add_send_wait_ns(t_send.elapsed().as_nanos() as u64);
@@ -1093,22 +1540,45 @@ pub(crate) async fn run_pipeline_with_lookup(
     loop {
         let t_next = Instant::now();
         let next = if let Some(feed) = union_feed.as_mut() {
-            feed.next()
-                .await
-                .map(|item| item.map(|(batch, offsets)| (batch, Progress::Snapshot(offsets))))
+            feed.next().await
         } else {
             let stream = stream.as_mut().context("el pipeline no tiene stream")?;
             match stream.next().await {
                 Some(Ok(batch)) => {
-                    // Offsets que cubre este batch: con un plan pass-through,
-                    // todo lo que la fuente emitió hasta ahora ya produjo su
-                    // salida. UNION ALL no pasa por acá: su feed ya trae los
-                    // offsets de la única rama que emitió.
-                    let batch_offsets: SourceOffsets = trackers
-                        .iter()
-                        .map(|(topic, tracker)| (topic.clone(), tracker.snapshot()))
-                        .collect();
-                    Some(Ok((batch, Progress::Snapshot(batch_offsets))))
+                    // Con un plan pass-through, todo lo que la fuente emitió
+                    // hasta ahora ya produjo su salida. El progreso sale del
+                    // mecanismo del input (offsets, posiciones o receipts).
+                    let progress = match progress_sources.first() {
+                        Some((_, InputProgressSource::Offsets { .. })) => {
+                            let batch_offsets: SourceOffsets = trackers
+                                .iter()
+                                .map(|(topic, tracker)| (topic.clone(), tracker.snapshot()))
+                                .collect();
+                            Progress::Snapshot(batch_offsets)
+                        }
+                        Some((name, InputProgressSource::Positions(tracker))) => {
+                            Progress::Input {
+                                name: name.clone(),
+                                progress: InputProgress::Positions(tracker.snapshot()),
+                            }
+                        }
+                        Some((name, InputProgressSource::Receipts { queue, out })) => {
+                            let handles = out
+                                .lock()
+                                .expect("lock de receipts")
+                                .pop_front()
+                                .unwrap_or_default();
+                            Progress::Input {
+                                name: name.clone(),
+                                progress: InputProgress::Receipts {
+                                    queue: queue.clone(),
+                                    handles,
+                                },
+                            }
+                        }
+                        None => Progress::Snapshot(SourceOffsets::new()),
+                    };
+                    Some(Ok((batch, progress)))
                 }
                 Some(Err(err)) => Some(Err(anyhow::anyhow!(err))),
                 None => None,
@@ -1228,7 +1698,7 @@ pub(crate) async fn run_topic_pipeline_with_lookup(
         None
     };
 
-    let brokers = config.connectors.redpanda.brokers.join(",");
+    let brokers = config.redpanda()?.brokers.join(",");
     ensure_topic_partitions(&brokers, topic, config.deployment.partitions).await?;
 
     let input_def = &config.inputs[0];
@@ -1244,7 +1714,7 @@ pub(crate) async fn run_topic_pipeline_with_lookup(
         );
     }
     let source_group = format!("{}-{}", options.group_id, input_def.name);
-    let mut source_cc = source_client_config(config, &options.group_id, &budget);
+    let mut source_cc = source_client_config(config, &options.group_id, &budget)?;
     source_cc.set("group.id", &source_group);
     let input_topic = input_def.kafka_topic()?.to_string();
     let source = Arc::new(
@@ -1481,17 +1951,16 @@ async fn commit_topic_groups(
 fn assemble_union_sources(
     branches: &[UnionBranch],
     inputs: &[InputSource],
-    trackers: &[(String, OffsetTracker)],
-    input_topics: &[(String, String)],
+    progress_sources: &[(String, InputProgressSource)],
 ) -> Result<Vec<UnionSource>> {
     let mut sources = Vec::with_capacity(branches.len());
     for branch in branches {
-        let topic = input_topics
+        let progress = progress_sources
             .iter()
             .find(|(name, _)| name == &branch.source)
-            .map(|(_, topic)| topic.clone())
+            .map(|(_, progress)| progress.clone())
             .with_context(|| {
-                format!("UNION ALL lee topics y '{}' no es un input", branch.source)
+                format!("UNION ALL lee un input y '{}' no es un input", branch.source)
             })?;
         let schema = inputs
             .iter()
@@ -1499,21 +1968,39 @@ fn assemble_union_sources(
             .with_context(|| format!("sin schema para '{}'", branch.source))?
             .schema
             .clone();
-        let tracker = trackers
-            .iter()
-            .find(|(name, _)| name == &topic)
-            .with_context(|| format!("sin tracker para '{topic}'"))?
-            .1
-            .clone();
         sources.push(UnionSource {
             name: branch.source.clone(),
             sql: branch.sql.clone(),
-            topic,
             schema,
-            tracker,
+            progress,
         });
     }
     Ok(sources)
+}
+
+/// Borra los mensajes commiteados de la cola (lotes de 10, tope de la API).
+/// Un fallo es un warn: el contrato es at-least-once y el sink deduplica
+/// (PK + sequence.field).
+async fn delete_sqs_messages(client: &aws_sdk_sqs::Client, queue: &str, handles: &[String]) {
+    for chunk in handles.chunks(10) {
+        let mut req = client.delete_message_batch().queue_url(queue.to_string());
+        for (index, handle) in chunk.iter().enumerate() {
+            let entry = aws_sdk_sqs::types::DeleteMessageBatchRequestEntry::builder()
+                .id(format!("{index}"))
+                .receipt_handle(handle.clone())
+                .build()
+                .expect("entry de borrado válida");
+            req = req.entries(entry);
+        }
+        if let Err(e) = req.send().await {
+            tracing::warn!(
+                error = %e,
+                queue,
+                count = chunk.len(),
+                "DeleteMessageBatch SQS falló; los mensajes se reentregan y el sink deduplica"
+            );
+        }
+    }
 }
 
 /// `UNION ALL` hacia un topic. Un consumidor por rama: la transacción adjunta
@@ -1553,18 +2040,17 @@ async fn run_union_topic(
         None
     };
 
-    let brokers = config.connectors.redpanda.brokers.join(",");
+    let brokers = config.redpanda()?.brokers.join(",");
     ensure_topic_partitions(&brokers, topic, config.deployment.partitions).await?;
 
     let mut groups: Vec<(String, Arc<RdkafkaSource>)> = Vec::new();
     let mut inputs: Vec<InputSource> = Vec::new();
-    let mut trackers: Vec<(String, OffsetTracker)> = Vec::new();
-    let mut input_topics: Vec<(String, String)> = Vec::new();
+    let mut progress_sources: Vec<(String, InputProgressSource)> = Vec::new();
     let mut name_to_sources: std::collections::HashMap<
         String,
         (Vec<Arc<RdkafkaSource>>, OffsetTracker, DecodeFormat),
     > = std::collections::HashMap::new();
-    let cc = source_client_config(config, &options.group_id, &budget);
+    let cc = source_client_config(config, &options.group_id, &budget)?;
 
     for branch in branches {
         let input_def = config
@@ -1599,8 +2085,13 @@ async fn run_union_topic(
         );
         let tracker = OffsetTracker::new();
         groups.push((input_topic.clone(), source.clone()));
-        trackers.push((input_topic.clone(), tracker.clone()));
-        input_topics.push((input_def.name.clone(), input_topic));
+        progress_sources.push((
+            input_def.name.clone(),
+            InputProgressSource::Offsets {
+                topic: input_topic.clone(),
+                tracker: tracker.clone(),
+            },
+        ));
         name_to_sources.insert(
             input_def.name.clone(),
             (vec![source], tracker, prepared.format),
@@ -1637,7 +2128,7 @@ async fn run_union_topic(
         Ok(Arc::new(table.with_infinite_table(true)))
     });
 
-    let sources = assemble_union_sources(branches, &inputs, &trackers, &input_topics)?;
+    let sources = assemble_union_sources(branches, &inputs, &progress_sources)?;
     let mut feed = UnionFeed::start(&sources, &factory)
         .await
         .context("armando UNION ALL")?;
@@ -1686,7 +2177,14 @@ async fn run_union_topic(
         tokio::select! {
             batch = feed.next() => {
                 match batch {
-                    Some(Ok((batch, covered))) => {
+                    Some(Ok((batch, progress))) => {
+                        let Progress::Input {
+                            progress: InputProgress::Offsets(covered),
+                            ..
+                        } = progress
+                        else {
+                            unreachable!("UNION ALL a topic solo trae offsets de topic");
+                        };
                         if !in_txn {
                             sink.begin().await?;
                             in_txn = true;
@@ -1898,7 +2396,7 @@ async fn drive_window(
     let commit_handoff = handoff.clone();
     let commit_task = tokio::spawn(async move {
         while let Some(epoch) = epoch_rx.recv().await {
-            let kafka_offsets = epoch.body.applied_offsets().clone();
+            let kafka_offsets = epoch.body.applied_offsets();
             let result = sink_committer
                 .commit_epoch(epoch.writer, epoch.identifier, &epoch.body)
                 .await;
@@ -1944,6 +2442,7 @@ async fn drive_window(
                             writer: full_writer,
                             identifier,
                             body: CheckpointBody::Window(checkpoint),
+                            receipts: BTreeMap::new(),
                         })
                         .await
                         .is_err()

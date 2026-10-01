@@ -12,6 +12,7 @@ tachyon-sql = { path = "../tachyon-sql" }
 tachyon-source = { path = "../tachyon-source" }
 tachyon-sink = { path = "../tachyon-sink" }
 tachyon-metrics = { path = "../tachyon-metrics" }
+tachyon-convert = { path = "../tachyon-convert" }
 anyhow.workspace = true
 tracing.workspace = true
 datafusion.workspace = true
@@ -20,6 +21,11 @@ arrow.workspace = true
 futures = "0.3"
 rdkafka = { version = "0.39", features = ["cmake-build"] }
 apache-avro = "0.21"
+# Inputs de AWS (Kinesis/SQS): SDKs de servicio + loader de credenciales.
+aws-sdk-kinesis = "1"
+aws-sdk-sqs = "1"
+aws-config = "1"
+aws-types = "1"
 # Mapa de claves del operador de ventanas (hash rápido, sin orden observable).
 hashbrown = "0.17"
 # Valores de agregado por fila inline (sin alloc por fila en la ventana).

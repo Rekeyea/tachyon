@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::SourceOffsets;
+use crate::{InputPosition, InputPositions, SourceOffsets};
 
 /// Tope del archivo de sidecar. Por encima no se publica el rename.
 pub const MAX_SIDECAR_BYTES: usize = 512 * 1024 * 1024;
@@ -22,6 +22,10 @@ pub enum CheckpointBody {
     Window(WindowCheckpointV1),
     /// JSON v2. Join por intervalo.
     Join(JoinCheckpointV1),
+    /// JSON v3. Posiciones por input (mezcla de fuentes: Kafka, Kinesis, SQS).
+    /// Un pipeline solo-Kafka sigue escribiendo v0: v3 solo cuando hay al
+    /// menos un input no-Kafka.
+    Positions(InputPositions),
 }
 
 /// Sidecar v1. Un documento, un rename.
@@ -287,11 +291,20 @@ fn de_join_keys<'de, D: serde::Deserializer<'de>>(
     Ok(keys)
 }
 
-/// Distingue v0, v1 y v2. Otra forma, con el snapshot presente, es corrupción.
+/// Distingue v0, v1, v2 y v3. Otra forma, con el snapshot presente, es corrupción.
 pub fn parse_checkpoint(bytes: &[u8]) -> Result<CheckpointBody, String> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("sidecar no es JSON: {e}"))?;
     if let Some(version) = value.get("v").and_then(|v| v.as_u64()) {
+        if version == 3 {
+            let positions = value
+                .get("positions")
+                .cloned()
+                .ok_or_else(|| "sidecar v3 sin clave 'positions'".to_string())?;
+            let positions: InputPositions =
+                serde_json::from_value(positions).map_err(|e| format!("sidecar v3 corrupto: {e}"))?;
+            return Ok(CheckpointBody::Positions(positions));
+        }
         if version == 2 {
             let checkpoint: JoinCheckpointV1 = serde_json::from_value(value)
                 .map_err(|e| format!("sidecar v2 corrupto: {e}"))?;
@@ -401,14 +414,28 @@ impl CheckpointBody {
                 owned.v = 2;
                 serde_json::to_vec(&owned).map_err(|e| e.to_string())
             }
+            CheckpointBody::Positions(positions) => {
+                let doc = serde_json::json!({ "v": 3, "positions": positions });
+                serde_json::to_vec(&doc).map_err(|e| e.to_string())
+            }
         }
     }
 
-    pub fn applied_offsets(&self) -> &SourceOffsets {
+    /// Offsets Kafka que cubre el checkpoint (el commit informativo en el
+    /// broker y el resume de las fuentes de topic). En v3 salen solo las
+    /// entradas `Kafka`; el resto de inputs no tiene offsets.
+    pub fn applied_offsets(&self) -> SourceOffsets {
         match self {
-            CheckpointBody::Offsets(offsets) => offsets,
-            CheckpointBody::Window(checkpoint) => &checkpoint.applied,
-            CheckpointBody::Join(checkpoint) => &checkpoint.applied,
+            CheckpointBody::Offsets(offsets) => offsets.clone(),
+            CheckpointBody::Window(checkpoint) => checkpoint.applied.clone(),
+            CheckpointBody::Join(checkpoint) => checkpoint.applied.clone(),
+            CheckpointBody::Positions(positions) => positions
+                .iter()
+                .filter_map(|(input, position)| match position {
+                    InputPosition::Kafka(offsets) => Some((input.clone(), offsets.clone())),
+                    _ => None,
+                })
+                .collect(),
         }
     }
 }
@@ -416,6 +443,7 @@ impl CheckpointBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::merge_positions;
 
     fn sample_window() -> WindowCheckpointV1 {
         let mut key = Vec::new();
@@ -483,6 +511,7 @@ mod tests {
             CheckpointBody::Offsets(got) => assert_eq!(got, offsets),
             CheckpointBody::Window(_) => panic!("v0 leído como ventana"),
             CheckpointBody::Join(_) => panic!("v0 leído como join"),
+            CheckpointBody::Positions(_) => panic!("v0 leído como positions"),
         }
     }
 
@@ -514,12 +543,94 @@ mod tests {
             CheckpointBody::Window(got) => assert_eq!(got, checkpoint),
             CheckpointBody::Offsets(_) => panic!("v1 leído como offsets"),
             CheckpointBody::Join(_) => panic!("v1 leído como join"),
+            CheckpointBody::Positions(_) => panic!("v1 leído como positions"),
         }
     }
 
     #[test]
     fn unknown_version_is_rejected() {
-        let err = parse_checkpoint(br#"{"v":3}"#).unwrap_err();
+        let err = parse_checkpoint(br#"{"v":4}"#).unwrap_err();
         assert!(err.contains("desconocida"), "{err}");
+    }
+
+    #[test]
+    fn v3_roundtrips_mixed_positions() {
+        let mut positions = InputPositions::new();
+        positions.insert(
+            "orders".into(),
+            InputPosition::Kafka(BTreeMap::from([(0, 10i64), (1, 3)])),
+        );
+        positions.insert(
+            "streams".into(),
+            InputPosition::Kinesis(BTreeMap::from([(
+                "shardId-00000001699999999999999999999999999999999999999999999999".into(),
+                "4959030000000000000000000000000000000000000000000000000000".into(),
+            )])),
+        );
+        positions.insert("clicks".into(), InputPosition::Sqs);
+        let body = CheckpointBody::Positions(positions.clone());
+        let bytes = body.to_bytes().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("\"v\":3"), "{text}");
+        match parse_checkpoint(&bytes).unwrap() {
+            CheckpointBody::Positions(got) => assert_eq!(got, positions),
+            other => panic!("v3 leído como otra cosa: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v3_applied_offsets_keeps_only_kafka_entries() {
+        let mut positions = InputPositions::new();
+        positions.insert(
+            "orders".into(),
+            InputPosition::Kafka(BTreeMap::from([(0, 7i64)])),
+        );
+        positions.insert(
+            "streams".into(),
+            InputPosition::Kinesis(BTreeMap::from([("shardId-000".into(), "1".into())])),
+        );
+        positions.insert("clicks".into(), InputPosition::Sqs);
+        let offsets = CheckpointBody::Positions(positions).applied_offsets();
+        assert_eq!(
+            offsets,
+            BTreeMap::from([("orders".into(), BTreeMap::from([(0, 7i64)]))])
+        );
+    }
+
+    #[test]
+    fn v3_requires_the_positions_key() {
+        let err = parse_checkpoint(br#"{"v":3}"#).unwrap_err();
+        assert!(err.contains("positions"), "{err}");
+    }
+
+    #[test]
+    fn merge_positions_advances_per_input() {
+        let mut positions = InputPositions::new();
+        positions.insert("orders".into(), InputPosition::Kafka(BTreeMap::from([(0, 5i64)])));
+        positions.insert(
+            "streams".into(),
+            InputPosition::Kinesis(BTreeMap::from([("shardId-000".into(), "100".into())])),
+        );
+        positions.insert("clicks".into(), InputPosition::Sqs);
+
+        let mut update = InputPositions::new();
+        update.insert("orders".into(), InputPosition::Kafka(BTreeMap::from([(0, 3i64), (1, 9)])));
+        update.insert(
+            "streams".into(),
+            InputPosition::Kinesis(BTreeMap::from([("shardId-000".into(), "099".into())])),
+        );
+        merge_positions(&mut positions, &update);
+
+        assert_eq!(
+            positions.get("orders"),
+            Some(&InputPosition::Kafka(BTreeMap::from([(0, 5i64), (1, 9)]))),
+            "el offset nunca retrocede; la partición nueva entra"
+        );
+        assert_eq!(
+            positions.get("streams"),
+            Some(&InputPosition::Kinesis(BTreeMap::from([("shardId-000".into(), "100".into())]))),
+            "el seq Kinesis nunca retrocede"
+        );
+        assert_eq!(positions.get("clicks"), Some(&InputPosition::Sqs));
     }
 }

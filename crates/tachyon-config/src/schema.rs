@@ -30,7 +30,9 @@ fn default_version() -> u32 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Connectors {
-    pub redpanda: RedpandaConfig,
+    /// Brokers de Redpanda. Obligatorio cuando hay un input o output de topic.
+    #[serde(default)]
+    pub redpanda: Option<RedpandaConfig>,
     /// Ausente cuando la salida es un topic: esa pipeline no abre warehouse.
     #[serde(default)]
     pub paimon: Option<PaimonConfig>,
@@ -38,6 +40,12 @@ pub struct Connectors {
     /// registra ahí y el mensaje lleva el id.
     #[serde(default)]
     pub schema_registry: Option<SchemaRegistryConfig>,
+    /// Cola SQS. Obligatorio cuando hay un input `sqs`.
+    #[serde(default)]
+    pub sqs: Option<SqsConfig>,
+    /// Stream Kinesis. Obligatorio cuando hay un input `kinesis`.
+    #[serde(default)]
+    pub kinesis: Option<KinesisConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +65,28 @@ pub struct SecurityConfig {
     pub sasl_mechanism: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
+}
+
+/// Conexión a SQS: cadena de credenciales por defecto de AWS, región y
+/// endpoint opcional (LocalStack en pruebas).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SqsConfig {
+    pub region: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+/// Conexión a Kinesis: cadena de credenciales por defecto de AWS, región y
+/// endpoint opcional (LocalStack en pruebas).
+#[derive(Debug, Clone, Deserialize)]
+pub struct KinesisConfig {
+    pub region: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,16 +114,42 @@ pub enum PayloadFormat {
     Avro,
 }
 
-/// Un stream de entrada. Un topic de Redpanda o una tabla Paimon, no los dos.
+/// Punto de arranque de un stream Kinesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartFrom {
+    /// Desde el final del stream: solo registros nuevos.
+    #[default]
+    Latest,
+    /// Desde el registro más antiguo disponible en cada shard.
+    TrimHorizon,
+}
+
+/// Un stream de entrada. Una de cuatro fuentes: topic de Redpanda, tabla
+/// Paimon, stream Kinesis o cola SQS.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InputDef {
     pub name: String,
-    /// Topic físico. Excluyente con `table`.
+    /// Topic físico. Excluyente con `table`, `kinesis` y `sqs`.
     #[serde(default)]
     pub topic: Option<String>,
     /// `db.tabla` de Paimon. Tachyon sigue los snapshots nuevos.
     #[serde(default)]
     pub table: Option<String>,
+    /// Stream de Kinesis (nombre). Exactamente un consumidor por stream:
+    /// todos los shards en paralelo; la escala entra por los shards.
+    #[serde(default)]
+    pub kinesis: Option<String>,
+    /// Cola SQS (nombre o URL). N consumidores compiten por la cola con
+    /// long polling.
+    #[serde(default)]
+    pub sqs: Option<String>,
+    /// Punto de arranque del stream Kinesis. Default: `latest`.
+    #[serde(default)]
+    pub start_from: Option<StartFrom>,
+    /// Espera del long polling de SQS (p. ej. "20s"). Default: 20s.
+    #[serde(default)]
+    pub receive_wait: Option<String>,
     /// Clave de particionado (== state key == bucket key).
     pub key: String,
     /// Ruta al schema Arrow de las columnas que ve el SQL. Ausente cuando
@@ -110,6 +166,12 @@ pub struct InputDef {
     pub avro_schema: Option<String>,
     #[serde(default)]
     pub watermark: Option<WatermarkConfig>,
+    /// Si un input tiene un esquema distinto al del SQL, este campo define el
+    /// nombre lógico de la tabla base a la que se convierte (ver `convert_to`
+    /// en los inputs). Tachyon aplica un conversor ligero entre el decoder y
+    /// DataFusion para mapear columnas y coercionar tipos.
+    #[serde(default)]
+    pub convert_to: Option<String>,
 }
 
 /// Una dimensión de Paimon. El nombre es el de la tabla en el `JOIN`.
@@ -138,6 +200,56 @@ impl InputDef {
             .as_deref()
             .map(str::trim)
             .filter(|table| !table.is_empty())
+    }
+
+    /// Stream Kinesis, si este input es un stream de AWS.
+    pub fn kinesis_stream(&self) -> Option<&str> {
+        self.kinesis
+            .as_deref()
+            .map(str::trim)
+            .filter(|stream| !stream.is_empty())
+    }
+
+    /// Cola SQS, si este input es una cola de AWS.
+    pub fn sqs_queue(&self) -> Option<&str> {
+        self.sqs
+            .as_deref()
+            .map(str::trim)
+            .filter(|queue| !queue.is_empty())
+    }
+
+    /// Fuente del input. La validación garantiza una sola fuente, así que el
+    /// default a `Topic` solo rige cuando ninguna de las cuatro está.
+    pub fn kind(&self) -> InputKind {
+        if self.paimon_table().is_some() {
+            InputKind::Table
+        } else if self.kinesis_stream().is_some() {
+            InputKind::Kinesis
+        } else if self.sqs_queue().is_some() {
+            InputKind::Sqs
+        } else {
+            InputKind::Topic
+        }
+    }
+}
+
+/// Fuente de un input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    Topic,
+    Table,
+    Kinesis,
+    Sqs,
+}
+
+impl PipelineConfig {
+    /// Brokers de Redpanda. Solo existe cuando la pipeline usa topic
+    /// (input u output); la validación lo exige.
+    pub fn redpanda(&self) -> Result<&RedpandaConfig, Error> {
+        self.connectors
+            .redpanda
+            .as_ref()
+            .ok_or_else(|| Error::Config("falta connectors.redpanda".to_string()))
     }
 }
 

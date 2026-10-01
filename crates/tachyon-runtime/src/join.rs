@@ -12,7 +12,7 @@ use arrow::array::{Array, Float64Array, Int64Array, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use tachyon_config::{parse_fixed_duration, PipelineConfig};
+use tachyon_config::{parse_fixed_duration, InputKind, PipelineConfig};
 use tachyon_core::{
     CheckpointBody, JoinCell, JoinCheckpointV1, JoinColumnSpec, JoinEvent, JoinKeyState, JoinSpec,
     JoinState, SourceOffsets,
@@ -221,6 +221,15 @@ pub async fn run_join_pipeline(
     if config.inputs.len() != 2 {
         anyhow::bail!("el join tiene dos inputs");
     }
+    if config
+        .inputs
+        .iter()
+        .any(|input| input.kind() != InputKind::Topic)
+    {
+        anyhow::bail!(
+            "el join lee topics; kinesis y sqs publican una tabla (pass-through)"
+        );
+    }
     let left_lag = side_lag(config, &join.left, &join.left_time, &join.left_key)?;
     let right_lag = side_lag(config, &join.right, &join.right_time, &join.right_key)?;
     let budget = StatelessBudget::resolve(config).context("presupuesto del pipeline")?;
@@ -257,12 +266,15 @@ pub async fn run_join_pipeline(
         Recovered::PassThrough { identifier, .. } => {
             anyhow::bail!("checkpoint {identifier} es pass-through y el plan es un join")
         }
+        Recovered::Positions { identifier, .. } => {
+            anyhow::bail!("checkpoint {identifier} es de inputs mixtos y el plan es un join; se rechaza")
+        }
         Recovered::Window { identifier, .. } => {
             anyhow::bail!("checkpoint {identifier} es de una ventana y el plan es un join")
         }
     };
 
-    let brokers = config.connectors.redpanda.brokers.join(",");
+    let brokers = config.redpanda()?.brokers.join(",");
     let left_input = input_def(config, &join.left)?;
     let right_input = input_def(config, &join.right)?;
     let left_topic = left_input.kafka_topic()?.to_string();
@@ -425,7 +437,7 @@ fn spawn_input(
     AbortOnDrop,
 )> {
     let source_group = format!("{}-{}", options.group_id, input.name);
-    let mut source_cc = source_client_config(config, &options.group_id, budget);
+    let mut source_cc = source_client_config(config, &options.group_id, budget)?;
     source_cc.set("group.id", &source_group);
     let topic = input.kafka_topic()?.to_string();
     let mut source = RdkafkaSource::new(&source_cc, &topic)

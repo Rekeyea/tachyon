@@ -104,7 +104,7 @@ pub async fn run_table_stream(
         tracing::info!(%addr, "métricas disponibles");
     }
 
-    let brokers = config.connectors.redpanda.brokers.join(",");
+    let brokers = config.redpanda()?.brokers.join(",");
     ensure_topic_partitions(&brokers, topic, config.deployment.partitions).await?;
     let cursor_topic = format!("{topic}-tachyon-cursor");
     ensure_cursor_topic(&brokers, topic, &cursor_topic).await?;

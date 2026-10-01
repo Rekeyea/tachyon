@@ -22,6 +22,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 
 use crate::consumer::{LotRanges, RecordStream};
+use crate::kinesis::LotPositions;
 use tachyon_core::OffsetRange;
 use crate::decode::Decoder;
 use crate::record::SourceRecord;
@@ -60,6 +61,37 @@ impl OffsetTracker {
     }
 }
 
+/// Progreso de una fuente Kinesis: shard -> último sequence number emitido.
+///
+/// Mismo contrato que `OffsetTracker` (se avanza al emitir cada batch), pero
+/// la posición es el sequence number de Kinesis (128 bits, se compara
+/// lexicográfico == numérico; ver `kinesis_seq_le`). El resume usa
+/// `AFTER_SEQUENCE_NUMBER` del último seq commiteado.
+#[derive(Debug, Clone, Default)]
+pub struct PositionTracker(Arc<Mutex<BTreeMap<String, String>>>);
+
+impl PositionTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Avanza el progreso con los seq de un batch emitido (shard -> último seq).
+    fn advance(&self, emitted: &BTreeMap<String, String>) {
+        let mut progress = self.0.lock().expect("lock del tracker");
+        for (shard, seq) in emitted {
+            let entry = progress.entry(shard.clone()).or_insert_with(|| seq.clone());
+            if !tachyon_core::kinesis_seq_le(seq, entry) {
+                *entry = seq.clone();
+            }
+        }
+    }
+
+    /// Copia del progreso actual.
+    pub fn snapshot(&self) -> BTreeMap<String, String> {
+        self.0.lock().expect("lock del tracker").clone()
+    }
+}
+
 /// Fuente de streaming de Redpanda para una partición, integrada con DataFusion.
 pub struct RedpandaPartitionStream {
     partition: i32,
@@ -84,12 +116,25 @@ pub struct RedpandaPartitionStream {
     /// Carril propio: los rangos que llegan con cada lote y adónde se
     /// publican cuando su batch se emite (ver `with_lane`).
     lane: Option<(LotRanges, LaneRanges)>,
+    /// Progreso Kinesis: se avanza al emitir cada batch (shard -> último seq)
+    /// con las posiciones que la fuente publica por lote (ver
+    /// `with_position_tracker`).
+    position_tracker: Option<(PositionTracker, LotPositions)>,
+    /// Carril de receipts SQS: los del batch (extraídos de
+    /// `SourceRecord.position`) se publican en `out` al emitirlo (ver
+    /// `with_receipts`).
+    receipts_out: Option<ReceiptsOut>,
 }
 
 /// Rangos de offsets de lo que un carril ya emitió y todavía no leyó quien
 /// consume el stream. Se vacía después de recibir cada batch: con un plan
 /// pass-through, todo lo emitido hasta ese batch ya salió.
 pub type LaneRanges = Arc<Mutex<Vec<OffsetRange>>>;
+
+/// Receipt handles de los batches emitidos y todavía no leídos por el
+/// writer (uno por batch emitido, FIFO). El writer los consume en lockstep
+/// con los batches y los borra de SQS después del commit.
+pub type ReceiptsOut = Arc<Mutex<std::collections::VecDeque<Vec<String>>>>;
 
 impl RedpandaPartitionStream {
     pub fn new(
@@ -110,6 +155,8 @@ impl RedpandaPartitionStream {
             decode_parallelism: 1,
             row_partitions: false,
             lane: None,
+            position_tracker: None,
+            receipts_out: None,
         }
     }
 
@@ -134,6 +181,22 @@ impl RedpandaPartitionStream {
     /// Publica en `tracker` los offsets de cada batch al emitirlo.
     pub fn with_offset_tracker(mut self, tracker: OffsetTracker) -> Self {
         self.tracker = Some(tracker);
+        self
+    }
+
+    /// Publica en `tracker` las posiciones Kinesis de cada batch al emitirlo.
+    /// `lots` es el canal de posiciones por lote que la fuente llena (mismo
+    /// contrato FIFO que `LotRanges`).
+    pub fn with_position_tracker(mut self, tracker: PositionTracker, lots: LotPositions) -> Self {
+        self.position_tracker = Some((tracker, lots));
+        self
+    }
+
+    /// Publica en `out` los receipts SQS de cada batch al emitirlo (uno por
+    /// batch, FIFO): el writer los consume en lockstep con los batches y los
+    /// borra de SQS después del commit.
+    pub fn with_receipts(mut self, out: ReceiptsOut) -> Self {
+        self.receipts_out = Some(out);
         self
     }
 
@@ -171,6 +234,8 @@ impl PartitionStream for RedpandaPartitionStream {
         let batch_size = self.batch_size;
         let max_batch_delay = self.max_batch_delay;
         let tracker = self.tracker.clone();
+        let position_tracker = self.position_tracker.clone();
+        let receipts_out = self.receipts_out.clone();
         let decode_parallelism = self.decode_parallelism;
         let row_partitions = self.row_partitions;
         let lane = self.lane.clone();
@@ -200,10 +265,17 @@ impl PartitionStream for RedpandaPartitionStream {
             // era el techo del pipeline.
             let mut acc: Vec<Vec<SourceRecord>> = Vec::new();
             let mut acc_ranges: Vec<OffsetRange> = Vec::new();
+            let mut acc_positions: Vec<(String, String)> = Vec::new();
             let mut acc_rows = 0usize;
             let mut since_first: Option<Instant> = None;
             let mut in_flight = FuturesOrdered::<
-                tokio::task::JoinHandle<(BTreeMap<i32, i64>, Vec<OffsetRange>, DecodedLot)>,
+                tokio::task::JoinHandle<(
+                    BTreeMap<i32, i64>,
+                    BTreeMap<String, String>,
+                    Vec<OffsetRange>,
+                    Vec<String>,
+                    DecodedLot,
+                )>,
             >::new();
 
             // Diagnóstico (TACHYON_DEBUG_STREAM=1): cada 2s, cuánto esperó
@@ -222,7 +294,7 @@ impl PartitionStream for RedpandaPartitionStream {
                 }
                 let mut emit = false;
                 if acc_rows >= batch_size {
-                    in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges)));
+                    in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges), std::mem::take(&mut acc_positions)));
                     acc_rows = 0;
                     since_first = None;
                     emit = in_flight.len() >= decode_parallelism;
@@ -230,7 +302,7 @@ impl PartitionStream for RedpandaPartitionStream {
                     && since_first.is_some_and(|t0| t0.elapsed() >= max_batch_delay)
                 {
                     tracing::debug!(rows = acc_rows, "emitiendo batch parcial (flush time-based)");
-                    in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges)));
+                    in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges), std::mem::take(&mut acc_positions)));
                     acc_rows = 0;
                     since_first = None;
                     // Como uno lleno: no frena el pipeline. Si no llega nada
@@ -272,13 +344,18 @@ impl PartitionStream for RedpandaPartitionStream {
                                     acc_ranges.extend(ranges);
                                 }
                             }
+                            if let Some((_, lots)) = &position_tracker {
+                                if let Some(positions) = lots.pop() {
+                                    acc_positions.extend(positions);
+                                }
+                            }
                         }
                         Ok(Some(Err(e))) => {
                             yield Err(DataFusionError::Execution(e.to_string()));
                         }
                         Ok(None) => {
                             if acc_rows > 0 {
-                                in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges)));
+                                in_flight.push_back(spawn_decode(&decoder, &schema, row_partitions, std::mem::take(&mut acc), std::mem::take(&mut acc_ranges), std::mem::take(&mut acc_positions)));
                                 acc_rows = 0;
                             }
                             if in_flight.is_empty() {
@@ -304,15 +381,23 @@ impl PartitionStream for RedpandaPartitionStream {
                         waits[1] += waited.elapsed().as_secs_f64();
                     }
                     match head {
-                        Some(Ok((offs, ranges, result))) => {
+                        Some(Ok((offs, pos, ranges, receipts, result))) => {
                             if let Some(t) = &tracker {
                                 t.advance(&offs);
+                            }
+                            if let Some((pt, _)) = &position_tracker {
+                                pt.advance(&pos);
                             }
                             if let Some((_, out)) = &lane {
                                 out.lock().expect("lock de rangos del carril").extend(ranges);
                             }
                             match result {
                                 Ok(batch) => {
+                                    if let Some(out) = &receipts_out {
+                                        out.lock()
+                                            .expect("lock de receipts")
+                                            .push_back(receipts);
+                                    }
                                     let waited = Instant::now();
                                     yield Ok(batch);
                                     if debug {
@@ -353,24 +438,44 @@ const IDLE_RELEASE: Duration = Duration::from_millis(5);
 /// CPU-bound puro). El lote viaja con sus offsets, que se publican en el
 /// tracker cuando el batch decodificado se emite (en orden de despacho).
 /// Decodifica `lots` en un hilo del pool de blocking. Devuelve el próximo
-/// offset por partición que cubre el batch (para el checkpoint) y el batch.
+/// offset por partición que cubre el batch (para el checkpoint), las
+/// posiciones Kinesis que cubre (shard -> último seq; vacío en Kafka), los
+/// receipt handles SQS de sus registros (vacío en Kafka), y el batch.
 fn spawn_decode(
     decoder: &Decoder,
     schema: &SchemaRef,
     row_partitions: bool,
     lots: Vec<Vec<SourceRecord>>,
     ranges: Vec<OffsetRange>,
-) -> tokio::task::JoinHandle<(BTreeMap<i32, i64>, Vec<OffsetRange>, DecodedLot)> {
+    positions: Vec<(String, String)>,
+) -> tokio::task::JoinHandle<(
+    BTreeMap<i32, i64>,
+    BTreeMap<String, String>,
+    Vec<OffsetRange>,
+    Vec<String>,
+    DecodedLot,
+)> {
     let decoder = decoder.clone();
     let schema = schema.clone();
     tokio::task::spawn_blocking(move || {
         let rows: usize = lots.iter().map(Vec::len).sum();
         let mut offsets = BTreeMap::<i32, i64>::new();
+        let mut pos = BTreeMap::<String, String>::new();
+        for (shard, seq) in positions {
+            let slot = pos.entry(shard).or_insert_with(|| seq.clone());
+            if !tachyon_core::kinesis_seq_le(&seq, slot) {
+                *slot = seq;
+            }
+        }
         let mut payloads: Vec<&[u8]> = Vec::with_capacity(rows);
+        let mut receipts: Vec<String> = Vec::new();
         // Los registros de una partición llegan juntos: se cachea la última.
         let mut current: Option<(i32, i64)> = None;
         for record in lots.iter().flatten() {
             payloads.push(&record.value);
+            if let Some(receipt) = &record.position {
+                receipts.push(receipt.clone());
+            }
             match &mut current {
                 Some((partition, next)) if *partition == record.partition => {
                     *next = (*next).max(record.offset + 1);
@@ -400,7 +505,7 @@ fn spawn_decode(
                     Ok(batch)
                 }
             });
-        (offsets, ranges, result)
+        (offsets, pos, ranges, receipts, result)
     })
 }
 

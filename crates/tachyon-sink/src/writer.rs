@@ -37,8 +37,8 @@ use paimon::spec::CommitKind;
 use paimon::table::IncrementalScanMode;
 use paimon::{CatalogFactory, Options};
 use tachyon_core::{
-    parse_checkpoint, partition_tickets, CheckpointBody, PartitionTicketV1, SourceOffsets,
-    MAX_SIDECAR_BYTES,
+    parse_checkpoint, partition_tickets, CheckpointBody, InputPositions, PartitionTicketV1,
+    SourceOffsets, MAX_SIDECAR_BYTES,
 };
 
 /// Reintentos de un commit de Paimon con resultado incierto (error de I/O
@@ -234,6 +234,10 @@ impl PaimonSink {
         self.next_identifier = identifier + 1;
         match body {
             CheckpointBody::Offsets(offsets) => Ok(Recovered::PassThrough { identifier, offsets }),
+            CheckpointBody::Positions(positions) => Ok(Recovered::Positions {
+                identifier,
+                positions,
+            }),
             CheckpointBody::Window(checkpoint) => {
                 if checkpoint.commit_identifier != identifier {
                     anyhow::bail!(
@@ -594,6 +598,11 @@ pub enum Recovered {
         identifier: i64,
         offsets: SourceOffsets,
     },
+    /// Sidecar v3: posiciones por input (mezcla de fuentes).
+    Positions {
+        identifier: i64,
+        positions: InputPositions,
+    },
     Window {
         identifier: i64,
         checkpoint: tachyon_core::WindowCheckpointV1,
@@ -616,6 +625,7 @@ async fn publish_checkpoint(
 ) -> Result<()> {
     let stamped = match body {
         CheckpointBody::Offsets(_) => body.clone(),
+        CheckpointBody::Positions(_) => body.clone(),
         CheckpointBody::Window(checkpoint) => {
             let mut owned = checkpoint.clone();
             owned.commit_identifier = identifier;
@@ -664,6 +674,10 @@ pub struct CheckpointEpoch {
     pub writer: crate::shard::EpochWrite,
     pub identifier: i64,
     pub body: CheckpointBody,
+    /// Receipt handles SQS que el commit task borra de la cola si el
+    /// checkpoint queda commiteado (at-least-once: ver `tachyon-source::sqs`).
+    /// Cola URL -> handles.
+    pub receipts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Último identifier commiteado por este `commit_user` (recorre los

@@ -1434,8 +1434,8 @@ impl ResumeFilter {
 /// Implementa `Stream` directamente (sin macro) para evitar la dependencia
 /// `async-stream`. Es cancelation-safe: soltar el stream no afecta al task
 /// de poll, que sigue poseyendo el `NativeConsumer`.
-struct ReceiverStream {
-    rx: tokio::sync::mpsc::Receiver<Result<Vec<SourceRecord>, String>>,
+pub(crate) struct ReceiverStream {
+    pub(crate) rx: tokio::sync::mpsc::Receiver<Result<Vec<SourceRecord>, String>>,
 }
 
 impl futures::Stream for ReceiverStream {

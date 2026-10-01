@@ -1,0 +1,9 @@
+[package]
+name = "tachyon-convert"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { workspace = true }
+arrow-cast = "58"
+anyhow = { workspace = true }

@@ -19,6 +19,7 @@ use crate::run::{
 use crate::table_stream::run_table_stream;
 
 /// Un pipeline de Tachyon (una instancia).
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Pipeline {
     plan: PipelinePlan,
@@ -98,10 +99,13 @@ impl Pipeline {
         &self,
         input_codecs: &std::collections::HashMap<String, PreparedInput>,
     ) -> Result<PipelineHandle> {
-        if self.union_all.is_some()
-            && (self.window.is_some() || self.join.is_some() || self.lookup.is_some())
-        {
-            anyhow::bail!("UNION ALL no se mezcla con una ventana, un join o un lookup");
+        // UNION ALL con window es válido: las ramas se unifican y la ventana
+        // opera sobre el stream combinado. Con join o lookup no se permite aún.
+        if self.union_all.is_some() && self.join.is_some() {
+            anyhow::bail!("UNION ALL no se mezcla con un interval join");
+        }
+        if self.union_all.is_some() && self.lookup.is_some() {
+            anyhow::bail!("UNION ALL no se mezcla con un lookup join");
         }
         if self
             .config

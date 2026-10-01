@@ -36,7 +36,7 @@ Tachyon es un motor de ejecución de pipelines de streaming basado en lakehouse.
 ### Objetivos
 
 - **O1.** SQL como única interface de transformación (DataFusion SQL + extensiones de streaming).
-- **O2.** Un archivo de configuración que defina inputs (Redpanda), output (Paimon) y despliegue.
+- **O2.** Un archivo de configuración que defina inputs (Redpanda, Kinesis o SQS), output (Paimon) y despliegue.
 - **O3.** Footprint medible y bajo (Rust, sin JVM, embebible).
 - **O4.** Una salida por pipeline; escalado horizontal por particiones de Redpanda.
 - **O5.** Un solo writer por bucket de Paimon (corrección + sin conflictos de escritura).
@@ -171,7 +171,17 @@ deployment:
     checkpoint_storage: s3://lakehouse/checkpoints/orders-enrichment
 ```
 
-> **Opinionated defaults:** el usuario solo *debe* especificar lo esencial: `connectors` (Redpanda + Paimon), `inputs` (los streams de entrada), `output` (la tabla y la clave) y `deployment.partitions`. El resto (`resources`, `scaling`, `state.checkpoint_*`) tiene defaults sensatos y solo se sobreescribe si hace falta. No hay opciones de backend de estado, de formato de checkpoint ni de estrategia de asignación de particiones: Tachyon las decide.
+**Tipos de input.** Cada input declara exactamente una fuente física:
+
+| Campo en el input | Fuente | Semántica de entrega | Resumen de posición |
+|---|---|---|---|
+| `topic:` | Redpanda (Kafka) | exactly-once | offsets por partición (`{"kafka": {...}}`) |
+| `kinesis:` | AWS Kinesis Data Streams | exactly-once | `shard_id → sequence_number` (`{"kinesis": {...}}`) |
+| `sqs:` | AWS SQS | at-least-once (dedup por PK + `sequence_field`) | receipt handles se borran tras el commit (`{"sqs": null}`) |
+
+Kinesis y SQS son inputs de **pass-through** (filter/project/limit + sink Paimon): un window o un join rechaza un input que no sea topic. El avro de registro (`schema_registry`) aplica solo a inputs de topic; kinesis y sqs traen el schema en el propio `avro_schema` cuando el formato es avro.
+
+> **Opinionated defaults:** el usuario solo *debe* especificar lo esencial: `connectors` (Redpanda + Paimon, o Kinesis/SQS según los inputs), `inputs` (los streams de entrada), `output` (la tabla y la clave) y `deployment.partitions`. El resto (`resources`, `scaling`, `state.checkpoint_*`) tiene defaults sensatos y solo se sobreescribe si hace falta. No hay opciones de backend de estado, de formato de checkpoint ni de estrategia de asignación de particiones: Tachyon las decide.
 
 ### 3.3 La regla de alineación (invariante clave)
 
@@ -473,6 +483,16 @@ Como Tachyon no es distribuido, el fan-in (múltiples entradas → una salida) *
 
 - No existe un conector Arrow/DataFusion/Redpanda off-the-shelf. "Nativo" = **conector source/sink en Rust** (rdkafka o cliente nativo de Redpanda + Arrow IPC).
 - Es trabajo de Tachyon, pero encaja con el stack Rust (sin JVM, sin serialización costosa).
+
+### 8.5 Kinesis y SQS como inputs
+
+Además de topic de Redpanda, un input puede leer de **AWS Kinesis Data Streams** (`kinesis:`) o **AWS SQS** (`sqs:`). Ambos son fuentes de pass-through (filter/project/limit + sink Paimon) y comparten el mismo modelo de exactly-once/at-least-once que el sink:
+
+- **Kinesis (exactly-once):** un consumidor por stream; todos los shards se leen en paralelo (el paralelismo escala con el número de shards). La posición es `shard_id → sequence_number` y se commitea en el mismo sidecar atómico que el snapshot de Paimon. Al reiniciar, cada shard reanuda con `AFTER_SEQUENCE_NUMBER` desde su seq commiteado (sin releer). Un shard hijo adoptado tras un split arranca en `TRIM_HORIZON` salvo que el checkpoint ya lleve su seq.
+- **SQS (at-least-once):** N consumidores compiten por la cola con long polling (`receive_wait`, default 20s). Cada mensaje viaja con su receipt handle hasta el writer; el handle se borra de la cola (`DeleteMessageBatch`) solo cuando el snapshot de Paimon se commitea. El `visibility_timeout` se fija a `commit_interval + 60s`: si un commit se demora, el mensaje se vuelve visible y se consume dos veces, y la deduplicación la hace Paimon (PK + `sequence_field`).
+- **Checkpoint v3:** cuando una pipeline mezcla o usa inputs no-Kafka, el sidecar de offsets pasa de v0 (offsets Kafka) a v3 (`{"v":3,"positions":{<input>: {"kafka":...|"kinesis":...|"sqs":null}}}`), una posición por input lógico. Una pipeline solo-Kafka sigue escribiendo v0 byte a byte, para no invalidar checkpoints existentes.
+- **Conectores:** `connectors.kinesis` / `connectors.sqs` declaran `region` y opcionalmente `endpoint` (floCi/LocalStack) y `profile` (AWS Shared Config). Las credenciales salen de la cadena default de AWS (env, shared config, IMDS).
+- **Limitaciones v1:** un sink a topic exige inputs solo de topic (la transacción commitea consumer groups de Kafka); un window o un join rechaza inputs kinesis/sqs con un error explícito.
 
 ---
 

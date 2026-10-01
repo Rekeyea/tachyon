@@ -1,6 +1,6 @@
 //! Validación del invariante de alineación (ver DESIGN.md §3.3).
 
-use crate::schema::PipelineConfig;
+use crate::schema::{InputKind, PipelineConfig};
 use tachyon_core::Error;
 
 /// Valida la config contra el invariante de alineación:
@@ -96,6 +96,8 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
     }
 
     let mut table_inputs = 0;
+    let mut kinesis_inputs = 0;
+    let mut sqs_inputs = 0;
     for input in &cfg.inputs {
         if input.key != cfg.output.key {
             return Err(Error::KeyMismatch(format!(
@@ -103,14 +105,20 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
                 input.name, input.key, cfg.output.key
             )));
         }
+        let sources = [
+            input.kafka_topic().is_ok(),
+            input.paimon_table().is_some(),
+            input.kinesis_stream().is_some(),
+            input.sqs_queue().is_some(),
+        ];
+        if sources.iter().filter(|&&source| source).count() != 1 {
+            return Err(Error::Config(format!(
+                "input '{}' necesita una sola fuente: topic, table, kinesis o sqs",
+                input.name
+            )));
+        }
         if input.paimon_table().is_some() {
             table_inputs += 1;
-            if input.kafka_topic().is_ok() {
-                return Err(Error::Config(format!(
-                    "input '{}' tiene table y topic; hace falta uno solo",
-                    input.name
-                )));
-            }
             if input.schema.is_some() || input.avro_schema.is_some() {
                 return Err(Error::Config(format!(
                     "input '{}': la tabla trae su schema",
@@ -131,9 +139,39 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
             }
             continue;
         }
-        if input.kafka_topic().is_err() {
+        match input.kind() {
+            InputKind::Kinesis => {
+                kinesis_inputs += 1;
+                if cfg.connectors.kinesis.is_none() {
+                    return Err(Error::Config(format!(
+                        "input '{}': kinesis requiere connectors.kinesis.region",
+                        input.name
+                    )));
+                }
+            }
+            InputKind::Sqs => {
+                sqs_inputs += 1;
+                if cfg.connectors.sqs.is_none() {
+                    return Err(Error::Config(format!(
+                        "input '{}': sqs requiere connectors.sqs.region",
+                        input.name
+                    )));
+                }
+                if let Some(wait) = input.receive_wait.as_deref() {
+                    parse_fixed_duration(wait)?;
+                }
+            }
+            _ => {}
+        }
+        if input.start_from.is_some() && input.kind() != InputKind::Kinesis {
             return Err(Error::Config(format!(
-                "input '{}' necesita topic o table",
+                "input '{}': start_from solo se usa con kinesis",
+                input.name
+            )));
+        }
+        if input.receive_wait.is_some() && input.kind() != InputKind::Sqs {
+            return Err(Error::Config(format!(
+                "input '{}': receive_wait solo se usa con sqs",
                 input.name
             )));
         }
@@ -164,13 +202,42 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
                         input.name
                     )));
                 }
-                if registry_url(cfg).is_none() {
-                    return Err(Error::Config(format!(
-                        "input '{}': format avro sin archivo requiere connectors.schema_registry.url",
-                        input.name
-                    )));
+                match input.kind() {
+                    InputKind::Topic => {
+                        if registry_url(cfg).is_none() {
+                            return Err(Error::Config(format!(
+                                "input '{}': format avro sin archivo requiere connectors.schema_registry.url",
+                                input.name
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(Error::Config(format!(
+                            "input '{}': el avro de kinesis o sqs trae su schema en avro_schema",
+                            input.name
+                        )));
+                    }
                 }
             }
+        }
+    }
+
+    if cfg.output.topic.is_some() && (kinesis_inputs > 0 || sqs_inputs > 0) {
+        return Err(Error::Config(
+            "el output a topic solo acepta inputs de topic; kinesis y sqs publican una tabla"
+                .to_string(),
+        ));
+    }
+    if cfg
+        .inputs
+        .iter()
+        .any(|input| input.kind() == InputKind::Topic)
+        || cfg.output.topic.is_some()
+    {
+        if cfg.connectors.redpanda.is_none() {
+            return Err(Error::Config(
+                "un input o output de topic requiere connectors.redpanda.brokers".to_string(),
+            ));
         }
     }
 
@@ -688,5 +755,146 @@ deployment:
         table_input.inputs[0].schema = None;
         let err = validate_config(&table_input).unwrap_err();
         assert!(err.to_string().contains("cola de snapshots"), "{err}");
+    }
+
+    fn kinesis_pipeline() -> PipelineConfig {
+        serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  paimon:
+    warehouse: ./w
+  kinesis:
+    region: us-east-1
+inputs:
+  - name: streams
+    kinesis: clicks
+    key: order_id
+    schema: streams.json
+output:
+  name: streams_lake
+  table: default.t
+  key: order_id
+  bucket: 1
+deployment:
+  partitions: 1
+"#,
+        )
+        .expect("yaml de test")
+    }
+
+    #[test]
+    fn a_kinesis_input_reads_a_stream_into_a_table() {
+        let cfg = kinesis_pipeline();
+        assert_eq!(cfg.inputs[0].kind(), InputKind::Kinesis);
+        assert!(validate_config(&cfg).is_ok(), "{cfg:?}");
+    }
+
+    #[test]
+    fn a_kinesis_input_requires_the_connector() {
+        let mut cfg = kinesis_pipeline();
+        cfg.connectors.kinesis = None;
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("connectors.kinesis"), "{err}");
+    }
+
+    #[test]
+    fn a_kinesis_input_cannot_publish_a_topic() {
+        let mut cfg = kinesis_pipeline();
+        cfg.output.table = None;
+        cfg.output.bucket = None;
+        cfg.output.topic = Some("clicks-out".to_string());
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("solo acepta inputs de topic"), "{err}");
+    }
+
+    #[test]
+    fn an_sqs_input_reads_a_queue_into_a_table() {
+        let cfg: PipelineConfig = serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  paimon:
+    warehouse: ./w
+  sqs:
+    region: us-east-1
+    endpoint: http://localhost:4566
+inputs:
+  - name: clicks
+    sqs: clicks-queue
+    key: order_id
+    schema: clicks.json
+    receive_wait: 20s
+output:
+  name: clicks_lake
+  table: default.t
+  key: order_id
+  bucket: 1
+deployment:
+  partitions: 1
+"#,
+        )
+        .expect("yaml de test");
+        assert_eq!(cfg.inputs[0].kind(), InputKind::Sqs);
+        assert!(validate_config(&cfg).is_ok(), "{cfg:?}");
+    }
+
+    #[test]
+    fn an_sqs_input_requires_the_connector() {
+        let mut cfg: PipelineConfig = serde_yaml::from_str(
+            r#"
+pipeline:
+  name: t
+connectors:
+  paimon:
+    warehouse: ./w
+inputs:
+  - name: clicks
+    sqs: clicks-queue
+    key: order_id
+    schema: clicks.json
+output:
+  name: clicks_lake
+  table: default.t
+  key: order_id
+  bucket: 1
+deployment:
+  partitions: 1
+"#,
+        )
+        .expect("yaml de test");
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("connectors.sqs"), "{err}");
+    }
+
+    #[test]
+    fn an_input_has_exactly_one_source() {
+        let mut cfg = kinesis_pipeline();
+        cfg.inputs[0].topic = Some("clicks-topic".to_string());
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("una sola fuente"), "{err}");
+    }
+
+    #[test]
+    fn start_from_and_receive_wait_stay_on_their_source() {
+        let mut cfg = kinesis_pipeline();
+        cfg.inputs[0].receive_wait = Some("20s".to_string());
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("receive_wait solo se usa con sqs"), "{err}");
+
+        let mut topic = pipeline("");
+        topic.inputs[0].start_from = Some(crate::schema::StartFrom::TrimHorizon);
+        let err = validate_config(&topic).unwrap_err();
+        assert!(err.to_string().contains("start_from solo se usa con kinesis"), "{err}");
+    }
+
+    #[test]
+    fn a_topic_input_requires_the_redpanda_connector() {
+        let mut cfg = pipeline("");
+        cfg.connectors.redpanda = None;
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("connectors.redpanda"), "{err}");
     }
 }

@@ -167,7 +167,6 @@ fn main() -> Result<()> {
         if input.paimon_table().is_some() {
             continue;
         }
-        let topic = input.kafka_topic()?;
         let prepared = match input.format {
             PayloadFormat::Json => {
                 let spec = input.schema.as_deref().ok_or_else(|| {
@@ -191,6 +190,9 @@ fn main() -> Result<()> {
                 })?
             }
             PayloadFormat::Avro => {
+                // Avro del registry: solo inputs de topic (kinesis y sqs
+                // traen su schema en `avro_schema`).
+                let topic = input.kafka_topic()?;
                 let url = config
                     .connectors
                     .schema_registry

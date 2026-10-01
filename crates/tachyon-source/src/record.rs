@@ -15,6 +15,9 @@ pub struct SourceRecord {
     pub key: Option<Vec<u8>>,
     /// El payload a decodificar (JSON o Avro).
     pub value: Vec<u8>,
+    /// Posición de una fuente no-Kafka: sequence number de Kinesis o
+    /// receipt handle de SQS. `None` en Kafka/Redpanda (ahí manda `offset`).
+    pub position: Option<String>,
 }
 
 impl SourceRecord {
@@ -25,6 +28,7 @@ impl SourceRecord {
             offset,
             key,
             value,
+            position: None,
         }
     }
 }

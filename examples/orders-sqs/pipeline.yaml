@@ -1,0 +1,31 @@
+pipeline:
+  name: orders-sqs
+  version: 1
+
+connectors:
+  paimon:
+    warehouse: ./warehouse
+    catalog: local
+  sqs:
+    region: us-east-1
+    # endpoint: http://localhost:4566   # floCi
+    # profile: mi-perfil-aws            # opcional
+
+inputs:
+  - name: orders
+    sqs: orders-queue            # nombre de la cola (o URL completa)
+    key: order_id                # == state key == bucket key
+    schema: json/orders          # schema Arrow (columnas que ve el SQL)
+    receive_wait: 20s            # long polling (default: 20s)
+
+output:
+  name: orders_lake
+  table: default.orders_lake
+  key: order_id
+  bucket: 1
+  sequence_field: source_version
+
+deployment:
+  partitions: 1
+  consumers_per_topic: 2         # N consumidores compitiendo por la cola
+  commit_interval: 5s

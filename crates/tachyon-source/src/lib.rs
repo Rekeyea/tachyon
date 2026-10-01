@@ -14,8 +14,10 @@ pub mod consumer;
 pub mod decode;
 pub mod handoff;
 mod json_flat;
+pub mod kinesis;
 pub mod record;
 pub mod schema_wire;
+pub mod sqs;
 pub mod stream;
 
 pub use consumer::{
@@ -23,9 +25,11 @@ pub use consumer::{
 };
 pub use handoff::{StateRequest, WindowHandoff};
 pub use decode::{parse_avro_schema, DecodeFormat, Decoder};
+pub use kinesis::{KinesisSource, LotPositions, StartPosition};
 pub use schema_wire::{
     arrow_from_avro, avro_json_from_arrow, encode_envelopes, latest_topic_schema,
     register_topic_schema, SchemaCache,
 };
 pub use record::SourceRecord;
-pub use stream::{LaneRanges, OffsetTracker, RedpandaPartitionStream};
+pub use sqs::SqsSource;
+pub use stream::{LaneRanges, OffsetTracker, PositionTracker, ReceiptsOut, RedpandaPartitionStream};

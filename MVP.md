@@ -4,7 +4,7 @@
 > **Depende de:** `DESIGN.md` (el diseño completo)
 > **Fecha:** 2026-09-23
 
-El MVP es un **pipeline ETL stateless** de Redpanda → Paimon, escalable por particiones. Es el entregable mínimo que valida la arquitectura: SQL + config, el conector de fuente, la transformación stateless, el sink de Paimon, y el escalado por particiones. El estado (redb), el checkpointing y el fan-in por co-partitioning llegan en fases posteriores.
+El MVP es un **pipeline ETL stateless** de Redpanda/Kinesis/SQS → Paimon, escalable por particiones. Es el entregable mínimo que valida la arquitectura: SQL + config, el conector de fuente, la transformación stateless, el sink de Paimon, y el escalado por particiones. El estado (redb), el checkpointing y el fan-in por co-partitioning llegan en fases posteriores.
 
 ---
 
@@ -16,9 +16,10 @@ El MVP es un **pipeline ETL stateless** de Redpanda → Paimon, escalable por pa
 - **Parsing y validación** de la config y la SQL.
 - **Validación del invariante de alineación** (`inputs[*].key == output.key`, `partitions == buckets`) en compile-time.
 - **Conector fuente Redpanda** (`StreamTableExec`): consumer group, particionado por clave, decodificación a Arrow (Avro y JSON).
+- **Conectores fuente Kinesis y SQS** (pass-through): Kinesis lee todos los shards en paralelo con posición `shard_id → sequence_number` (exactly-once, resume con `AFTER_SEQUENCE_NUMBER`); SQS usa N consumidores compitiendo con long polling y borra los receipt handles tras el commit (at-least-once, dedup por PK + `sequence_field`).
 - **Transformación stateless** en SQL: filter, project, aggregate stateless, join stateless.
 - **Conector sink Paimon**: writer por bucket, sequence numbers, commit.
-- **Fault tolerance (stateless): exactly-once por stream.** Los offsets de cada input se commitean en el mismo paso atómico que el snapshot de Paimon (`commit_identifier` monótono bajo un `commit_user` estable; offsets en `<tabla>/tachyon-offsets/<commit_user>/<id>.json`). Al reiniciar, cada fuente se re-posiciona en el último checkpoint (skip + seek), sin depender de los offsets del consumer group. Requiere un plan pass-through (filter/project/limit), validado al arrancar.
+- **Fault tolerance (stateless): exactly-once por stream.** Los offsets de cada input se commitean en el mismo paso atómico que el snapshot de Paimon (`commit_identifier` monótono bajo un `commit_user` estable; offsets en `<tabla>/tachyon-offsets/<commit_user>/<id>.json`). Al reiniciar, cada fuente se re-posiciona en el último checkpoint (skip + seek), sin depender de los offsets del consumer group. Requiere un plan pass-through (filter/project/limit), validado al arrancar. Con inputs no-Kafka (Kinesis/SQS) el sidecar usa el formato v3 (`{"v":3,"positions":{...}}`), una posición por input; una pipeline solo-Kafka sigue escribiendo v0 byte a byte.
 - **Métricas básicas:** throughput (rows/s, MB/s), consumer lag, memoria, CPU.
 - **Escalado por particiones:** N instancias, cada una con un subconjunto de particiones, escribiendo a buckets disjuntos.
 
