@@ -1,0 +1,24 @@
+# Benchmark del SINK de SQS: input SQS (floCi) -> output SQS (floCi).
+# El mensaje es durable al publicarse (SendMessageBatch); at-least-once.
+# Flink no tiene sink de SQS: esta corrida se mide solo con Tachyon.
+pipeline:
+  name: ${NAME}
+connectors:
+  sqs:
+    region: us-east-1
+    endpoint: http://localhost:4566   # floCi
+inputs:
+  - name: orders
+    sqs: ${QUEUE}
+    key: order_id
+    schema: /bench/tachyon/schemas/etl.json
+output:
+  name: etl_out
+  sqs: ${OUT_QUEUE}
+  key: order_id
+deployment:
+  partitions: 8
+  commit_interval: ${COMMIT}
+  metrics:
+    bind_addr: 127.0.0.1:9464
+${TACHYON_EXTRA}

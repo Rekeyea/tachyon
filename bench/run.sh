@@ -104,6 +104,45 @@ start_engine() { # start_engine <engine> <kind> <source>; exporta CID y GROUP
   export CID
 }
 
+start_sink_engine() { # start_sink_engine <engine> <source>; exporta CID
+  # Sink de Kinesis/SQS: input de AWS -> output de AWS (sin tabla Paimon).
+  # Flink solo tiene sink de Kinesis; SQS se mide solo con Tachyon.
+  local engine=$1 source=$2
+  export NAME="bench-sink-$(date +%s)" COMMIT PARALLELISM
+  stop_engines
+  if [ "$engine" = flink ]; then
+    render "flink/etl-kinesis-sink.sql" ".run/job.sql"
+    CID=$(docker run -d --name bench-flink --network "$NET" --cpuset-cpus "$CPUS" --memory "$MEM" \
+      -v tachyon-bench-wh:/wh -v "$BENCH":/bench \
+      -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test \
+      --entrypoint bash tachyon-bench-flink \
+      -c 'bin/jobmanager.sh start && bin/taskmanager.sh start && sleep infinity')
+    for _ in $(seq 60); do
+      docker exec bench-flink curl -sf localhost:18081/overview 2>/dev/null | grep -q '"slots-total":[1-9]' && break
+      sleep 0.5
+    done
+    docker exec bench-flink bin/sql-client.sh -f /bench/.run/job.sql > .run/submit.log 2>&1
+    grep -q "Job ID" .run/submit.log || { cat .run/submit.log; exit 1; }
+  else
+    local tpl="tachyon/etl-$source-sink.yaml"
+    render "$tpl" ".run/pipeline.yaml"
+    cp "tachyon/etl-sink.sql" .run/pipeline.sql
+    local image=tachyon-build entry=("$TACHYON_BIN") extra=()
+    if [ -n "${PROFILE:-}" ]; then
+      image=tachyon-prof extra=(--privileged)
+      entry=(perf record -F 499 -g -o /bench/.run/perf.data -- "$TACHYON_BIN")
+    fi
+    for v in $(env | grep -o '^TACHYON_DEBUG_[A-Z_]*' || true); do extra+=(-e "$v=1"); done
+    CID=$(docker run -d --name bench-tachyon --network "$NET" --cpuset-cpus "$CPUS" --memory "$MEM" \
+      ${extra[@]+"${extra[@]}"} -e RUST_LOG="${RUST_LOG:-warn}" -e TACHYON_INSTANCE_ID=bench \
+      -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test \
+      -v tachyon-bench-wh:/wh -v "$BENCH":/bench -v tachyon-target:/work/target:ro \
+      --entrypoint "${entry[0]}" "$image" "${entry[@]:1}" \
+      --config /bench/.run/pipeline.yaml --sql /bench/.run/pipeline.sql)
+  fi
+  export CID
+}
+
 meta() { # contexto de la corrida para el jsonl
   python3 -c 'import json,sys,os; r=json.loads(sys.stdin.read()); r.update({"source":os.environ.get("SOURCE","redpanda"),"cpus":os.environ["CPUS"],"mem":os.environ["MEM"],"commit":os.environ["COMMIT"],"parallelism":int(os.environ["PARALLELISM"]),"lag_ms":int(os.environ["LAG_MS"]),"tag":os.environ.get("TAG",""),"tachyon_bin":os.environ["TACHYON_BIN"],"ts":int(__import__("time").time())}); print(json.dumps(r))'
 }
@@ -186,6 +225,37 @@ case "${1:-}" in
       | meta | tee -a "$OUT"
     docker logs "$CID" > ".run/$engine-$kind-live.log" 2>&1 || true
     stop_engines
+    ;;
+  sink)
+    engine=$2 source="${3:-kinesis}"
+    if [ "$engine" = flink ] && [ "$source" = sqs ]; then
+      echo "Flink no tiene sink de SQS: la corrida sqs se mide solo con Tachyon" >&2
+      exit 1
+    fi
+    export SOURCE="$source"
+    NET=$(net_for "$source")
+    case "$source" in
+      kinesis) EVENTS="${SINK_KINESIS_EVENTS:-20000000}" ;;
+      sqs) EVENTS="${SINK_SQS_EVENTS:-500000}" ;;
+    esac
+    export STREAM="bench-etl-sink" QUEUE="bench-etl-sink" \
+           OUT_STREAM="bench-etl-sink-out" OUT_QUEUE="bench-etl-sink-out"
+    # Input fresco: el meta guarda el base_ms exacto para la verificación.
+    harness preload --source "$source" --stream "$STREAM" --queue "$QUEUE" \
+      --shards "$SHARDS" --kind etl --events "$EVENTS"
+    # Salida fresca.
+    harness mksink --source "$source" --stream "$OUT_STREAM" --queue "$OUT_QUEUE" --shards "$SHARDS"
+    start_sink_engine "$engine" "$source"
+    harness drain_sink --engine "$engine" --kind etl --source "$source" \
+      --container "$CID" --warmup "${WARMUP:-10}" --duration "${DURATION:-30}" \
+      | meta > .run/drain_sink.json
+    # Deja cerrar el último tramo y verifica la salida: una tasa sin salida
+    # correcta no cuenta.
+    sleep 3
+    docker logs "$CID" > ".run/$engine-sink.log" 2>&1 || true
+    stop_engines
+    harness verify_sink --source "$source" --stream "$OUT_STREAM" --queue "$OUT_QUEUE" --events "$EVENTS" > .run/verify_sink.json
+    python3 -c 'import json; d=json.load(open(".run/drain_sink.json")); v=json.loads(open(".run/verify_sink.json").read().strip().splitlines()[-1]); span=d["warmup_s"]+d["window_s"]; d["rows_s"]=round(v["output_records"]/span); d["rows_per_cpu_s"]=round(v["output_records"]/max(d["cpu_cores"]*span,1e-9)); d["verify"]=v; print(json.dumps(d))' | tee -a "$OUT"
     ;;
   *) sed -n 2,12p "$0"; exit 1 ;;
 esac

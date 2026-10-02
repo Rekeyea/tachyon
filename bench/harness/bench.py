@@ -728,6 +728,72 @@ def cmd_drain(a):
 
 
 # --------------------------------------------------------------------------
+# sink: throughput de la salida AWS (Kinesis/SQS) por ventana fija
+# --------------------------------------------------------------------------
+# floCi no expone un contador de registros (ni LatestSequenceNumber) y
+# GetRecords no da abasto para seguir un stream a ~100K rec/s en tiempo real.
+# Así que el throughput del sink se mide por ventana: el motor escribe durante
+# warmup+duration y se mide la CPU del cgroup en ese tramo (drain_sink). Luego
+# se lee la salida una sola vez para contar y verificar (verify_sink, vía
+# sink_truth.py): la tasa es el promedio sobre la ventana (incluye el warmup).
+
+def cmd_drain_sink(a):
+    """CPU del motor durante la ventana del sink. El motor ya está corriendo
+    (run.sh lo arrancó); se espera el warmup para que llegue a régimen y se
+    mide la CPU sobre la ventana. El conteo de salida lo hace verify_sink."""
+    cg = Cgroup(a.container)
+    time.sleep(a.warmup)
+    t0 = time.time()
+    cpu0 = cg.cpu_s()
+    time.sleep(a.duration)
+    t1 = time.time()
+    cpu1 = cg.cpu_s()
+    cg.stop()
+    out = {
+        "engine": a.engine, "kind": a.kind, "source": a.source,
+        "warmup_s": a.warmup, "window_s": round(t1 - t0, 2),
+        "cpu_cores": round((cpu1 - cpu0) / (t1 - t0), 2),
+        "peak_anon_mb": round(cg.peak_anon),
+    }
+    print(json.dumps(out))
+
+
+def cmd_verify_sink(a):
+    """Correctitud del sink: lee la salida de AWS y la compara contra la
+    fórmula del generador (sink_truth.py). Devuelve el conteo y la correctitud."""
+    import subprocess
+    target = a.stream if a.source == "kinesis" else a.queue
+    out = subprocess.run(
+        [sys.executable, "/bench/harness/sink_truth.py", a.source, target, str(a.events)],
+        capture_output=True, text=True, check=False)
+    line = (out.stdout.strip().splitlines() or ["{}"])[-1]
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        r = {"error": (out.stderr or out.stdout)[-500:]}
+    r["ok"] = (r.get("extra") == 0 and r.get("wrong_values") == 0
+               and r.get("dup_versions") == 0)
+    r.pop("wrong_sample", None)
+    print(json.dumps(r))
+
+
+def cmd_mksink(a):
+    """Salida fresca: stream o cola nueva para el sink (borra la anterior)."""
+    if a.source == "kinesis":
+        create_stream(a.stream, a.shards)
+    else:
+        q = aws_client("sqs")
+        try:
+            url = q.get_queue_url(QueueName=a.queue)["QueueUrl"]
+            q.delete_queue(QueueUrl=url)
+        except q.exceptions.QueueDoesNotExist:
+            pass
+        time.sleep(1)
+        q.create_queue(QueueName=a.queue)
+    print(json.dumps({"source": a.source, "created": True}))
+
+
+# --------------------------------------------------------------------------
 # live: tasa fija, latencia de punta a punta
 # --------------------------------------------------------------------------
 
@@ -916,6 +982,26 @@ def main():
     p.add_argument("--settle", type=float, default=8)
     p.add_argument("--procs", type=int, default=4)
     p.set_defaults(fn=cmd_live)
+    p = sub.add_parser("mksink")
+    p.add_argument("--source", choices=["kinesis", "sqs"], required=True)
+    p.add_argument("--stream", default=None)
+    p.add_argument("--queue", default=None)
+    p.add_argument("--shards", type=int, default=16)
+    p.set_defaults(fn=cmd_mksink)
+    p = sub.add_parser("drain_sink")
+    p.add_argument("--engine", required=True)
+    p.add_argument("--kind", choices=["etl", "win"], required=True)
+    p.add_argument("--source", choices=["kinesis", "sqs"], required=True)
+    p.add_argument("--container", required=True)
+    p.add_argument("--warmup", type=float, default=10)
+    p.add_argument("--duration", type=float, default=30)
+    p.set_defaults(fn=cmd_drain_sink)
+    p = sub.add_parser("verify_sink")
+    p.add_argument("--source", choices=["kinesis", "sqs"], required=True)
+    p.add_argument("--stream", default=None)
+    p.add_argument("--queue", default=None)
+    p.add_argument("--events", type=int, required=True)
+    p.set_defaults(fn=cmd_verify_sink)
     a = ap.parse_args()
     a.fn(a)
 
