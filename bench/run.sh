@@ -257,5 +257,23 @@ case "${1:-}" in
     harness verify_sink --source "$source" --stream "$OUT_STREAM" --queue "$OUT_QUEUE" --events "$EVENTS" > .run/verify_sink.json
     python3 -c 'import json; d=json.load(open(".run/drain_sink.json")); v=json.loads(open(".run/verify_sink.json").read().strip().splitlines()[-1]); span=d["warmup_s"]+d["window_s"]; d["rows_s"]=round(v["output_records"]/span); d["rows_per_cpu_s"]=round(v["output_records"]/max(d["cpu_cores"]*span,1e-9)); d["verify"]=v; print(json.dumps(d))' | tee -a "$OUT"
     ;;
+  live-sink)
+    # Latencia del sink de Kinesis (punta a punta): produce a tasa fija y
+    # sigue la salida. Solo Kinesis (Flink no tiene sink de SQS).
+    engine=$2
+    export SOURCE="kinesis"
+    NET=$(net_for kinesis)
+    export STREAM="bench-live-sink" OUT_STREAM="bench-live-sink-out"
+    # Input y salida frescos (vacíos): el motor espera en el input vacío.
+    harness preload --source kinesis --stream "$STREAM" --shards "$SHARDS" --kind etl --events 0
+    harness mksink --source kinesis --stream "$OUT_STREAM" --shards "$SHARDS"
+    start_sink_engine "$engine" "kinesis"
+    harness live_sink --engine "$engine" --kind etl --source kinesis \
+      --stream "$STREAM" --out-stream "$OUT_STREAM" --container "$CID" \
+      --rate "${RATE:-5000}" --duration "${DURATION:-30}" --settle "${SETTLE:-8}" \
+      | meta | tee -a "$OUT"
+    docker logs "$CID" > ".run/$engine-sink-live.log" 2>&1 || true
+    stop_engines
+    ;;
   *) sed -n 2,12p "$0"; exit 1 ;;
 esac

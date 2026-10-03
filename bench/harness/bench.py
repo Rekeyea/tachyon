@@ -874,6 +874,85 @@ def cmd_live(a):
     print(json.dumps(out))
 
 
+def cmd_live_sink(a):
+    """Latencia del sink (Kinesis): produce a tasa fija con event_time = reloj
+    de pared y sigue la salida del sink (GetRecords desde LATEST, un hilo por
+    shard). La latencia por registro es `ahora - event_time` en el instante en
+    que el tail lo ve. El input y la salida son frescos (vacíos)."""
+    import threading
+    cg = Cgroup(a.container)
+    k0 = aws_client("kinesis")
+    desc = k0.describe_stream(StreamName=a.out_stream)["StreamDescription"]
+    shards = [s["ShardId"] for s in desc["Shards"]]
+    lat = []
+    stop = threading.Event()
+
+    def tail(shard):
+        k = aws_client("kinesis")
+        it = k.get_shard_iterator(
+            StreamName=a.out_stream, ShardId=shard,
+            ShardIteratorType="LATEST")["ShardIterator"]
+        while not stop.is_set():
+            try:
+                r = k.get_records(ShardIterator=it, Limit=100)
+            except Exception:
+                time.sleep(0.01)
+                continue
+            for rec in r["Records"]:
+                try:
+                    et = json.loads(rec["Data"])["event_time"]
+                except Exception:
+                    continue
+                lat.append(now_ms() - et)
+            it = r["NextShardIterator"]
+            time.sleep(0.01)  # ~100 GetRecords/s por shard
+
+    threads = [threading.Thread(target=tail, args=(s,)) for s in shards]
+    for t in threads:
+        t.start()
+    # Produce el input a tasa fija (event_time = reloj de pared).
+    start_at = time.time() + 1.0
+    q = mp.Queue()
+    procs = []
+    per_part = a.rate / PARTITIONS
+    for w in range(a.procs):
+        parts = [x for x in range(PARTITIONS) if x % a.procs == w]
+        pr = mp.Process(target=_kinesis_live_worker,
+                        args=(a.stream, a.kind, parts, per_part, a.duration, start_at, q))
+        pr.start()
+        procs.append(pr)
+    time.sleep(max(0, start_at - time.time()))
+    cpu0 = cg.cpu_s()
+    t0 = time.time()
+    produced = sum(q.get() for _ in procs)
+    for pr in procs:
+        pr.join()
+    t_prod = time.time() - t0
+    cpu1 = cg.cpu_s()
+    # Deja que el sink publique las últimas filas.
+    time.sleep(a.settle)
+    stop.set()
+    for t in threads:
+        t.join(timeout=5)
+    cg.stop()
+    arr = np.array(lat) if lat else np.array([0])
+    expected = produced * 9 // 10 if a.kind == "etl" else None
+    out = {"engine": a.engine, "kind": a.kind, "source": a.source,
+           "rate_target": a.rate, "rate_real": round(produced / t_prod),
+           "produced": produced,
+           "cpu_cores": round((cpu1 - cpu0) / t_prod, 2),
+           "peak_anon_mb": round(cg.peak_anon),
+           "rows": int(arr.size),
+           "p50_ms": int(np.percentile(arr, 50)),
+           "p90_ms": int(np.percentile(arr, 90)),
+           "p99_ms": int(np.percentile(arr, 99)),
+           "max_ms": int(arr.max()),
+           "mean_ms": round(float(arr.mean()), 1)}
+    if expected is not None:
+        out["landed_fraction"] = round(arr.size / max(expected, 1), 4)
+    print(json.dumps(out))
+
+
 def cmd_verify_etl(a):
     """ETL: cada evento no cancelado aparece una vez (claves únicas)."""
     import verify
@@ -1002,6 +1081,18 @@ def main():
     p.add_argument("--queue", default=None)
     p.add_argument("--events", type=int, required=True)
     p.set_defaults(fn=cmd_verify_sink)
+    p = sub.add_parser("live_sink")
+    p.add_argument("--engine", required=True)
+    p.add_argument("--kind", choices=["etl", "win"], required=True)
+    p.add_argument("--source", choices=["kinesis"], required=True)
+    p.add_argument("--stream", default=None)
+    p.add_argument("--out-stream", default=None)
+    p.add_argument("--container", required=True)
+    p.add_argument("--rate", type=int, required=True)
+    p.add_argument("--duration", type=float, default=30)
+    p.add_argument("--settle", type=float, default=8)
+    p.add_argument("--procs", type=int, default=4)
+    p.set_defaults(fn=cmd_live_sink)
     a = ap.parse_args()
     a.fn(a)
 
