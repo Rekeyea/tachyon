@@ -159,7 +159,41 @@ def create_topic(topic, partitions=PARTITIONS):
             time.sleep(1)
 
 
+def cmd_preload_news2(a):
+    """Un topic, una partición, el mismo orden de event time que la fórmula."""
+    sys.path.insert(0, "/bench/harness")
+    import news2
+
+    patients, minutes = news2.scale()
+    create_topic(a.topic, partitions=news2.TOPIC_PARTITIONS)
+    producer = _producer()
+    sent = 0
+    t0 = time.time()
+    for event in news2.iter_events(patients, minutes):
+        key, value = news2.payload(event)
+        _produce_one(producer, a.topic, value, key, 0)
+        sent += 1
+        if sent % 10000 == 0:
+            producer.poll(0)
+    producer.flush(300)
+    dt = time.time() - t0
+    print(json.dumps({
+        "source": "redpanda",
+        "kind": "news2",
+        "topic": a.topic,
+        "events": sent,
+        "patients": patients,
+        "minutes": minutes,
+        "wide_rows": patients * minutes,
+        "base_ms": news2.BASE_MS,
+        "secs": round(dt, 1),
+        "rate": round(sent / dt) if dt else 0,
+    }))
+
+
 def cmd_preload(a):
+    if a.kind == "news2":
+        return cmd_preload_news2(a)
     if a.source == "redpanda":
         create_topic(a.topic)
         worker, target = _preload_worker, a.topic
@@ -632,13 +666,32 @@ def scrape(url):
     return out
 
 
+def cmd_truth_news2(a):
+    import subprocess
+    out = subprocess.run(
+        [sys.executable, "/bench/harness/truth_news2.py", a.topic, a.warehouse],
+        capture_output=True, text=True, check=False)
+    line = (out.stdout.strip().splitlines() or ["{}"])[-1]
+    try:
+        result = json.loads(line)
+    except json.JSONDecodeError:
+        result = {"ok": False, "error": (out.stderr or out.stdout)[-800:]}
+    if out.returncode and result.get("ok") is not True:
+        result["ok"] = False
+        if out.stderr:
+            result["stderr"] = out.stderr[-800:]
+    print(json.dumps(result))
+
+
 def cmd_drain(a):
     cg = Cgroup(a.container)
     wait_table(a.table)
     # Progreso = filas commiteadas en Paimon (igual señal para los tres motores
     # y las tres fuentes). El backlog es el 90% de los eventos (el ETL filtra
     # el 10% cancelado).
-    if a.source == "redpanda":
+    if a.backlog:
+        total = a.backlog
+    elif a.source == "redpanda":
         total = end_offsets(a.topic) * 9 // 10
     else:
         total = a.events * 9 // 10
@@ -694,30 +747,31 @@ def cmd_drain(a):
     if 0.2 in mark and 0.8 in mark:
         (t0, c0, u0), (t1, c1, u1) = mark[0.2], mark[0.8]
         dt = t1 - t0
-        out.update({
-            "rows_s": round((c1 - c0) / dt),
-            "cpu_cores": round((u1 - u0) / dt, 2),
-            "rows_per_cpu_s": round((c1 - c0) / max(u1 - u0, 1e-9)),
-        })
-        # Estabilidad: tasa por tramo de 1s dentro del 20-80%.
-        win = [s for s in samples if t0 <= s[0] <= t1]
-        rates = []
-        i = 0
-        for j in range(len(win)):
-            while win[j][0] - win[i][0] > 2.0:
-                i += 1
-            if win[j][0] - win[i][0] >= 1.5:
-                rates.append((win[j][1] - win[i][1]) / (win[j][0] - win[i][0]))
-        if rates:
-            r = np.array(rates)
-            out["rate_cv"] = round(float(r.std() / max(r.mean(), 1)), 3)
-        m0, m1 = mark.get(("m", 0.2)), mark.get(("m", 0.8))
-        if m0 and m1:
-            # Segundos de cada etapa en la ventana 20-80% (source_next y
-            # send_wait son del loop principal; write y commit, de sus tasks).
-            out["stages_s"] = {k: round((m1[k] - m0[k]) / 1e9, 2)
-                               for k in ("source_next_ns", "send_wait_ns", "write_ns", "commit_ns")
-                               if k in m0 and k in m1}
+        if dt > 0:
+            out.update({
+                "rows_s": round((c1 - c0) / dt),
+                "cpu_cores": round((u1 - u0) / dt, 2),
+                "rows_per_cpu_s": round((c1 - c0) / max(u1 - u0, 1e-9)),
+            })
+            # Estabilidad: tasa por tramo de 1s dentro del 20-80%.
+            win = [s for s in samples if t0 <= s[0] <= t1]
+            rates = []
+            i = 0
+            for j in range(len(win)):
+                while win[j][0] - win[i][0] > 2.0:
+                    i += 1
+                if win[j][0] - win[i][0] >= 1.5:
+                    rates.append((win[j][1] - win[i][1]) / (win[j][0] - win[i][0]))
+            if rates:
+                r = np.array(rates)
+                out["rate_cv"] = round(float(r.std() / max(r.mean(), 1)), 3)
+            m0, m1 = mark.get(("m", 0.2)), mark.get(("m", 0.8))
+            if m0 and m1:
+                # Segundos de cada etapa en la ventana 20-80% (source_next y
+                # send_wait son del loop principal; write y commit, de sus tasks).
+                out["stages_s"] = {k: round((m1[k] - m0[k]) / 1e9, 2)
+                                   for k in ("source_next_ns", "send_wait_ns", "write_ns", "commit_ns")
+                                   if k in m0 and k in m1}
     out.update({
         "first_commit_s": round(first_commit, 2) if first_commit else None,
         "drain_s": round(t_end - t_start, 2),
@@ -1008,7 +1062,7 @@ def main():
     p.add_argument("--topic", default=None)
     p.add_argument("--stream", default=None)
     p.add_argument("--queue", default=None)
-    p.add_argument("--kind", choices=["etl", "win"], required=True)
+    p.add_argument("--kind", choices=["etl", "win", "news2"], required=True)
     p.add_argument("--events", type=int, required=True)
     p.add_argument("--procs", type=int, default=4)
     p.add_argument("--shards", type=int, default=16)
@@ -1033,7 +1087,7 @@ def main():
     p.set_defaults(fn=lambda a: create_topic(a.topic))
     p = sub.add_parser("drain")
     p.add_argument("--engine", required=True)
-    p.add_argument("--kind", choices=["etl", "win"], required=True)
+    p.add_argument("--kind", choices=["etl", "win", "news2"], required=True)
     p.add_argument("--source", choices=["redpanda", "kinesis", "sqs"], default="redpanda")
     p.add_argument("--topic", default=None)
     p.add_argument("--stream", default=None)
@@ -1045,7 +1099,12 @@ def main():
     p.add_argument("--container", required=True)
     p.add_argument("--timeout", type=float, default=600)
     p.add_argument("--metrics", default=None)
+    p.add_argument("--backlog", type=int, default=None)
     p.set_defaults(fn=cmd_drain)
+    p = sub.add_parser("truth_news2")
+    p.add_argument("--topic", required=True)
+    p.add_argument("--warehouse", required=True)
+    p.set_defaults(fn=cmd_truth_news2)
     p = sub.add_parser("live")
     p.add_argument("--engine", required=True)
     p.add_argument("--kind", choices=["etl", "win"], required=True)

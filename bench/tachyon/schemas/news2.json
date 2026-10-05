@@ -1,0 +1,7 @@
+[
+  {"name": "event_id", "type": "Int64", "nullable": false},
+  {"name": "patient_id", "type": "Utf8", "nullable": false},
+  {"name": "measurement_type", "type": "Utf8", "nullable": false},
+  {"name": "value", "type": "Float64", "nullable": false},
+  {"name": "measurement_timestamp", "type": "Int64", "nullable": false}
+]

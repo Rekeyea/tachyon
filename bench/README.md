@@ -95,24 +95,44 @@ Una corrida suelta: `bench/run.sh drain tachyon etl` (Redpanda),
 escenario; `PROFILE=1` corre Tachyon bajo `perf`. En SQS el preload es
 destructivo (cola): `drain` lo refresca justo antes de arrancar el motor.
 
-## Resultados (2026-09-30, Linux x86_64, 24 CPUs, 4 por motor)
+## Resultados (Linux x86_64, 24 CPUs, 4 por motor)
 
 Tachyon `benchfast` contra Flink 2.2.1 + Paimon 1.4.2. Toda corrida de
-throughput verificó su salida fila por fila; `python3 bench/report.py`
-regenera las tablas desde `results/`.
+throughput verificó su salida fila por fila. `python3 bench/report.py`
+imprime la mediana de todas las corridas verificadas en `results/`, y eso
+mezcla lectores viejos. El corte de cada tabla está en la subsección.
 
 ### Kinesis (10M eventos, 16 shards)
 
-Throughput (backlog drenado, exactly-once, salida verificada):
+Throughput (backlog drenado, exactly-once, salida verificada). Flink es la
+corrida única de `results/2026-09-30.jsonl`. Tachyon son las 12 últimas
+corridas verificadas de `results/2026-10-03.jsonl` (ts 1791063204 a
+1791063559): el lector que quedó. Las líneas anteriores de ese archivo son
+binarios intermedios del mismo día y no entran en la mediana. La SQL
+descarta el 10% `cancelled`: 9 000 000 filas en las 12, sin duplicados, sin
+faltantes y sin valores malos.
 
-| motor | corridas | filas/s (mediana) | cores usados | filas/CPU-s | RSS anon pico |
-|---|---|---|---|---|---|
-| tachyon | 1 | 364K | 0.77 | 540K | 595 MB |
-| flink | 1 | 460K | 2.37 | 180K | 1953 MB |
-| **Tachyon / Flink** | | **0.79x** en filas/s | | **3.0x** en filas/CPU-s | |
+| motor | corridas | filas/s (mediana) | min–max | cores usados | filas/CPU-s | RSS anon pico |
+|---|---|---|---|---|---|---|
+| tachyon | 12 | 954K | 186K–1.05M | 1.92 | 496K | 551 MB |
+| flink (30 Sep) | 1 | 460K | — | 2.37 | 180K | 1953 MB |
+| **Tachyon / Flink** | | **2.08x** | peor Tachyon / esa corrida de Flink: **0.40x** | | **2.76x** | |
 
-Latencia de punta a punta (tasa objetivo 100K/s; real 75K Tachyon / 53K
-Flink, acotada por floCi; `landed_fraction` 1.0 en ambos):
+Diez de las doce quedan entre 903K y 1.05M filas/s. La mediana del drenado
+completo es 9.9 s (la de Flink, 37 s). Dos quedan por debajo de Flink: 186K
+(drenado 30.0 s, 0.45 cores, `source_next` 25.2 s) y 321K (drenado 22.9 s,
+0.88 cores, `source_next` 12.0 s). En la de 321K el log mostró 16
+GetRecords en vuelo durante todo el tramo lento: Tachyon esperaba a floCi.
+La de 186K no quedó con ese log.
+
+En la ventana del 20% al 80%, `source_next` sigue siendo casi todo el
+reloj. En una corrida rápida son ~5 s de ~6 s; el write de Paimon ~0.3 s
+y el commit ~1.1 s. `source_next` es la espera de `lane.next()`: el
+GetRecords y el decode.
+
+Latencia de punta a punta, medida el 30 Sep y no repetida (tasa objetivo
+100K/s; real 75K Tachyon / 53K Flink, acotada por floCi; `landed_fraction`
+1.0 en ambos):
 
 | motor | p50 | p99 | p99.9 | max | cores |
 |---|---|---|---|---|---|
@@ -147,10 +167,11 @@ máquina hay corridas sueltas (`results/2026-09-30.jsonl`). Resumen M5
 
 ## Límites conocidos
 
-- floCi emula Kinesis y SQS en un solo proceso: SQS queda acotado a
-  ~780–1300 msg/s y Kinesis a ~75K–240K rec/s según la carga. Las tasas de
-  SQS miden el emulador, no al motor; en AWS real el motor consume en
-  paralelo por shard/cola.
+- floCi emula Kinesis y SQS en un solo proceso. En vivo, Kinesis queda en
+  ~75K–240K rec/s y SQS en ~780–1300 msg/s: esas tasas miden el emulador.
+  Un drenado lee un stream ya cargado. Ahí 10 de las 12 corridas del 3 Oct
+  quedan entre 903K y 1.05M filas/s, y 2 se quedan en 186K y 321K. En AWS
+  el motor lee cada shard en paralelo.
 - Flink no tiene source de SQS: la comparación de paridad solo existe para
   Kinesis (y Redpanda).
 - El backlog de Kinesis (10M) es menor que el de Redpanda (60M) para que el

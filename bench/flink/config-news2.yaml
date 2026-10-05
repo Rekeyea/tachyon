@@ -1,0 +1,47 @@
+# Igual que config.yaml (proceso 3072m, cgroup 4608m) salvo el reparto interno.
+# El backend es hashmap, así que el managed por defecto (~1 GB) no se usa y el
+# heap de tareas se queda en ~1 GB. NEWS2 tiene 13 sinks Paimon en ese heap.
+# El managed baja a 128m y la red a 64m; el resto sigue siendo heap de tareas.
+jobmanager:
+  rpc:
+    address: localhost
+    port: 6123
+  bind-host: 0.0.0.0
+  memory:
+    process:
+      size: 1024m
+taskmanager:
+  bind-host: 0.0.0.0
+  host: localhost
+  numberOfTaskSlots: 8
+  memory:
+    process:
+      size: 3072m
+    managed:
+      size: 128m
+    network:
+      min: 64m
+      max: 64m
+rest:
+  port: 18081
+  address: localhost
+  bind-address: 0.0.0.0
+blob:
+  server:
+    port: 6124
+parallelism:
+  default: 4
+execution:
+  checkpointing:
+    interval: 1s
+    mode: EXACTLY_ONCE
+    dir: file:///wh/flink-checkpoints
+state:
+  backend:
+    type: hashmap
+pipeline:
+  object-reuse: true
+env:
+  java:
+    opts:
+      all: --add-exports=java.rmi/sun.rmi.registry=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED --add-exports=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.text=ALL-UNNAMED --add-opens=java.base/java.time=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED

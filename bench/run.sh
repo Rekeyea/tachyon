@@ -2,7 +2,7 @@
 # Benchmark Tachyon vs Flink en la misma máquina.
 #
 #   bench/run.sh preload                       # una vez: carga bench-etl y bench-win
-#   bench/run.sh drain <tachyon|flink> <etl|win>
+#   bench/run.sh drain <tachyon|flink> <etl|win|news2>
 #   bench/run.sh live  <tachyon|flink> <etl|win> <rate>
 #
 # Variables: CPUS (cpuset del motor, default 4-7), MEM (tope, default 4608m),
@@ -34,6 +34,8 @@ OUT="results/$(date +%Y-%m-%d).jsonl"
 
 harness() {
   docker run --rm --network "$NET" --cpuset-cpus "$HARNESS_CPUS" \
+    -e NEWS2_PATIENTS="${NEWS2_PATIENTS:-250}" \
+    -e NEWS2_MINUTES="${NEWS2_MINUTES:-2000}" \
     -v tachyon-bench-wh:/wh -v /sys/fs/cgroup:/cg:ro -v "$BENCH":/bench \
     tachyon-benchkit python harness/bench.py "$@"
 }
@@ -151,6 +153,75 @@ LAG_S=$(python3 -c "print(f'{${LAG_MS}/1000:.3f}')")
 TACHYON_EXTRA="${TACHYON_EXTRA:-}"
 export CPUS MEM COMMIT PARALLELISM LAG_MS LAG_S TACHYON_EXTRA TACHYON_BIN
 
+drain_news2() {
+  local engine=$1
+  export LAG_MS=10000
+  LAG_S=$(python3 -c "print(f'{${LAG_MS}/1000:.3f}')")
+  export LAG_S SOURCE=redpanda
+  export NEWS2_PATIENTS="${NEWS2_PATIENTS:-250}"
+  export NEWS2_MINUTES="${NEWS2_MINUTES:-2000}"
+  export TOPIC=bench-news2
+  export NAME="bench-news2-$(date +%s)"
+  export GROUP="flink-$NAME"
+  NET="container:tachyon-redpanda"
+  python3 harness/news2.py --render "$engine" .run
+  harness preload --source redpanda --topic "$TOPIC" --kind news2 --events 0 \
+    | tee .run/news2-preload.json
+  local wide
+  wide=$(python3 -c 'import json; print(json.load(open(".run/news2-preload.json"))["wide_rows"])')
+  stop_engines
+  docker run --rm -v tachyon-bench-wh:/wh tachyon-benchkit \
+    sh -c "rm -rf /wh/$engine/delta.db /wh/flink-checkpoints; mkdir -p /wh/$engine; chmod -R 777 /wh"
+  docker run --rm --cpuset-cpus "$HARNESS_CPUS" -v tachyon-bench-wh:/wh -v "$BENCH":/bench \
+    --entrypoint bash tachyon-bench-flink -c "bin/sql-client.sh -f /bench/.run/ddl.sql" \
+    > .run/ddl.log 2>&1 || { cat .run/ddl.log; exit 1; }
+  if grep -q "ERROR" .run/ddl.log; then cat .run/ddl.log; exit 1; fi
+  if [ "$engine" = flink ]; then
+    CID=$(docker run -d --name bench-flink --network "$NET" --cpuset-cpus "$CPUS" --memory "$MEM" \
+      -v tachyon-bench-wh:/wh -v "$BENCH":/bench \
+      -v "$BENCH/flink/config-news2.yaml:/opt/flink/conf/config.yaml:ro" \
+      --entrypoint bash tachyon-bench-flink \
+      -c 'bin/jobmanager.sh start && bin/taskmanager.sh start && sleep infinity')
+    for _ in $(seq 60); do
+      docker exec bench-flink curl -sf localhost:18081/overview 2>/dev/null | grep -q '"slots-total":[1-9]' && break
+      sleep 0.5
+    done
+    if ! docker exec bench-flink bin/sql-client.sh -f /bench/.run/job.sql > .run/submit.log 2>&1; then
+      cat .run/submit.log
+      exit 1
+    fi
+    grep -q "Job ID" .run/submit.log || { cat .run/submit.log; exit 1; }
+  else
+    CID=$(docker run -d --name bench-tachyon --network "$NET" --cpuset-cpus "$CPUS" --memory "$MEM" \
+      -e RUST_LOG="${RUST_LOG:-warn}" -e TACHYON_INSTANCE_ID=bench \
+      -v tachyon-bench-wh:/wh -v "$BENCH":/bench -v tachyon-target:/work/target:ro \
+      --entrypoint bash tachyon-build /bench/.run/news2-tachyon.sh)
+    # 1s basta para ver si el proceso murió al arrancar. Con 4s, en esta
+    # escala el wide table a veces ya pasó el 20% y la medición no ve saltos.
+    sleep 1
+    docker ps --format '{{.Names}}' | grep -qx bench-tachyon || {
+      echo "tachyon no quedó en pie" >&2
+      docker logs bench-tachyon 2>&1 | tail -80 || true
+      cat .run/news2/*.log 2>/dev/null || true
+      exit 1
+    }
+  fi
+  export CID
+  local metrics=()
+  if [ "$engine" = tachyon ]; then
+    metrics=(--metrics http://127.0.0.1:9464/metrics)
+  fi
+  harness drain --engine "$engine" --kind news2 --source redpanda \
+    --topic "$TOPIC" --table "/wh/$engine/delta.db/news2_wide" --group "$GROUP" \
+    --container "$CID" --timeout "${TIMEOUT:-900}" --backlog "$wide" \
+    ${metrics[@]+"${metrics[@]}"} | meta > .run/drain.json
+  sleep 3
+  docker logs "$CID" > ".run/$engine-news2.log" 2>&1 || true
+  stop_engines
+  harness truth_news2 --topic "$TOPIC" --warehouse "/wh/$engine" > .run/verify.json
+  python3 -c 'import json; r=json.load(open(".run/drain.json")); v=json.loads(open(".run/verify.json").read().strip().splitlines()[-1]); r["verify"]=v; print(json.dumps(r))' | tee -a "$OUT"
+}
+
 case "${1:-}" in
   preload)
     source="${2:-redpanda}"
@@ -170,6 +241,10 @@ case "${1:-}" in
     esac
     ;;
   drain)
+    if [ "${3:-}" = news2 ]; then
+      drain_news2 "$2"
+      exit 0
+    fi
     engine=$2 kind=$3 source="${4:-redpanda}"
     export SOURCE="$source"
     NET=$(net_for "$source")
