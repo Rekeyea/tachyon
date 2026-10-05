@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use aws_config::SdkConfig;
 use aws_types::region::Region;
 use tachyon_config::{KinesisConfig, SqsConfig};
+use tachyon_source::KinesisReader;
 
 /// Carga el `SdkConfig` de un conector: región de la config, perfil y
 /// endpoint opcionales.
@@ -16,9 +17,8 @@ pub(crate) async fn sdk_config(
     profile: Option<&str>,
     endpoint: Option<&str>,
 ) -> Result<SdkConfig> {
-    let mut builder =
-        aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(Region::new(region.to_string()));
+    let mut builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(Region::new(region.to_string()));
     if let Some(profile) = profile {
         builder = builder.profile_name(profile.to_string());
     }
@@ -28,17 +28,49 @@ pub(crate) async fn sdk_config(
     Ok(builder.load().await)
 }
 
-pub(crate) async fn kinesis_client(config: &KinesisConfig) -> Result<aws_sdk_kinesis::Client> {
-    let sdk = sdk_config(&config.region, config.profile.as_deref(), config.endpoint.as_deref())
-        .await
-        .with_context(|| format!("cargando credenciales para kinesis ({})", config.region))?;
-    Ok(aws_sdk_kinesis::Client::new(&sdk))
+pub(crate) struct KinesisSession {
+    pub client: aws_sdk_kinesis::Client,
+    pub reader: Option<KinesisReader>,
+}
+
+pub(crate) async fn kinesis_client(config: &KinesisConfig) -> Result<KinesisSession> {
+    let sdk = sdk_config(
+        &config.region,
+        config.profile.as_deref(),
+        config.endpoint.as_deref(),
+    )
+    .await
+    .with_context(|| format!("cargando credenciales para kinesis ({})", config.region))?;
+    let client = aws_sdk_kinesis::Client::new(&sdk);
+    let reader = match sdk.credentials_provider() {
+        Some(provider) => {
+            let region = sdk
+                .region()
+                .map(|region| region.as_ref().to_string())
+                .unwrap_or_else(|| config.region.clone());
+            let endpoint = sdk
+                .endpoint_url()
+                .map(|endpoint| endpoint.to_string())
+                .unwrap_or_else(|| format!("https://kinesis.{region}.amazonaws.com"));
+            Some(
+                KinesisReader::new(provider, region, endpoint).map_err(|error| {
+                    anyhow::anyhow!("lector kinesis ({}): {error}", config.region)
+                })?,
+            )
+        }
+        None => None,
+    };
+    Ok(KinesisSession { client, reader })
 }
 
 pub(crate) async fn sqs_client(config: &SqsConfig) -> Result<aws_sdk_sqs::Client> {
-    let sdk = sdk_config(&config.region, config.profile.as_deref(), config.endpoint.as_deref())
-        .await
-        .with_context(|| format!("cargando credenciales para sqs ({})", config.region))?;
+    let sdk = sdk_config(
+        &config.region,
+        config.profile.as_deref(),
+        config.endpoint.as_deref(),
+    )
+    .await
+    .with_context(|| format!("cargando credenciales para sqs ({})", config.region))?;
     Ok(aws_sdk_sqs::Client::new(&sdk))
 }
 

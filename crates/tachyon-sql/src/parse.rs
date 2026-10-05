@@ -57,6 +57,10 @@ pub struct UnionBranch {
     pub source: String,
 }
 
+/// Nombre con el que el runtime registra la concatenación de las ramas.
+/// No es un input: las tablas de verdad son `union_all[*].source`.
+pub const UNION_SOURCE: &str = "_tachyon_union";
+
 /// Ventana reconocida en el `GROUP BY`, antes de que DataFusion vea la SQL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowShape {
@@ -68,6 +72,8 @@ pub struct WindowShape {
     /// Columnas del `GROUP BY` que no son la llamada de ventana.
     pub group_columns: Vec<String>,
     pub aggs: Vec<WindowAgg>,
+    /// Sumas de alias de agregados. Van después de los agregados en la tabla.
+    pub derived: Vec<WindowDerived>,
     /// `WHERE` original, si hay. El rewrite lo conserva.
     pub filter_sql: Option<String>,
     /// Tabla del `FROM`. Una sola, en una query de ventana.
@@ -78,8 +84,20 @@ pub struct WindowShape {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowAgg {
     pub kind: AggKind,
+    /// Columna que ve el operador. En una expresión es `_tachyon_agg_N`.
     pub input: Option<String>,
+    /// Expresión SQL proyectada antes del acumulador. `None` si `input` es una columna.
+    pub project: Option<String>,
     pub alias: String,
+    /// Literal de `COALESCE(agg, literal)`, en texto (`0`, `0.0`).
+    pub fill: Option<String>,
+}
+
+/// Suma de alias ya agregados. No tiene estado: se calcula al cerrar la ventana.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowDerived {
+    pub alias: String,
+    pub terms: Vec<String>,
 }
 
 impl WindowShape {
@@ -95,14 +113,21 @@ impl WindowShape {
         if !cols.contains(&self.event_time.as_str()) {
             cols.push(&self.event_time);
         }
+        let mut projected: Vec<String> = cols.iter().map(|col| (*col).to_string()).collect();
         for agg in &self.aggs {
-            if let Some(input) = &agg.input {
-                if !cols.contains(&input.as_str()) {
-                    cols.push(input);
+            if let Some(project) = &agg.project {
+                let name = agg
+                    .input
+                    .as_deref()
+                    .expect("una expresión de agregado tiene columna sintética");
+                projected.push(format!("({project}) AS {name}"));
+            } else if let Some(input) = &agg.input {
+                if !projected.iter().any(|col| col == input) {
+                    projected.push(input.clone());
                 }
             }
         }
-        let list = cols.join(", ");
+        let list = projected.join(", ");
         let mut sql = format!(
             "SELECT {list}, _tachyon_partition FROM {}",
             self.source
@@ -152,15 +177,26 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
         .source
         .as_ref()
         .ok_or_else(|| Error::Sql("el INSERT no tiene una query SELECT".to_string()))?;
-    let source_tables = extract_source_tables(source);
+    let mut source_tables = extract_source_tables(source);
     let mut window = window_shape(source)?;
+    let nested = if window.is_some() {
+        union_under_window(source)?
+    } else {
+        None
+    };
+    if let Some(branches) = &nested {
+        source_tables = branches.iter().map(|branch| branch.source.clone()).collect();
+    }
     if let Some(shape) = window.as_mut() {
-        if source_tables.len() != 1 {
+        if nested.is_some() {
+            shape.source = UNION_SOURCE.to_string();
+        } else if source_tables.len() != 1 {
             return Err(Error::Sql(
                 "una query de ventana tiene un solo FROM".to_string(),
             ));
+        } else {
+            shape.source = source_tables[0].clone();
         }
-        shape.source = source_tables[0].clone();
     }
     let (join, lookup) = match classify_join(source)? {
         Some(JoinClass::Interval(join)) => (Some(join), None),
@@ -177,7 +213,15 @@ pub fn parse_sql(sql: &str) -> Result<ParsedSql, Error> {
             "una query no puede ser ventana y lookup a la vez".to_string(),
         ));
     }
-    let union_all = union_branches(source)?;
+    let mut union_all = union_branches(source)?;
+    if let Some(branches) = nested {
+        if union_all.is_some() {
+            return Err(Error::Sql(
+                "UNION ALL de la ventana no se anida dos veces".to_string(),
+            ));
+        }
+        union_all = Some(branches);
+    }
     // UNION ALL con window es válido: las ramas se unifican y la ventana
     // opera sobre el stream combinado. Con join o lookup no se permite aún
     // (el runtime necesita soporte de fan-in stateful para eso).
@@ -234,6 +278,37 @@ fn union_branches(query: &Query) -> Result<Option<Vec<UnionBranch>>, Error> {
         seen.push(branch.source.clone());
     }
     Ok(Some(branches))
+}
+
+/// `FROM (SELECT ... UNION ALL SELECT ...)`. Las ramas son las tablas.
+fn union_under_window(query: &Query) -> Result<Option<Vec<UnionBranch>>, Error> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Ok(None);
+    }
+    match &select.from[0].relation {
+        TableFactor::Derived {
+            lateral, subquery, ..
+        } => {
+            if *lateral {
+                return Err(Error::Sql(
+                    "la ventana no acepta un LATERAL".to_string(),
+                ));
+            }
+            match union_branches(subquery)? {
+                Some(branches) => Ok(Some(branches)),
+                None => Err(Error::Sql(
+                    "la ventana sobre varias tablas las une con UNION ALL".to_string(),
+                )),
+            }
+        }
+        TableFactor::Table { .. } => Ok(None),
+        _ => Err(Error::Sql(
+            "una query de ventana tiene un solo FROM".to_string(),
+        )),
+    }
 }
 
 fn query_limits_the_result(query: &Query) -> bool {
@@ -996,7 +1071,9 @@ fn window_shape(query: &Query) -> Result<Option<WindowShape>, Error> {
     }
     if let Some(shape) = window.as_mut() {
         shape.group_columns = group_columns;
-        shape.aggs = select_aggs(&select.projection)?;
+        let (aggs, derived) = select_window_outputs(&select.projection, &shape.group_columns)?;
+        shape.aggs = aggs;
+        shape.derived = derived;
         shape.filter_sql = select.selection.as_ref().map(|expr| expr.to_string());
         if shape.aggs.is_empty() {
             return Err(Error::Sql(
@@ -1007,25 +1084,60 @@ fn window_shape(query: &Query) -> Result<Option<WindowShape>, Error> {
     Ok(window)
 }
 
-fn select_aggs(items: &[SelectItem]) -> Result<Vec<WindowAgg>, Error> {
+fn select_window_outputs(
+    items: &[SelectItem],
+    group: &[String],
+) -> Result<(Vec<WindowAgg>, Vec<WindowDerived>), Error> {
     let mut aggs = Vec::new();
+    let mut derived = Vec::new();
     for item in items {
         match item {
             SelectItem::ExprWithAlias { expr, alias } => {
-                if let Some((kind, input)) = agg_call(expr)? {
-                    aggs.push(WindowAgg {
-                        kind,
-                        input,
+                if let Some(sum) = sum_terms(expr) {
+                    for term in &sum {
+                        if !aggs.iter().any(|agg: &WindowAgg| agg.alias == *term) {
+                            return Err(Error::Sql(format!(
+                                "'{}' suma '{term}', que no es un agregado de esta ventana",
+                                alias.value
+                            )));
+                        }
+                    }
+                    derived.push(WindowDerived {
                         alias: alias.value.clone(),
+                        terms: sum,
                     });
+                    continue;
                 }
+                if let Some(parsed) = coalesce_agg(expr)? {
+                    push_agg(&mut aggs, parsed, alias.value.clone())?;
+                    continue;
+                }
+                if let Some(parsed) = agg_call(expr)? {
+                    push_agg(&mut aggs, parsed, alias.value.clone())?;
+                    continue;
+                }
+                return Err(Error::Sql(format!(
+                    "la ventana no acepta la expresión '{}'",
+                    alias.value
+                )));
             }
             SelectItem::UnnamedExpr(expr) => {
-                if agg_call(expr)?.is_some() {
+                if agg_call(expr)?.is_some() || coalesce_agg(expr)?.is_some() {
                     return Err(Error::Sql(
                         "el agregado de una ventana necesita alias".to_string(),
                     ));
                 }
+                if let Expr::Identifier(ident) = expr {
+                    if group.iter().any(|col| col == &ident.value)
+                        || ident.value == "window_start"
+                        || ident.value == "window_end"
+                    {
+                        continue;
+                    }
+                }
+                return Err(Error::Sql(format!(
+                    "la ventana no acepta la expresión {expr}"
+                )));
             }
             _ => {
                 return Err(Error::Sql(
@@ -1034,10 +1146,65 @@ fn select_aggs(items: &[SelectItem]) -> Result<Vec<WindowAgg>, Error> {
             }
         }
     }
-    Ok(aggs)
+    for (index, agg) in aggs.iter_mut().enumerate() {
+        if agg.project.is_some() {
+            agg.input = Some(format!("_tachyon_agg_{index}"));
+        }
+    }
+    Ok((aggs, derived))
 }
 
-fn agg_call(expr: &Expr) -> Result<Option<(AggKind, Option<String>)>, Error> {
+struct ParsedAgg {
+    kind: AggKind,
+    input: Option<String>,
+    project: Option<String>,
+    fill: Option<String>,
+}
+
+fn push_agg(aggs: &mut Vec<WindowAgg>, parsed: ParsedAgg, alias: String) -> Result<(), Error> {
+    if aggs.iter().any(|agg| agg.alias == alias) {
+        return Err(Error::Sql(format!(
+            "el alias '{alias}' está repetido en la ventana"
+        )));
+    }
+    aggs.push(WindowAgg {
+        kind: parsed.kind,
+        input: parsed.input,
+        project: parsed.project,
+        alias,
+        fill: parsed.fill,
+    });
+    Ok(())
+}
+
+fn coalesce_agg(expr: &Expr) -> Result<Option<ParsedAgg>, Error> {
+    let Expr::Function(fun) = expr else {
+        return Ok(None);
+    };
+    if !fun.name.to_string().eq_ignore_ascii_case("COALESCE") {
+        return Ok(None);
+    }
+    let args = function_args(fun)?;
+    if args.len() != 2 {
+        return Err(Error::Sql(
+            "COALESCE de una ventana es COALESCE(agregado, literal)".to_string(),
+        ));
+    }
+    let Some(mut parsed) = agg_call(args[0])? else {
+        return Err(Error::Sql(
+            "COALESCE de una ventana envuelve un agregado".to_string(),
+        ));
+    };
+    if parsed.fill.is_some() {
+        return Err(Error::Sql(
+            "COALESCE no se anida en una ventana".to_string(),
+        ));
+    }
+    parsed.fill = Some(number_literal(args[1])?);
+    Ok(Some(parsed))
+}
+
+fn agg_call(expr: &Expr) -> Result<Option<ParsedAgg>, Error> {
     let Expr::Function(fun) = expr else {
         return Ok(None);
     };
@@ -1057,30 +1224,121 @@ fn agg_call(expr: &Expr) -> Result<Option<(AggKind, Option<String>)>, Error> {
             )));
         }
     }
-    let input = match &fun.args {
-        FunctionArguments::List(list) if list.args.is_empty() => None,
+    let (input, project) = match &fun.args {
+        FunctionArguments::List(list) if list.args.is_empty() => (None, None),
         FunctionArguments::List(list) if list.args.len() == 1 => match &list.args[0] {
-            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(column_name(expr)?),
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => (None, None),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                if contains_agg(inner) {
+                    return Err(Error::Sql(format!(
+                        "agregado no soportado en ventanas exactly-once: {name} anidado"
+                    )));
+                }
+                match column_name_if(inner) {
+                    Some(column) => (Some(column), None),
+                    None => (None, Some(inner.to_string())),
+                }
+            }
             _ => {
                 return Err(Error::Sql(format!(
                     "agregado no soportado en ventanas exactly-once: {name}"
                 )))
             }
         },
-        FunctionArguments::None => None,
+        FunctionArguments::None => (None, None),
         _ => {
             return Err(Error::Sql(format!(
                 "agregado no soportado en ventanas exactly-once: {name}"
             )))
         }
     };
-    if kind != AggKind::Count && input.is_none() {
-        return Err(Error::Sql(format!(
-            "{name} necesita una columna"
-        )));
+    if kind != AggKind::Count && input.is_none() && project.is_none() {
+        return Err(Error::Sql(format!("{name} necesita una columna")));
     }
-    Ok(Some((kind, input)))
+    Ok(Some(ParsedAgg {
+        kind,
+        input,
+        project,
+        fill: None,
+    }))
+}
+
+fn sum_terms(expr: &Expr) -> Option<Vec<String>> {
+    let mut terms = Vec::new();
+    fn walk(expr: &Expr, terms: &mut Vec<String>) -> bool {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Plus,
+                right,
+            } => walk(left, terms) && walk(right, terms),
+            Expr::Nested(inner) => walk(inner, terms),
+            Expr::Identifier(ident) => {
+                terms.push(ident.value.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+    if walk(expr, &mut terms) && terms.len() >= 2 {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+fn contains_agg(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(fun) => {
+            let name = fun.name.to_string().to_ascii_uppercase();
+            matches!(
+                name.as_str(),
+                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "TUMBLE" | "HOP" | "SESSION" | "COALESCE"
+            ) || function_args(fun)
+                .ok()
+                .is_some_and(|args| args.iter().any(|arg| contains_agg(arg)))
+        }
+        Expr::BinaryOp { left, right, .. } => contains_agg(left) || contains_agg(right),
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+            contains_agg(expr)
+        }
+        Expr::IsNull(expr) | Expr::IsNotNull(expr) => contains_agg(expr),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_ref().is_some_and(|expr| contains_agg(expr))
+                || conditions.iter().any(|when| {
+                    contains_agg(&when.condition) || contains_agg(&when.result)
+                })
+                || else_result.as_ref().is_some_and(|expr| contains_agg(expr))
+        }
+        _ => false,
+    }
+}
+
+fn column_name_if(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.clone()),
+        _ => None,
+    }
+}
+
+fn number_literal(expr: &Expr) -> Result<String, Error> {
+    let Expr::Value(value) = expr else {
+        return Err(Error::Sql(format!(
+            "el segundo argumento de COALESCE tiene que ser un número, llegó {expr}"
+        )));
+    };
+    match &value.value {
+        Value::Number(number, _) => Ok(number.clone()),
+        _ => Err(Error::Sql(format!(
+            "el segundo argumento de COALESCE tiene que ser un número, llegó {expr}"
+        ))),
+    }
 }
 
 fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
@@ -1108,6 +1366,7 @@ fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
                 gap_ms: None,
                 group_columns: vec![],
                 aggs: vec![],
+                derived: vec![],
                 filter_sql: None,
                 source: String::new(),
             }
@@ -1134,6 +1393,7 @@ fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
                 gap_ms: None,
                 group_columns: vec![],
                 aggs: vec![],
+                derived: vec![],
                 filter_sql: None,
                 source: String::new(),
             }
@@ -1152,6 +1412,7 @@ fn window_call(expr: &Expr) -> Result<Option<WindowShape>, Error> {
                 gap_ms: Some(interval_ms(args[1])?),
                 group_columns: vec![],
                 aggs: vec![],
+                derived: vec![],
                 filter_sql: None,
                 source: String::new(),
             }
@@ -1633,6 +1894,7 @@ mod tests {
         assert_eq!(shape.aggs[0].alias, "event_count");
         assert!(shape.rewrite_sql().contains("_tachyon_partition"));
         assert!(shape.rewrite_sql().contains("status <> 'cancelled'"));
+        assert!(shape.derived.is_empty());
 
         let hop = parse_sql(
             "INSERT INTO out SELECT order_id, COUNT(*) AS n \
@@ -1643,6 +1905,38 @@ mod tests {
         assert_eq!(shape.slide_ms, Some(5_000));
         assert_eq!(shape.size_ms, 10_000);
         assert_eq!(shape.kind, tachyon_core::WindowKind::Hop);
+    }
+
+    #[test]
+    fn a_case_aggregate_projects_before_the_window_and_can_be_summed() {
+        let sql = "INSERT INTO gdnews2_scores \
+            SELECT patient_id, window_start, window_end, \
+                MAX(CASE WHEN measurement_type = 'HEART_RATE' THEN value END) AS heart_rate_value, \
+                COALESCE(MAX(CASE WHEN measurement_type = 'HEART_RATE' THEN score END), 0) AS heart_rate_score, \
+                COALESCE(MAX(CASE WHEN measurement_type = 'OXYGEN_SATURATION' THEN score END), 0) AS oxygen_saturation_score, \
+                heart_rate_score + oxygen_saturation_score AS news2_score \
+            FROM scored \
+            GROUP BY patient_id, TUMBLE(measurement_timestamp, INTERVAL '1' MINUTE)";
+        let shape = parse_sql(sql).unwrap().window.expect("ventana");
+        assert_eq!(shape.group_columns, vec!["patient_id"]);
+        assert_eq!(shape.aggs.len(), 3);
+        assert_eq!(shape.aggs[0].alias, "heart_rate_value");
+        assert!(shape.aggs[0].fill.is_none());
+        assert_eq!(shape.aggs[0].input.as_deref(), Some("_tachyon_agg_0"));
+        assert!(shape.aggs[0].project.as_ref().unwrap().contains("HEART_RATE"));
+        assert_eq!(shape.aggs[1].fill.as_deref(), Some("0"));
+        assert_eq!(shape.aggs[1].alias, "heart_rate_score");
+        assert_eq!(
+            shape.derived,
+            vec![WindowDerived {
+                alias: "news2_score".into(),
+                terms: vec!["heart_rate_score".into(), "oxygen_saturation_score".into()],
+            }]
+        );
+        let rewrite = shape.rewrite_sql();
+        assert!(rewrite.contains("AS _tachyon_agg_0"), "{rewrite}");
+        assert!(rewrite.contains("_tachyon_partition"), "{rewrite}");
+        assert!(!rewrite.to_uppercase().contains("TUMBLE"), "{rewrite}");
     }
 
     #[test]
@@ -1789,6 +2083,45 @@ mod tests {
     }
 
     #[test]
+    fn a_window_over_union_all_names_each_score_table() {
+        let sql = "INSERT INTO news2_wide \
+            SELECT patient_id, window_start, window_end, \
+                MAX(CASE WHEN measurement_type = 'HEART_RATE' THEN value END) AS heart_rate_value, \
+                COALESCE(MAX(CASE WHEN measurement_type = 'HEART_RATE' THEN score END), 0) AS heart_rate_score, \
+                COALESCE(MAX(CASE WHEN measurement_type = 'OXYGEN_SATURATION' THEN score END), 0) AS oxygen_saturation_score, \
+                heart_rate_score + oxygen_saturation_score AS news2_score \
+            FROM ( \
+                SELECT measurement_type, patient_id, value, score, measurement_timestamp FROM scores_heart_rate \
+                UNION ALL \
+                SELECT measurement_type, patient_id, value, score, measurement_timestamp FROM scores_oxygen_saturation \
+            ) \
+            GROUP BY patient_id, TUMBLE(measurement_timestamp, INTERVAL '1' MINUTE)";
+        let parsed = parse_sql(sql).unwrap();
+        let shape = parsed.window.expect("ventana");
+        assert_eq!(shape.source, UNION_SOURCE);
+        assert_eq!(shape.group_columns, vec!["patient_id"]);
+        assert_eq!(shape.derived.len(), 1);
+        let branches = parsed.union_all.expect("ramas");
+        assert_eq!(
+            branches
+                .iter()
+                .map(|branch| branch.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scores_heart_rate", "scores_oxygen_saturation"]
+        );
+        assert_eq!(
+            parsed.source_tables,
+            vec!["scores_heart_rate", "scores_oxygen_saturation"]
+        );
+        let err = parse_sql(
+            "INSERT INTO out SELECT patient_id, COUNT(*) AS n \
+             FROM (SELECT patient_id, event_time FROM orders) \
+             GROUP BY patient_id, TUMBLE(event_time, INTERVAL '1' MINUTE)",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UNION ALL"), "{err}");
+    }
+
     fn union_all_with_window_is_allowed() {
         // El parser acepta UNION ALL + window en la estructura general.
         // Las ramas de UNION ALL deben ser SELECT simples (sin GROUP BY);

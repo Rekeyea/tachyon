@@ -44,6 +44,13 @@ pub struct WindowCheckpointV1 {
     pub instance_watermark_ms: Option<i64>,
     pub spec: WindowSpecId,
     pub state: OperatorState,
+    /// Snapshot de la tabla de entrada ya aplicado. Vacío en un sidecar de topic.
+    #[serde(default)]
+    pub source_snapshot: Option<i64>,
+    /// Snapshot ya aplicado de cada tabla cuando la ventana lee varias.
+    /// Vacío en un sidecar de una sola tabla o de un topic.
+    #[serde(default)]
+    pub source_snapshots: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,9 +82,12 @@ pub enum WindowKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggSpec {
     pub kind: AggKind,
-    /// `None` en `COUNT(*)`.
+    /// `None` en `COUNT(*)`. Columna que ve el operador.
     pub input: Option<String>,
     pub alias: String,
+    /// Expresión proyectada antes del acumulador. Vacío en un sidecar viejo.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,9 +503,12 @@ mod tests {
                     kind: AggKind::Sum,
                     input: Some("amount".into()),
                     alias: "amount".into(),
+                    project: None,
                 }],
             },
             state: OperatorState { keys },
+            source_snapshot: None,
+            source_snapshots: BTreeMap::new(),
         }
     }
 

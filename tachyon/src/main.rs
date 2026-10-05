@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tachyon_config::{PayloadFormat, PipelineConfig};
 use tachyon_runtime::{Pipeline, PreparedInput, StatelessBudget};
 use tachyon_sink::compact::compact_table;
-use tachyon_sink::writer::open_table;
+use tachyon_sink::writer::open_table_with;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -94,13 +94,7 @@ fn load_schema(path: &PathBuf) -> Result<Arc<Schema>> {
         serde_json::from_str(&content).with_context(|| "parseando schema JSON".to_string())?;
     let arrow_fields: Vec<Field> = fields
         .iter()
-        .map(|f| {
-            Ok(Field::new(
-                &f.name,
-                parse_type(&f.data_type)?,
-                f.nullable,
-            ))
-        })
+        .map(|f| Ok(Field::new(&f.name, parse_type(&f.data_type)?, f.nullable)))
         .collect::<Result<_>>()?;
     Ok(Arc::new(Schema::new(arrow_fields)))
 }
@@ -113,17 +107,16 @@ fn split_table(id: &str) -> (String, String) {
 }
 
 async fn compact_output(config: &PipelineConfig, min_files: usize) -> Result<()> {
-    let table_name = config.output.table.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("la compactación publica un snapshot de output.table")
-    })?;
-    let warehouse = config
-        .connectors
-        .paimon
-        .as_ref()
-        .map(|paimon| paimon.warehouse.as_str())
-        .ok_or_else(|| anyhow::anyhow!("la compactación necesita connectors.paimon.warehouse"))?;
+    let table_name =
+        config.output.table.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("la compactación publica un snapshot de output.table")
+        })?;
+    let paimon =
+        config.connectors.paimon.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("la compactación necesita connectors.paimon.warehouse")
+        })?;
     let (database, table_id) = split_table(table_name);
-    let table = open_table(warehouse, &database, &table_id).await?;
+    let table = open_table_with(&paimon.catalog_options(), &database, &table_id).await?;
     let outcome = compact_table(&table, min_files).await?;
     match outcome.snapshot_id {
         Some(id) => println!(
@@ -182,12 +175,10 @@ fn main() -> Result<()> {
                 let arrow = load_schema(&resolve_schema_path(spec, args.schemas_dir.as_ref())?)?;
                 let avro_spec = input.avro_schema.as_deref().expect("avro_schema");
                 let avro_path = resolve_schema_path(avro_spec, args.schemas_dir.as_ref())?;
-                let avsc = std::fs::read_to_string(&avro_path).with_context(|| {
-                    format!("leyendo schema Avro {}", avro_path.display())
-                })?;
-                PreparedInput::from_avsc(arrow, &avsc).with_context(|| {
-                    format!("parseando schema Avro de '{}'", input.name)
-                })?
+                let avsc = std::fs::read_to_string(&avro_path)
+                    .with_context(|| format!("leyendo schema Avro {}", avro_path.display()))?;
+                PreparedInput::from_avsc(arrow, &avsc)
+                    .with_context(|| format!("parseando schema Avro de '{}'", input.name))?
             }
             PayloadFormat::Avro => {
                 // Avro del registry: solo inputs de topic (kinesis y sqs
@@ -204,9 +195,8 @@ fn main() -> Result<()> {
                             input.name
                         )
                     })?;
-                PreparedInput::from_registry(url, topic).with_context(|| {
-                    format!("leyendo el schema de '{}'", input.name)
-                })?
+                PreparedInput::from_registry(url, topic)
+                    .with_context(|| format!("leyendo el schema de '{}'", input.name))?
             }
         };
         input_codecs.insert(input.name.clone(), prepared);

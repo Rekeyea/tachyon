@@ -148,9 +148,7 @@ fn rows(batches: &[arrow::array::RecordBatch]) -> Vec<(i64, i64, i64)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn live_interval_join_emits_the_pair_once() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let pid = std::process::id();
     let orders = format!("tachyon-join-orders-{pid}");
     let payments = format!("tachyon-join-payments-{pid}");
@@ -172,9 +170,18 @@ async fn live_interval_join_emits_the_pair_once() {
         "default",
         "paid_orders",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-            ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
-            ("payment_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            (
+                "amount",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            (
+                "payment_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
         ],
         &["order_id", "payment_id"],
         1,
@@ -193,10 +200,14 @@ async fn live_interval_join_emits_the_pair_once() {
     };
     let codecs = HashMap::from([
         ("orders".to_string(), PreparedInput::json(orders_schema())),
-        ("payments".to_string(), PreparedInput::json(payments_schema())),
+        (
+            "payments".to_string(),
+            PreparedInput::json(payments_schema()),
+        ),
     ]);
     let metrics = Arc::new(InstanceMetrics::new());
-    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("payment_id")).expect("sink");
+    let sink =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("payment_id")).expect("sink");
     let task = tokio::spawn({
         let cfg = cfg.clone();
         let join = join.clone();
@@ -219,11 +230,16 @@ async fn live_interval_join_emits_the_pair_once() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     task.abort();
-    assert_eq!(got, vec![(1, 10, 7)], "el par dentro de la hora no quedó: {got:?}");
+    assert_eq!(
+        got,
+        vec![(1, 10, 7)],
+        "el par dentro de la hora no quedó: {got:?}"
+    );
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metrics = Arc::new(InstanceMetrics::new());
-    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("payment_id")).expect("sink");
+    let sink =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("payment_id")).expect("sink");
     let task = tokio::spawn({
         let cfg = cfg.clone();
         let join = join.clone();
@@ -249,7 +265,11 @@ async fn live_interval_join_emits_the_pair_once() {
     tokio::time::sleep(Duration::from_secs(4)).await;
     task.abort();
     let got = rows(&read_table_rows(&table).await.expect("leer"));
-    assert_eq!(got, vec![(1, 10, 7)], "el pago a las dos horas entró: {got:?}");
+    assert_eq!(
+        got,
+        vec![(1, 10, 7)],
+        "el pago a las dos horas entró: {got:?}"
+    );
 }
 
 fn died(

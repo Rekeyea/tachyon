@@ -67,7 +67,10 @@ async fn produce_range(producer: &FutureProducer, topic: &str, ids: std::ops::Ra
         );
         let key = id.to_string();
         producer
-            .send(FutureRecord::to(topic).key(&key).payload(&payload), Duration::from_secs(5))
+            .send(
+                FutureRecord::to(topic).key(&key).payload(&payload),
+                Duration::from_secs(5),
+            )
             .await
             .expect("produciendo order");
     }
@@ -126,7 +129,11 @@ type Instance = (
     Arc<InstanceMetrics>,
 );
 
-fn start_instance(config: &PipelineConfig, table: &paimon::table::Table, group_id: &str) -> Instance {
+fn start_instance(
+    config: &PipelineConfig,
+    table: &paimon::table::Table,
+    group_id: &str,
+) -> Instance {
     let config = config.clone();
     let options = RunOptions {
         commit_interval: Duration::from_millis(500),
@@ -161,7 +168,10 @@ async fn wait_rows(instance: &Instance, table: &paimon::table::Table, expected: 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut ids = vec![];
     while std::time::Instant::now() < deadline {
-        assert!(!instance.0.is_finished(), "la instancia terminó antes de tiempo");
+        assert!(
+            !instance.0.is_finished(),
+            "la instancia terminó antes de tiempo"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
         ids = order_ids(table).await;
         if ids.len() >= expected {
@@ -186,7 +196,9 @@ fn force_group_offsets(group_id: &str, topic: &str, offset_for: impl Fn(i32) -> 
             .expect("tpl");
     }
     consumer.assign(&tpl).expect("assign");
-    consumer.commit(&tpl, CommitMode::Sync).expect("forzando offsets del grupo");
+    consumer
+        .commit(&tpl, CommitMode::Sync)
+        .expect("forzando offsets del grupo");
 }
 
 fn high_watermark(topic: &str, partition: i32) -> i64 {
@@ -222,7 +234,10 @@ async fn run_scenario(name: &str, drift: KafkaDrift) {
         DB,
         TABLE,
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("status", PDataType::VarChar(VarCharType::string_type())),
             ("source_version", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::Double(DoubleType::new())),
@@ -273,8 +288,7 @@ async fn run_scenario(name: &str, drift: KafkaDrift) {
         "la tabla debe tener los dos lotes completos (sin pérdida)"
     );
     assert_eq!(
-        rows_read,
-        LOTE as u64,
+        rows_read, LOTE as u64,
         "la instancia 2 debe leer exactamente el lote 2 (ni re-proceso ni hueco)"
     );
     let offsets_dir = std::path::Path::new(&warehouse)
@@ -282,7 +296,10 @@ async fn run_scenario(name: &str, drift: KafkaDrift) {
         .join(TABLE)
         .join("tachyon-offsets")
         .join(&group_id);
-    assert!(offsets_dir.is_dir(), "falta el directorio de offsets de checkpoint: {offsets_dir:?}");
+    assert!(
+        offsets_dir.is_dir(),
+        "falta el directorio de offsets de checkpoint: {offsets_dir:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&warehouse);
 }

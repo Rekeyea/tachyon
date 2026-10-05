@@ -70,7 +70,10 @@ async fn recreate_topic(broker: &str) {
     }
 
     let new_topic = NewTopic::new(ORDERS_TOPIC, 2, TopicReplication::Fixed(1));
-    match admin.create_topics(std::iter::once(&new_topic), &opts).await {
+    match admin
+        .create_topics(std::iter::once(&new_topic), &opts)
+        .await
+    {
         Ok(results) => {
             for r in results {
                 if let Err((msg, code)) = r {
@@ -94,17 +97,13 @@ async fn produce_events(producer: &FutureProducer) {
     ];
     for (order_id, status, amount) in orders {
         let key = order_id.to_string();
-        let msg = format!(
-            r#"{{"order_id":{order_id},"status":"{status}","amount":{amount}}}"#
-        );
+        let msg = format!(r#"{{"order_id":{order_id},"status":"{status}","amount":{amount}}}"#);
         send(producer, ORDERS_TOPIC, &key, &msg).await;
     }
 }
 
 async fn send(producer: &FutureProducer, topic: &str, key: &str, msg: &str) {
-    let record = FutureRecord::to(topic)
-        .key(key)
-        .payload(msg);
+    let record = FutureRecord::to(topic).key(key).payload(msg);
     let fut = producer
         .send_result(record)
         .unwrap_or_else(|(e, _)| panic!("encolando en {topic}: {e}"));
@@ -144,8 +143,7 @@ fn make_stream_table(
     });
     let ps = RedpandaPartitionStream::new(0, schema.clone(), decoder, batch_size, make_stream);
     Ok(Arc::new(
-        StreamingTable::try_new(schema, vec![Arc::new(ps)])?
-            .with_infinite_table(true),
+        StreamingTable::try_new(schema, vec![Arc::new(ps)])?.with_infinite_table(true),
     ))
 }
 
@@ -226,7 +224,11 @@ async fn live_redpanda_stateless_transform() {
         .iter()
         .map(|f| f.name().as_str())
         .collect();
-    assert_eq!(out_names, vec!["order_id", "status"], "solo columnas proyectadas");
+    assert_eq!(
+        out_names,
+        vec!["order_id", "status"],
+        "solo columnas proyectadas"
+    );
 
     // Recopila (order_id, status) de la salida.
     let mut rows: Vec<(i64, String)> = Vec::new();

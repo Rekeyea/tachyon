@@ -4,9 +4,10 @@ description = "Conector sink Paimon (writer por bucket)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
-tachyon-core = { path = "../tachyon-core" }
+tachyon-core = { version = "0.1.0", path = "../tachyon-core" }
 # Stack alineado (ver invariante de versiones en el Cargo.toml del workspace):
 # paimon 0.3.0 trae arrow 58 vía paimon-datafusion; no actualizar sin re-alinear.
 paimon = "0.3"

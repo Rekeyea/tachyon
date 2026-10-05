@@ -110,16 +110,18 @@ fn produce(topic: &str, base: i64, rows: u64, label: &str) -> Produced {
             let event_time = now_ms();
             max_event_ms = max_event_ms.max(event_time);
             let key = order_id.to_string();
-            let payload = format!(
-                r#"{{"order_id":{order_id},"event_time":{event_time},"amount":1}}"#
-            );
+            let payload =
+                format!(r#"{{"order_id":{order_id},"event_time":{event_time},"amount":1}}"#);
             loop {
                 match producer.send_result(FutureRecord::to(topic).key(&key).payload(&payload)) {
                     Ok(delivery) => {
                         inflight.push(delivery);
                         break;
                     }
-                    Err((KafkaError::MessageProduction(rdkafka::error::RDKafkaErrorCode::QueueFull), _)) => {
+                    Err((
+                        KafkaError::MessageProduction(rdkafka::error::RDKafkaErrorCode::QueueFull),
+                        _,
+                    )) => {
                         if let Some(done) = inflight.next().await {
                             done.expect("delivery").expect("ack");
                             sent += 1;
@@ -131,7 +133,12 @@ fn produce(topic: &str, base: i64, rows: u64, label: &str) -> Produced {
                 }
             }
             if inflight.len() >= 2_000 {
-                inflight.next().await.expect("inflight").expect("delivery").expect("ack");
+                inflight
+                    .next()
+                    .await
+                    .expect("inflight")
+                    .expect("delivery")
+                    .expect("ack");
                 sent += 1;
             }
             if sent > 0 && sent % 200_000 == 0 {
@@ -162,9 +169,8 @@ fn produce_rows(topic: &str, rows: &[(i64, i64)]) {
             .expect("producer");
         for (order_id, event_time) in rows {
             let key = order_id.to_string();
-            let payload = format!(
-                r#"{{"order_id":{order_id},"event_time":{event_time},"amount":1}}"#
-            );
+            let payload =
+                format!(r#"{{"order_id":{order_id},"event_time":{event_time},"amount":1}}"#);
             producer
                 .send(
                     FutureRecord::to(topic).key(&key).payload(&payload),
@@ -263,9 +269,7 @@ fn pipeline_died(
 #[test]
 #[ignore = "mide throughput contra Redpanda local; cargo test --profile benchfast"]
 fn bench_window_two_streams() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
     let pid = std::process::id();
     let topic = format!("tachyon-bench-orders-{pid}");
     let table_name = format!("orders_window_{pid}");

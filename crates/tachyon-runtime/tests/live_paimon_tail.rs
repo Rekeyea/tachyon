@@ -174,7 +174,9 @@ fn died(
     }
 }
 
-fn start(cfg: PipelineConfig) -> tokio::task::JoinHandle<anyhow::Result<tachyon_runtime::PipelineHandle>> {
+fn start(
+    cfg: PipelineConfig,
+) -> tokio::task::JoinHandle<anyhow::Result<tachyon_runtime::PipelineHandle>> {
     tokio::spawn(async move {
         let pipeline = Pipeline::new(&cfg, SQL)?;
         pipeline.run(&HashMap::new()).await
@@ -184,9 +186,7 @@ fn start(cfg: PipelineConfig) -> tokio::task::JoinHandle<anyhow::Result<tachyon_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn live_a_paimon_table_publishes_each_snapshot_once() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let pid = std::process::id();
     let output = format!("tachyon-paimon-out-{pid}");
     let cursor_topic = format!("{output}-tachyon-cursor");
@@ -196,7 +196,9 @@ async fn live_a_paimon_table_publishes_each_snapshot_once() {
             .set("bootstrap.servers", BROKER)
             .create()
             .expect("admin");
-        admin.delete_topics(&[&cursor_topic], &Default::default()).await
+        admin
+            .delete_topics(&[&cursor_topic], &Default::default())
+            .await
     };
 
     let warehouse = std::env::temp_dir().join(format!("tachyon-paimon-tail-{pid}"));
@@ -208,8 +210,14 @@ async fn live_a_paimon_table_publishes_each_snapshot_once() {
         "default",
         "paid_orders",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-            ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            (
+                "amount",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
         ],
         &["order_id"],
         1,
@@ -223,16 +231,12 @@ async fn live_a_paimon_table_publishes_each_snapshot_once() {
     let cfg = config(&warehouse, &output);
     let task = start(cfg.clone());
     let topic = output.clone();
-    let got = tokio::task::spawn_blocking(move || {
-        read_committed(&topic, 2, Duration::from_secs(20))
-    })
-    .await
-    .expect("lectura");
+    let got =
+        tokio::task::spawn_blocking(move || read_committed(&topic, 2, Duration::from_secs(20)))
+            .await
+            .expect("lectura");
     if task.is_finished() {
-        panic!(
-            "la cola terminó: {} kinds={first_kinds}",
-            died(task.await)
-        );
+        panic!("la cola terminó: {} kinds={first_kinds}", died(task.await));
     }
     assert_eq!(
         order_ids(&got),
@@ -263,11 +267,10 @@ async fn live_a_paimon_table_publishes_each_snapshot_once() {
     write_rows(&table, &[(3, 30)]).await;
     let second_kinds = kinds(&table).await;
     let topic = output.clone();
-    let third = tokio::task::spawn_blocking(move || {
-        read_committed(&topic, 3, Duration::from_secs(20))
-    })
-    .await
-    .expect("lectura");
+    let third =
+        tokio::task::spawn_blocking(move || read_committed(&topic, 3, Duration::from_secs(20)))
+            .await
+            .expect("lectura");
     if task.is_finished() {
         panic!(
             "la cola terminó tras el segundo snapshot: {} kinds={second_kinds}",

@@ -154,11 +154,7 @@ impl WindowHandoff {
     /// Bloquea hasta que el operador diga si había ficha. `Ok(None)` si este
     /// proceso no tiene operador escuchando.
     pub fn request_adopt(&self, partition: i32) -> Result<Option<i64>, String> {
-        let tx = self
-            .bus
-            .lock()
-            .expect("lock del bus de estado")
-            .clone();
+        let tx = self.bus.lock().expect("lock del bus de estado").clone();
         let Some(tx) = tx else {
             return Ok(None);
         };
@@ -235,7 +231,10 @@ impl WindowHandoff {
         for member in inner.members.values() {
             for &partition in &member.assigned {
                 let unread = !inner.at_end.contains(&partition);
-                let unapplied = match (inner.admitted.get(&partition), inner.applied.get(&partition)) {
+                let unapplied = match (
+                    inner.admitted.get(&partition),
+                    inner.applied.get(&partition),
+                ) {
                     (Some(admitted), Some(applied)) => applied < admitted,
                     (Some(_), None) => true,
                     (None, _) => false,
@@ -496,7 +495,11 @@ fn held(inner: &Inner, consumer: u64, partition: i32) -> bool {
     }
     if let Some(&admitted) = inner.admitted.get(&partition) {
         let have = inner.applied.get(&partition).copied().unwrap_or(i64::MIN);
-        if admitted > have && inner.owner.get(&partition).is_some_and(|owner| *owner != consumer)
+        if admitted > have
+            && inner
+                .owner
+                .get(&partition)
+                .is_some_and(|owner| *owner != consumer)
         {
             return true;
         }
@@ -663,5 +666,4 @@ mod tests {
         gate.note_assignment(a, &[1]);
         assert_eq!(gate.backlog(), [1].into_iter().collect());
     }
-
 }

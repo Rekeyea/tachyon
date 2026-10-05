@@ -132,8 +132,12 @@ fn read_committed(topic: &str, wait: Duration, until: i64) -> Vec<(i64, String)>
                     .payload()
                     .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                     .unwrap_or_default();
-                let value: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
-                let order_id = value.get("order_id").and_then(|item| item.as_i64()).unwrap_or(-1);
+                let value: serde_json::Value =
+                    serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+                let order_id = value
+                    .get("order_id")
+                    .and_then(|item| item.as_i64())
+                    .unwrap_or(-1);
                 let name = value
                     .get("customer_name")
                     .and_then(|item| item.as_str())
@@ -208,9 +212,7 @@ async fn died(stop: &mut Stop) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requiere Redpanda local en localhost:9092"]
 async fn live_lookup_keeps_the_country_and_sees_the_next_snapshot() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let pid = std::process::id();
     let input = format!("tachyon-lookup-in-{pid}");
     let output = format!("tachyon-lookup-out-{pid}");
@@ -257,9 +259,10 @@ async fn live_lookup_keeps_the_country_and_sees_the_next_snapshot() {
     let mut stop = Stop(Some(task));
 
     let topic = output.clone();
-    let first = tokio::task::spawn_blocking(move || read_committed(&topic, Duration::from_secs(20), 10))
-        .await
-        .expect("lectura");
+    let first =
+        tokio::task::spawn_blocking(move || read_committed(&topic, Duration::from_secs(20), 10))
+            .await
+            .expect("lectura");
     if stop.0.as_ref().is_some_and(|task| task.is_finished()) {
         panic!("el pipeline terminó: {}", died(&mut stop).await);
     }
@@ -277,9 +280,10 @@ async fn live_lookup_keeps_the_country_and_sees_the_next_snapshot() {
     produce(&input, &[(13, 1)]).await;
 
     let topic = output.clone();
-    let second = tokio::task::spawn_blocking(move || read_committed(&topic, Duration::from_secs(20), 13))
-        .await
-        .expect("lectura");
+    let second =
+        tokio::task::spawn_blocking(move || read_committed(&topic, Duration::from_secs(20), 13))
+            .await
+            .expect("lectura");
     if stop.0.as_ref().is_some_and(|task| task.is_finished()) {
         panic!("el pipeline terminó: {}", died(&mut stop).await);
     }

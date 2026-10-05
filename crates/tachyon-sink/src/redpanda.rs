@@ -42,10 +42,7 @@ impl RedpandaSink {
             .set("transactional.id", transactional_id)
             .set("enable.idempotence", "true")
             .set("acks", "all")
-            .set(
-                "transaction.timeout.ms",
-                transaction_timeout_ms.to_string(),
-            )
+            .set("transaction.timeout.ms", transaction_timeout_ms.to_string())
             .create()
             .context("creando el productor transaccional")?;
         let init = producer.clone();
@@ -127,11 +124,9 @@ impl RedpandaSink {
         };
         if !err.is_null() {
             let code = unsafe { rdkafka_sys::rd_kafka_error_code(err) };
-            let msg = unsafe {
-                std::ffi::CStr::from_ptr(rdkafka_sys::rd_kafka_error_string(err))
-            }
-            .to_string_lossy()
-            .into_owned();
+            let msg = unsafe { std::ffi::CStr::from_ptr(rdkafka_sys::rd_kafka_error_string(err)) }
+                .to_string_lossy()
+                .into_owned();
             unsafe { rdkafka_sys::rd_kafka_error_destroy(err) };
             if code != rdkafka_sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
                 anyhow::bail!("send_offsets_to_transaction: {msg}");

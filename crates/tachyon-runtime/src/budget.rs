@@ -96,11 +96,7 @@ impl StatelessBudget {
                 overrides.consumers_per_topic,
                 partitions.min(cpus),
             )?,
-            decode_parallelism: positive(
-                "decode_parallelism",
-                overrides.decode_parallelism,
-                cpus,
-            )?,
+            decode_parallelism: positive("decode_parallelism", overrides.decode_parallelism, cpus)?,
             fetch_min_bytes: Self::FETCH_MIN_BYTES,
             fetch_max_bytes: Self::FETCH_MAX_BYTES,
             max_partition_fetch_bytes: Self::MAX_PARTITION_FETCH_BYTES,

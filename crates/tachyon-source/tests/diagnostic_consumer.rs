@@ -74,7 +74,10 @@ fn diagnostic_consumer() {
                 if n % 500_000 == 0 {
                     let dt = last_mark.elapsed().as_secs_f64();
                     last_mark = Instant::now();
-                    println!("  {n} mensajes (offset {last_offset}), marca: {:.0} msg/s", 500_000.0 / dt);
+                    println!(
+                        "  {n} mensajes (offset {last_offset}), marca: {:.0} msg/s",
+                        500_000.0 / dt
+                    );
                 }
             }
             Some(Err(e)) => {

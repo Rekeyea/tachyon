@@ -59,7 +59,8 @@ async fn recreate_stream(client: &aws_sdk_kinesis::Client, stream: &str) {
     loop {
         match client.describe_stream().stream_name(stream).send().await {
             Ok(r) => {
-                if r.stream_description().map(|d| d.stream_status().to_string())
+                if r.stream_description()
+                    .map(|d| d.stream_status().to_string())
                     == Some("ACTIVE".to_string())
                 {
                     return;
@@ -67,7 +68,10 @@ async fn recreate_stream(client: &aws_sdk_kinesis::Client, stream: &str) {
             }
             Err(_) => {}
         }
-        assert!(t0.elapsed() < Duration::from_secs(30), "el stream no llega a ACTIVE");
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "el stream no llega a ACTIVE"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -83,14 +87,20 @@ async fn put_orders(
             r#"{{"order_id":{order_id},"status":"{status}","source_version":{version},"amount":{amount}}}"#
         );
         let entry = aws_sdk_kinesis::types::PutRecordsRequestEntry::builder()
-            .data(aws_sdk_kinesis::primitives::Blob::from(payload.into_bytes()))
+            .data(aws_sdk_kinesis::primitives::Blob::from(
+                payload.into_bytes(),
+            ))
             .partition_key(order_id.to_string())
             .build()
             .expect("entry");
         req = req.records(entry);
     }
     let resp = req.send().await.expect("put_records");
-    assert_eq!(resp.failed_record_count(), Some(0), "put_records con fallos");
+    assert_eq!(
+        resp.failed_record_count(),
+        Some(0),
+        "put_records con fallos"
+    );
 }
 
 /// Lee todo el stream de salida (TrimHorizon, paginado) y devuelve
@@ -189,9 +199,7 @@ const SQL: &str = "INSERT INTO orders_out \
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requiere floCi en localhost:4566"]
 async fn live_kinesis_sink_at_least_once() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     // --- 1. Streams frescos + 6 orders (1 cancelled) en el input ---
     let client = kinesis_client().await;

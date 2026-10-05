@@ -27,8 +27,8 @@ pub fn subject_name(topic: &str) -> String {
 pub fn avro_json_from_arrow(schema: &Schema) -> Result<String> {
     let mut fields = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        let ty = avro_type(field.data_type())
-            .with_context(|| format!("columna '{}'", field.name()))?;
+        let ty =
+            avro_type(field.data_type()).with_context(|| format!("columna '{}'", field.name()))?;
         let spec = if field.is_nullable() {
             serde_json::json!({
                 "name": field.name(),
@@ -72,8 +72,11 @@ pub fn register_topic_schema(url: &str, topic: &str, avsc: &str) -> Result<i32> 
         "schemaType": "AVRO",
         "schema": avsc,
     });
-    let response = post_json(&format!("{}/subjects/{subject}/versions", trim_url(url)), &body)
-        .with_context(|| format!("registrando {subject}"))?;
+    let response = post_json(
+        &format!("{}/subjects/{subject}/versions", trim_url(url)),
+        &body,
+    )
+    .with_context(|| format!("registrando {subject}"))?;
     response
         .get("id")
         .and_then(|id| id.as_i64())
@@ -148,7 +151,9 @@ pub fn envelope_id(payload: &[u8]) -> Option<i32> {
     if payload.first() != Some(&0) || payload.len() < 5 {
         return None;
     }
-    Some(i32::from_be_bytes(payload[1..5].try_into().expect("4 bytes")))
+    Some(i32::from_be_bytes(
+        payload[1..5].try_into().expect("4 bytes"),
+    ))
 }
 
 pub fn decode_envelope(

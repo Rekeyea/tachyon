@@ -96,7 +96,9 @@ impl FlatJson {
     ) -> Result<(), Fault> {
         p.ws();
         if p.next() != Some(b'{') {
-            return Err(Fault::Syntax("se esperaba un objeto JSON por mensaje".into()));
+            return Err(Fault::Syntax(
+                "se esperaba un objeto JSON por mensaje".into(),
+            ));
         }
         p.ws();
         if p.peek() == Some(b'}') {
@@ -230,7 +232,9 @@ impl<'a> Parser<'a> {
                 Some(b'"') => return Ok(Text::Scratch),
                 Some(b'\\') => self.escape(scratch)?,
                 Some(byte) if byte < 0x20 => {
-                    return Err(Fault::Syntax("carácter de control sin escapar en un string".into()))
+                    return Err(Fault::Syntax(
+                        "carácter de control sin escapar en un string".into(),
+                    ))
                 }
                 Some(byte) => scratch.push(byte),
             }
@@ -368,7 +372,13 @@ fn parse_i64(span: &[u8]) -> Result<i64, Fault> {
         let d = (digit - b'0') as i64;
         value = value
             .checked_mul(10)
-            .and_then(|v| if negative { v.checked_sub(d) } else { v.checked_add(d) })
+            .and_then(|v| {
+                if negative {
+                    v.checked_sub(d)
+                } else {
+                    v.checked_add(d)
+                }
+            })
             .ok_or_else(|| Fault::Syntax("entero JSON fuera de rango para Int64".into()))?;
     }
     Ok(value)
@@ -390,8 +400,8 @@ fn parse_f64(span: &[u8]) -> Result<f64, Fault> {
 /// cercano: el mismo resultado que `str::parse`. Si no, `None`.
 fn fast_decimal(span: &[u8]) -> Option<f64> {
     const POW10: [f64; 23] = [
-        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
-        1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
     ];
     let (negative, digits) = match span.split_first() {
         Some((b'-', rest)) => (true, rest),
@@ -404,7 +414,9 @@ fn fast_decimal(span: &[u8]) -> Option<f64> {
     for &byte in digits {
         match byte {
             b'0'..=b'9' => {
-                mantissa = mantissa.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+                mantissa = mantissa
+                    .checked_mul(10)?
+                    .checked_add(u64::from(byte - b'0'))?;
                 seen_digit = true;
                 if seen_point {
                     decimals += 1;
@@ -463,7 +475,11 @@ impl Col {
                 values.push(0.0);
                 valid.push(false);
             }
-            Col::Utf8 { offsets, data, valid } => {
+            Col::Utf8 {
+                offsets,
+                data,
+                valid,
+            } => {
                 offsets.push(data.len() as i32);
                 valid.push(false);
             }
@@ -485,7 +501,11 @@ impl Col {
                 values.pop();
                 valid.pop();
             }
-            Col::Utf8 { offsets, data, valid } => {
+            Col::Utf8 {
+                offsets,
+                data,
+                valid,
+            } => {
                 offsets.pop();
                 data.truncate(*offsets.last().expect("offset inicial") as usize);
                 valid.pop();
@@ -524,7 +544,11 @@ impl Col {
                 values.push(parse_f64(p.number_span()?)?);
                 valid.push(true);
             }
-            Col::Utf8 { offsets, data, valid } => {
+            Col::Utf8 {
+                offsets,
+                data,
+                valid,
+            } => {
                 if p.peek() != Some(b'"') {
                     return Err(Fault::Syntax(format!(
                         "valor JSON incompatible con la columna Utf8: {}",
@@ -579,7 +603,11 @@ impl Col {
             Col::F64(values, valid) => {
                 Arc::new(Float64Array::new(ScalarBuffer::from(values), nulls(valid)))
             }
-            Col::Utf8 { offsets, data, valid } => {
+            Col::Utf8 {
+                offsets,
+                data,
+                valid,
+            } => {
                 // SAFETY: los offsets son crecientes por construcción (cada
                 // push agrega al final de `data`) y `data` es UTF-8 válido:
                 // cada mensaje se validó entero con simdutf8 y los escapes se
@@ -589,10 +617,9 @@ impl Col {
                     StringArray::new_unchecked(offsets, Buffer::from_vec(data), nulls(valid))
                 })
             }
-            Col::Bool(values, valid) => Arc::new(BooleanArray::new(
-                BooleanBuffer::from(values),
-                nulls(valid),
-            )),
+            Col::Bool(values, valid) => {
+                Arc::new(BooleanArray::new(BooleanBuffer::from(values), nulls(valid)))
+            }
         }
     }
 }
@@ -671,8 +698,11 @@ mod tests {
 
     #[test]
     fn repeated_key_keeps_the_last_value() {
-        let batch = decode(&[r#"{"name":"first","id":1,"name":"second","id":2}"#, r#"{"name":"x"}"#])
-            .unwrap();
+        let batch = decode(&[
+            r#"{"name":"first","id":1,"name":"second","id":2}"#,
+            r#"{"name":"x"}"#,
+        ])
+        .unwrap();
         assert_eq!(col::<Int64Array>(&batch, 0).value(0), 2);
         let names = col::<StringArray>(&batch, 1);
         assert_eq!(names.value(0), "second");
@@ -698,7 +728,10 @@ mod tests {
     #[test]
     fn floats_match_the_standard_parser() {
         let texts = ["0.1", "-2.5e-3", "1E10", "123456789.123456789", "5e-324"];
-        let rows: Vec<String> = texts.iter().map(|t| format!(r#"{{"price":{t}}}"#)).collect();
+        let rows: Vec<String> = texts
+            .iter()
+            .map(|t| format!(r#"{{"price":{t}}}"#))
+            .collect();
         let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
         let batch = decode(&refs).unwrap();
         let prices = col::<Float64Array>(&batch, 2);
@@ -710,9 +743,26 @@ mod tests {
     #[test]
     fn fast_decimals_are_bit_identical_to_the_standard_parser() {
         let mut texts: Vec<String> = [
-            "0", "-0", "0.0", "1", "-1", "0.1", "0.2", "0.3", "1.5", "100.5", "-2.25", "3.14159",
-            "123456789.123456789", "9007199254740991", "9007199254740993", "0.000000000000000000001",
-            "1.0000000000000002", "4503599627370497.5", "12.", ".5",
+            "0",
+            "-0",
+            "0.0",
+            "1",
+            "-1",
+            "0.1",
+            "0.2",
+            "0.3",
+            "1.5",
+            "100.5",
+            "-2.25",
+            "3.14159",
+            "123456789.123456789",
+            "9007199254740991",
+            "9007199254740993",
+            "0.000000000000000000001",
+            "1.0000000000000002",
+            "4503599627370497.5",
+            "12.",
+            ".5",
         ]
         .iter()
         .map(|t| t.to_string())
@@ -725,7 +775,10 @@ mod tests {
             let int = x % 10_000_000;
             let frac_digits = (x >> 40) % 12;
             let frac = (x >> 20) % 10u64.pow(frac_digits as u32).max(1);
-            texts.push(format!("{int}.{frac:0width$}", width = frac_digits as usize));
+            texts.push(format!(
+                "{int}.{frac:0width$}",
+                width = frac_digits as usize
+            ));
         }
         for text in &texts {
             if let Some(fast) = fast_decimal(text.as_bytes()) {
@@ -734,7 +787,10 @@ mod tests {
             }
         }
         assert!(fast_decimal(b"1e5").is_none());
-        assert!(fast_decimal(b"9007199254740993").is_none(), "mantisa >= 2^53");
+        assert!(
+            fast_decimal(b"9007199254740993").is_none(),
+            "mantisa >= 2^53"
+        );
     }
 
     #[test]
@@ -780,12 +836,19 @@ mod tests {
                 2 => "null".to_string(),
                 _ => format!(r#""{}""#, "x".repeat((i % 13) as usize)),
             };
-            let price = if i % 5 == 0 { "null".to_string() } else { format!("{}.{}", i, i % 7) };
+            let price = if i % 5 == 0 {
+                "null".to_string()
+            } else {
+                format!("{}.{}", i, i % 7)
+            };
             let ok = if i % 3 == 0 { "true" } else { "false" };
             let row = if i % 6 == 0 {
                 format!(r#"{{"price":{price},"id":{i},"ok":{ok}}}"#)
             } else {
-                format!(r#"{{"id":{},"name":{name},"price":{price},"ok":{ok},"skip":[1,2]}}"#, i * 1_000_003)
+                format!(
+                    r#"{{"id":{},"name":{name},"price":{price},"ok":{ok},"skip":[1,2]}}"#,
+                    i * 1_000_003
+                )
             };
             rows.push(row);
         }

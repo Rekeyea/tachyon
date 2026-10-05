@@ -71,15 +71,14 @@ pub(crate) async fn prepare_lookup(
         }
     }
     let (database, table_name) = split_table(&dim.table);
-    let warehouse = config
+    let catalog = config
         .connectors
         .paimon
         .as_ref()
         .context("una dimensión requiere connectors.paimon.warehouse")?
-        .warehouse
-        .as_str();
-    let cache = DimensionCache::load(
-        warehouse,
+        .catalog_options();
+    let cache = DimensionCache::load_with(
+        &catalog,
         &database,
         &table_name,
         &dim.name,
@@ -90,9 +89,9 @@ pub(crate) async fn prepare_lookup(
     .await
     .context("cargando la dimensión")?;
 
-    let fact_key = fact_schema.field_with_name(&lookup.fact_key).map_err(|_| {
-        anyhow::anyhow!("el stream no tiene la columna '{}'", lookup.fact_key)
-    })?;
+    let fact_key = fact_schema
+        .field_with_name(&lookup.fact_key)
+        .map_err(|_| anyhow::anyhow!("el stream no tiene la columna '{}'", lookup.fact_key))?;
     match fact_key.data_type() {
         DataType::Int64 | DataType::Int32 | DataType::Utf8 => {}
         other => anyhow::bail!(
@@ -207,10 +206,7 @@ impl PartitionStream for LookupStream {
                     let enriched = {
                         let mut held = cache.lock().await;
                         if let Err(err) = held.refresh().await {
-                            return Some((
-                                Err(DataFusionError::Execution(err.to_string())),
-                                inner,
-                            ));
+                            return Some((Err(DataFusionError::Execution(err.to_string())), inner));
                         }
                         match held.enrich(&batch, &fact_key, keep_misses, &outputs, &schema) {
                             Ok(batch) => batch,

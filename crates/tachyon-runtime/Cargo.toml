@@ -4,15 +4,17 @@ description = "Runtime de ejecución de Tachyon (loop: consume -> transform -> w
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
-tachyon-core = { path = "../tachyon-core" }
-tachyon-config = { path = "../tachyon-config" }
-tachyon-sql = { path = "../tachyon-sql" }
-tachyon-source = { path = "../tachyon-source" }
-tachyon-sink = { path = "../tachyon-sink" }
-tachyon-metrics = { path = "../tachyon-metrics" }
-tachyon-convert = { path = "../tachyon-convert" }
+tachyon-core = { version = "0.1.0", path = "../tachyon-core" }
+tachyon-config = { version = "0.1.0", path = "../tachyon-config" }
+tachyon-sql = { version = "0.1.0", path = "../tachyon-sql" }
+tachyon-source = { version = "0.1.0", path = "../tachyon-source" }
+tachyon-sink = { version = "0.1.0", path = "../tachyon-sink" }
+tachyon-metrics = { version = "0.1.0", path = "../tachyon-metrics" }
+tachyon-convert = { version = "0.1.0", path = "../tachyon-convert" }
+paimon = "0.3"
 anyhow.workspace = true
 tracing.workspace = true
 datafusion.workspace = true
@@ -32,7 +34,7 @@ hashbrown = "0.17"
 smallvec = "1"
 
 [dev-dependencies]
-tachyon-sink = { path = "../tachyon-sink" }
+tachyon-sink = { version = "0.1.0", path = "../tachyon-sink" }
 serde_yaml.workspace = true
 anyhow.workspace = true
 paimon = "0.3"

@@ -16,7 +16,9 @@ use crate::run::{
     run_aws_pipeline, run_pipeline_with_lookup, run_topic_pipeline_with_lookup, AwsOutput,
     PipelineHandle, PreparedInput, RunOptions,
 };
+use crate::table_pipeline::run_table_pipeline;
 use crate::table_stream::run_table_stream;
+use crate::table_union::run_table_union;
 
 /// Un pipeline de Tachyon (una instancia).
 #[allow(dead_code)]
@@ -114,25 +116,64 @@ impl Pipeline {
             .any(|input| input.paimon_table().is_some())
         {
             if self.union_all.is_some() {
-                anyhow::bail!("UNION ALL lee topics");
+                if self.join.is_some() || self.lookup.is_some() {
+                    anyhow::bail!("UNION ALL no se mezcla con un join o un lookup");
+                }
+                let Some(shape) = self.window.as_ref() else {
+                    anyhow::bail!("UNION ALL de tablas Paimon es una ventana");
+                };
+                if self.config.output.table.is_none() {
+                    anyhow::bail!("la ventana de las tablas escribe otra tabla");
+                }
+                let options = RunOptions::from_config(&self.config);
+                let metrics = Arc::new(InstanceMetrics::new());
+                return run_table_union(
+                    &self.config,
+                    shape,
+                    self.union_all.as_deref().expect("ramas"),
+                    &options,
+                    &metrics,
+                )
+                .await;
             }
-            let topic = self
-                .config
-                .output
-                .topic
-                .as_deref()
-                .context("leer una tabla publica un topic")?;
+            if self.join.is_some() || self.lookup.is_some() {
+                anyhow::bail!("una tabla Paimon no entra en un join");
+            }
             let options = RunOptions::from_config(&self.config);
             let metrics = Arc::new(InstanceMetrics::new());
-            return run_table_stream(
-                &self.config,
-                &self.select_sql,
-                &options,
-                topic,
-                &self.config.output.key,
-                &metrics,
-            )
-            .await;
+            if self.config.output.topic.is_some() {
+                if self.window.is_some() {
+                    anyhow::bail!(
+                        "una ventana escribe en Paimon: el topic no guarda el estado abierto"
+                    );
+                }
+                let topic = self
+                    .config
+                    .output
+                    .topic
+                    .as_deref()
+                    .context("leer una tabla publica un topic")?;
+                return run_table_stream(
+                    &self.config,
+                    &self.select_sql,
+                    &options,
+                    topic,
+                    &self.config.output.key,
+                    &metrics,
+                )
+                .await;
+            }
+            if self.config.output.table.is_some() {
+                return run_table_pipeline(
+                    &self.config,
+                    &self.select_sql,
+                    self.window.as_ref(),
+                    &options,
+                    &metrics,
+                )
+                .await;
+            }
+            anyhow::bail!("leer una tabla publica un topic o escribe otra tabla");
         }
         if let Some(topic) = &self.config.output.topic {
             if self.window.is_some() || self.join.is_some() {
@@ -162,9 +203,7 @@ impl Pipeline {
                 );
             }
             if self.union_all.is_some() {
-                anyhow::bail!(
-                    "UNION ALL no escribe a kinesis: el sink tiene un solo input"
-                );
+                anyhow::bail!("UNION ALL no escribe a kinesis: el sink tiene un solo input");
             }
             let options = RunOptions::from_config(&self.config);
             let metrics = Arc::new(InstanceMetrics::new());
@@ -188,9 +227,7 @@ impl Pipeline {
                 );
             }
             if self.union_all.is_some() {
-                anyhow::bail!(
-                    "UNION ALL no escribe a sqs: el sink tiene un solo input"
-                );
+                anyhow::bail!("UNION ALL no escribe a sqs: el sink tiene un solo input");
             }
             let options = RunOptions::from_config(&self.config);
             let metrics = Arc::new(InstanceMetrics::new());
@@ -216,21 +253,19 @@ impl Pipeline {
             .as_deref()
             .context("la salida no tiene tabla")?;
         let (db, table) = split_table_identifier(table_id);
-        let warehouse = self
+        let paimon = self
             .config
             .connectors
             .paimon
             .as_ref()
-            .context("la salida a tabla requiere connectors.paimon")?
-            .warehouse
-            .as_str();
+            .context("la salida a tabla requiere connectors.paimon")?;
         let bucket = self
             .config
             .output
             .bucket
             .context("la salida a tabla requiere output.bucket")?;
-        let sink = PaimonSink::open(
-            warehouse,
+        let sink = PaimonSink::open_with(
+            paimon.catalog_options(),
             &db,
             &table,
             &self.config.output.key,
@@ -245,15 +280,8 @@ impl Pipeline {
         let options = RunOptions::from_config(&self.config);
         let metrics = Arc::new(InstanceMetrics::new());
         if let Some(join) = &self.join {
-            return run_join_pipeline(
-                &self.config,
-                &options,
-                sink,
-                join,
-                input_codecs,
-                &metrics,
-            )
-            .await;
+            return run_join_pipeline(&self.config, &options, sink, join, input_codecs, &metrics)
+                .await;
         }
         run_pipeline_with_lookup(
             &self.config,
@@ -271,16 +299,17 @@ impl Pipeline {
 }
 
 /// Orienta el JOIN contra el YAML. La dimensión no es un input.
-fn bind_lookup(
-    config: &PipelineConfig,
-    shape: Option<&LookupShape>,
-) -> Result<Option<LookupJoin>> {
+fn bind_lookup(config: &PipelineConfig, shape: Option<&LookupShape>) -> Result<Option<LookupJoin>> {
     let dimension_names: Vec<&str> = config
         .dimensions
         .iter()
         .map(|dimension| dimension.name.as_str())
         .collect();
-    let input_names: Vec<&str> = config.inputs.iter().map(|input| input.name.as_str()).collect();
+    let input_names: Vec<&str> = config
+        .inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect();
     if let Some(shape) = shape {
         let join = orient_lookup(shape, &dimension_names, &input_names)?;
         if config.inputs.len() != 1 {
@@ -380,7 +409,8 @@ deployment:
 
     #[test]
     fn misaligned_input_key_is_rejected() {
-        let yaml = valid_config_yaml().replace("key: order_id\n    schema", "key: other_id\n    schema");
+        let yaml =
+            valid_config_yaml().replace("key: order_id\n    schema", "key: other_id\n    schema");
         let cfg = load(&yaml);
         let err = Pipeline::new(&cfg, VALID_SQL).unwrap_err();
         assert!(

@@ -152,9 +152,9 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
                     input.name
                 )));
             }
-            if input.watermark.is_some() {
+            if input.watermark.is_some() && cfg.output.table.is_none() {
                 return Err(Error::Config(format!(
-                    "input '{}': una tabla no declara watermark",
+                    "input '{}': una tabla que publica un topic no declara watermark",
                     input.name
                 )));
             }
@@ -263,14 +263,41 @@ pub fn validate_config(cfg: &PipelineConfig) -> Result<(), Error> {
     }
 
     if table_inputs > 0 {
-        if cfg.inputs.len() != 1 {
+        if table_inputs != cfg.inputs.len() {
             return Err(Error::Config(
                 "leer una tabla Paimon es el único input".to_string(),
             ));
         }
-        if cfg.output.topic.is_none() {
+        if table_inputs > 1 {
+            if cfg.output.table.is_none() {
+                return Err(Error::Config(
+                    "varias tablas Paimon escriben una tabla".to_string(),
+                ));
+            }
+            if cfg.deployment.partitions != 1 {
+                return Err(Error::Config(
+                    "leer tablas y escribir otra usa una sola partición: el snapshot se lee entero"
+                        .to_string(),
+                ));
+            }
+            for input in &cfg.inputs {
+                if input.watermark.is_none() {
+                    return Err(Error::Config(format!(
+                        "input '{}': la unión de tablas declara watermark",
+                        input.name
+                    )));
+                }
+            }
+        } else if cfg.output.table.is_some() {
+            if cfg.deployment.partitions != 1 {
+                return Err(Error::Config(
+                    "leer una tabla y escribir otra usa una sola partición: el snapshot se lee entero"
+                        .to_string(),
+                ));
+            }
+        } else if cfg.output.topic.is_none() {
             return Err(Error::Config(
-                "leer una tabla Paimon publica un topic".to_string(),
+                "leer una tabla publica un topic o escribe otra tabla".to_string(),
             ));
         }
         if cfg
@@ -351,9 +378,9 @@ pub fn parse_fixed_duration(raw: &str) -> Result<i64, Error> {
             "duración '{raw}' debe ser un entero con sufijo ms, s, m, h o d"
         )));
     }
-    let value: i64 = number.parse().map_err(|_| {
-        Error::Config(format!("duración '{raw}' no entra en un entero"))
-    })?;
+    let value: i64 = number
+        .parse()
+        .map_err(|_| Error::Config(format!("duración '{raw}' no entra en un entero")))?;
     if value <= 0 {
         return Err(Error::Config(format!("duración '{raw}' debe ser > 0")));
     }
@@ -365,9 +392,9 @@ pub fn parse_fixed_duration(raw: &str) -> Result<i64, Error> {
         "d" => 86_400_000,
         _ => unreachable!("sufijo ya filtrado"),
     };
-    value.checked_mul(factor).ok_or_else(|| {
-        Error::Config(format!("duración '{raw}' se pasa de i64 milisegundos"))
-    })
+    value
+        .checked_mul(factor)
+        .ok_or_else(|| Error::Config(format!("duración '{raw}' se pasa de i64 milisegundos")))
 }
 
 fn validate_dimensions(cfg: &PipelineConfig) -> Result<(), Error> {
@@ -375,9 +402,7 @@ fn validate_dimensions(cfg: &PipelineConfig) -> Result<(), Error> {
         return Ok(());
     }
     if cfg.dimensions.len() > 1 {
-        return Err(Error::Config(
-            "el lookup une una dimensión".to_string(),
-        ));
+        return Err(Error::Config("el lookup une una dimensión".to_string()));
     }
     let dim = &cfg.dimensions[0];
     if dim.name.trim().is_empty() || dim.table.trim().is_empty() || dim.key.trim().is_empty() {
@@ -391,7 +416,11 @@ fn validate_dimensions(cfg: &PipelineConfig) -> Result<(), Error> {
             dim.name
         )));
     }
-    if cfg.inputs.iter().any(|input| input.paimon_table().is_some()) {
+    if cfg
+        .inputs
+        .iter()
+        .any(|input| input.paimon_table().is_some())
+    {
         return Err(Error::Config(
             "el lookup enriquece un stream, no una cola de snapshots".to_string(),
         ));
@@ -450,15 +479,15 @@ pub fn parse_memory_bytes(raw: &str) -> Result<u64, Error> {
             "memoria '{raw}' debe ser un entero con sufijo K, M, G, T, Ki, Mi, Gi o Ti"
         )));
     }
-    let value: u64 = number.parse().map_err(|_| {
-        Error::Config(format!("memoria '{raw}' no entra en un entero de bytes"))
-    })?;
+    let value: u64 = number
+        .parse()
+        .map_err(|_| Error::Config(format!("memoria '{raw}' no entra en un entero de bytes")))?;
     if value == 0 {
         return Err(Error::Config(format!("memoria '{raw}' debe ser > 0")));
     }
-    value.checked_mul(factor).ok_or_else(|| {
-        Error::Config(format!("memoria '{raw}' se pasa de u64 bytes"))
-    })
+    value
+        .checked_mul(factor)
+        .ok_or_else(|| Error::Config(format!("memoria '{raw}' se pasa de u64 bytes")))
 }
 
 fn strip_unit<'a>(raw: &'a str, unit: &str) -> Option<&'a str> {
@@ -632,10 +661,7 @@ deployment:
         let mut cfg = pipeline("");
         cfg.output.topic = Some("orders-by-customer".to_string());
         let err = validate_config(&cfg).unwrap_err();
-        assert!(
-            err.to_string().contains("exactamente uno"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("exactamente uno"), "{err}");
     }
 
     #[test]
@@ -667,8 +693,9 @@ deployment:
 
     #[test]
     fn a_paimon_input_rejects_a_schema_file_and_a_table_output() {
-        let err = validate_config(&serde_yaml::from_str(
-            r#"
+        let err = validate_config(
+            &serde_yaml::from_str(
+                r#"
 pipeline:
   name: t
 connectors:
@@ -688,36 +715,169 @@ output:
 deployment:
   partitions: 1
 "#,
+            )
+            .expect("yaml"),
         )
-        .expect("yaml"))
         .unwrap_err();
         assert!(err.to_string().contains("schema"), "{err}");
+    }
 
-        let err = validate_config(&serde_yaml::from_str(
+    #[test]
+    fn a_paimon_table_can_write_another_table_without_redpanda() {
+        let cfg: PipelineConfig = serde_yaml::from_str(
             r#"
 pipeline:
   name: t
 connectors:
-  redpanda:
-    brokers: ["localhost:9092"]
   paimon:
-    warehouse: ./w
+    warehouse: s3://tachyon/clinic
+    endpoint: http://rustfs:9000
+    region: us-east-1
+    access_key: replace-me
+    secret_key: replace-me
+    path_style: true
 inputs:
-  - name: paid
-    table: default.paid_orders
-    key: order_id
+  - name: scored
+    table: default.scored
+    key: patient_id
+    watermark:
+      column: measurement_timestamp
+      lag: 10s
 output:
-  name: paid_out
-  table: default.out
-  key: order_id
+  name: gdnews2_scores
+  table: default.gdnews2_scores
+  key: patient_id
   bucket: 1
 deployment:
   partitions: 1
 "#,
         )
-        .expect("yaml"))
+        .expect("yaml");
+        assert!(validate_config(&cfg).is_ok(), "{cfg:?}");
+        let options = cfg.connectors.paimon.expect("paimon").catalog_options();
+        assert_eq!(
+            options.get("warehouse").map(String::as_str),
+            Some("s3://tachyon/clinic")
+        );
+        assert_eq!(
+            options.get("s3.endpoint").map(String::as_str),
+            Some("http://rustfs:9000")
+        );
+        assert_eq!(
+            options.get("s3.region").map(String::as_str),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            options.get("s3.access-key").map(String::as_str),
+            Some("replace-me")
+        );
+        assert_eq!(
+            options.get("s3.secret-key").map(String::as_str),
+            Some("replace-me")
+        );
+        assert_eq!(
+            options.get("s3.path-style-access").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn a_paimon_table_inside_the_loop_rejects_more_than_one_partition() {
+        let err = validate_config(
+            &serde_yaml::from_str(
+                r#"
+pipeline:
+  name: t
+connectors:
+  paimon:
+    warehouse: ./w
+inputs:
+  - name: scored
+    table: default.scored
+    key: patient_id
+output:
+  name: gdnews2_scores
+  table: default.gdnews2_scores
+  key: patient_id
+  bucket: 4
+deployment:
+  partitions: 4
+"#,
+            )
+            .expect("yaml"),
+        )
         .unwrap_err();
-        assert!(err.to_string().contains("publica un topic"), "{err}");
+        assert!(err.to_string().contains("una sola partición"), "{err}");
+    }
+
+    #[test]
+    fn several_paimon_tables_can_feed_one_window() {
+        let cfg: PipelineConfig = serde_yaml::from_str(
+            r#"
+pipeline:
+  name: news2
+connectors:
+  paimon:
+    warehouse: ./w
+inputs:
+  - name: scores_heart_rate
+    table: delta.scores_heart_rate
+    key: patient_id
+    watermark:
+      column: measurement_timestamp
+      lag: 10s
+  - name: scores_oxygen_saturation
+    table: delta.scores_oxygen_saturation
+    key: patient_id
+    watermark:
+      column: measurement_timestamp
+      lag: 10s
+output:
+  name: news2_wide
+  table: delta.news2_wide
+  key: patient_id
+  bucket: 1
+deployment:
+  partitions: 1
+"#,
+        )
+        .expect("yaml");
+        assert!(validate_config(&cfg).is_ok(), "{cfg:?}");
+    }
+
+    #[test]
+    fn several_paimon_tables_need_a_watermark_and_one_partition() {
+        let err = validate_config(
+            &serde_yaml::from_str(
+                r#"
+pipeline:
+  name: news2
+connectors:
+  paimon:
+    warehouse: ./w
+inputs:
+  - name: scores_heart_rate
+    table: delta.scores_heart_rate
+    key: patient_id
+  - name: scores_oxygen_saturation
+    table: delta.scores_oxygen_saturation
+    key: patient_id
+    watermark:
+      column: measurement_timestamp
+      lag: 10s
+output:
+  name: news2_wide
+  table: delta.news2_wide
+  key: patient_id
+  bucket: 1
+deployment:
+  partitions: 1
+"#,
+            )
+            .expect("yaml"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("watermark"), "{err}");
     }
 
     #[test]
@@ -830,7 +990,10 @@ deployment:
         cfg.output.bucket = None;
         cfg.output.topic = Some("clicks-out".to_string());
         let err = validate_config(&cfg).unwrap_err();
-        assert!(err.to_string().contains("solo acepta inputs de topic"), "{err}");
+        assert!(
+            err.to_string().contains("solo acepta inputs de topic"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -906,12 +1069,19 @@ deployment:
         let mut cfg = kinesis_pipeline();
         cfg.inputs[0].receive_wait = Some("20s".to_string());
         let err = validate_config(&cfg).unwrap_err();
-        assert!(err.to_string().contains("receive_wait solo se usa con sqs"), "{err}");
+        assert!(
+            err.to_string().contains("receive_wait solo se usa con sqs"),
+            "{err}"
+        );
 
         let mut topic = pipeline("");
         topic.inputs[0].start_from = Some(crate::schema::StartFrom::TrimHorizon);
         let err = validate_config(&topic).unwrap_err();
-        assert!(err.to_string().contains("start_from solo se usa con kinesis"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("start_from solo se usa con kinesis"),
+            "{err}"
+        );
     }
 
     #[test]

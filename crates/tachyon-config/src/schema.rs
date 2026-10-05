@@ -1,5 +1,7 @@
 //! Schema de `pipeline.yaml` (ver DESIGN.md §3.2).
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use tachyon_core::Error;
 
@@ -95,6 +97,42 @@ pub struct PaimonConfig {
     #[serde(default = "default_catalog")]
     pub catalog: String,
     pub catalog_uri: Option<String>,
+    /// Endpoint S3 del warehouse. rustfs lo usa; un directorio local no.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub access_key: Option<String>,
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// `true` para rustfs y cualquier S3 que no use virtual-host. Default: false.
+    #[serde(default)]
+    pub path_style: bool,
+}
+
+impl PaimonConfig {
+    /// Opciones del catálogo de Paimon. Las claves S3 son las de paimon 0.3
+    /// (`s3.endpoint`, `s3.access-key`, `s3.secret-key`, `s3.region`,
+    /// `s3.path-style-access`). Un warehouse local solo manda `warehouse`.
+    pub fn catalog_options(&self) -> HashMap<String, String> {
+        let mut options = HashMap::new();
+        options.insert(String::from("warehouse"), self.warehouse.clone());
+        for (key, value) in [
+            ("s3.endpoint", self.endpoint.as_deref()),
+            ("s3.region", self.region.as_deref()),
+            ("s3.access-key", self.access_key.as_deref()),
+            ("s3.secret-key", self.secret_key.as_deref()),
+        ] {
+            if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+                options.insert(String::from(key), value.to_string());
+            }
+        }
+        if self.path_style {
+            options.insert(String::from("s3.path-style-access"), String::from("true"));
+        }
+        options
+    }
 }
 
 fn default_catalog() -> String {

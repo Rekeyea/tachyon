@@ -85,7 +85,10 @@ async fn recreate_topic(broker: &str) {
 
     // Crear el topic con 2 particiones.
     let new_topic = NewTopic::new(TOPIC, 2, TopicReplication::Fixed(1));
-    match admin.create_topics(std::iter::once(&new_topic), &opts).await {
+    match admin
+        .create_topics(std::iter::once(&new_topic), &opts)
+        .await
+    {
         Ok(results) => {
             for r in results {
                 if let Err((msg, code)) = r {
@@ -148,7 +151,8 @@ async fn end_to_end_redpanda_to_datafusion() {
         .expect("tabla")
         .with_infinite_table(true);
     let ctx = SessionContext::new();
-    ctx.register_table("orders", Arc::new(table)).expect("register");
+    ctx.register_table("orders", Arc::new(table))
+        .expect("register");
 
     // --- 4. SQL sobre el stream infinito (LIMIT cierra la consulta) ---
     let df = ctx

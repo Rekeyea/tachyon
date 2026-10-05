@@ -14,9 +14,8 @@ pub async fn sdk_config(
     endpoint: Option<&str>,
     profile: Option<&str>,
 ) -> Result<aws_config::SdkConfig> {
-    let mut builder =
-        aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(Region::new(region.to_string()));
+    let mut builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(Region::new(region.to_string()));
     if let Some(profile) = profile {
         builder = builder.profile_name(profile.to_string());
     }

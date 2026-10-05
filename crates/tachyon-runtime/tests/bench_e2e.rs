@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::{DataType, Field, Schema};
-use paimon::spec::{DataType as PDataType, BigIntType, DoubleType, VarCharType};
+use paimon::spec::{BigIntType, DataType as PDataType, DoubleType, VarCharType};
 use rdkafka::admin::{AdminClient, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
@@ -92,7 +92,12 @@ fn rss_mb() -> f64 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if let Some(v) = line.strip_prefix("VmRSS:") {
-                return v.trim().trim_end_matches(" kB").parse::<f64>().unwrap_or(0.0) / 1024.0;
+                return v
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .parse::<f64>()
+                    .unwrap_or(0.0)
+                    / 1024.0;
             }
         }
     }
@@ -128,7 +133,10 @@ fn pin_to_cores(n: usize) {
     if pinned == 0 {
         let rc = unsafe { libc::sched_setaffinity(0, size, &mask) };
         if rc != 0 {
-            eprintln!("sched_setaffinity falló: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "sched_setaffinity falló: {}",
+                std::io::Error::last_os_error()
+            );
             return;
         }
         pinned = 1;
@@ -143,7 +151,14 @@ async fn ensure_topic() {
     let admin: AdminClient<DefaultClientContext> = cc.create().expect("admin");
     let _ = admin.delete_topics(&[TOPIC], &Default::default()).await;
     admin
-        .create_topics(&[NewTopic::new(TOPIC, partitions(), TopicReplication::Fixed(1))], &Default::default())
+        .create_topics(
+            &[NewTopic::new(
+                TOPIC,
+                partitions(),
+                TopicReplication::Fixed(1),
+            )],
+            &Default::default(),
+        )
         .await
         .expect("creando topic");
 }
@@ -200,7 +215,11 @@ fn pre_produce() {
     println!(
         "  pre-producción: {ok}/{total_events} eventos en {dt:.1}s ({:.0} ev/s){}",
         ok as f64 / dt,
-        if err > 0 { format!(" ({err} errores)") } else { String::new() }
+        if err > 0 {
+            format!(" ({err} errores)")
+        } else {
+            String::new()
+        }
     );
     assert!(err == 0, "no deben haber errores de producción");
 }
@@ -273,7 +292,8 @@ async fn bench_e2e_sustained_drain() {
     }
 
     // --- 0. Warehouse + tabla Paimon ---
-    let warehouse = std::env::temp_dir().join(format!("tachyon-bench-e2e-wh-{}", std::process::id()));
+    let warehouse =
+        std::env::temp_dir().join(format!("tachyon-bench-e2e-wh-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&warehouse);
     std::fs::create_dir_all(&warehouse).expect("warehouse");
     let warehouse = warehouse.to_string_lossy().to_string();
@@ -285,7 +305,10 @@ async fn bench_e2e_sustained_drain() {
         DB,
         TABLE,
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("status", PDataType::VarChar(VarCharType::string_type())),
             ("source_version", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::Double(DoubleType::new())),
@@ -327,22 +350,31 @@ async fn bench_e2e_sustained_drain() {
     };
     let sink = PaimonSink::from_table(table, "order_id", partitions(), Some("source_version"))
         .expect("sink");
-    let input_schemas = HashMap::from([(
-        "orders".to_string(),
-        PreparedInput::json(orders_schema()),
-    )]);
+    let input_schemas =
+        HashMap::from([("orders".to_string(), PreparedInput::json(orders_schema()))]);
     let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
     let select_sql = "SELECT order_id, status, source_version, amount FROM orders";
     let metrics_read = metrics.clone();
     let run_task = tokio::spawn(async move {
-        run_pipeline(&config, select_sql, &options, sink, &input_schemas, &metrics, None).await
+        run_pipeline(
+            &config,
+            select_sql,
+            &options,
+            sink,
+            &input_schemas,
+            &metrics,
+            None,
+        )
+        .await
     });
 
     // --- 3. Medición en estado estacionario ---
     // Espera a que el pipeline pase el arranque (20% del total consumido) y
     // muestrea; luego espera al 80% y calcula la tasa entre ambos puntos.
     let total = events() as u64;
-    let read = |m: &tachyon_metrics::InstanceMetrics| m.rows_read.load(std::sync::atomic::Ordering::Relaxed);
+    let read = |m: &tachyon_metrics::InstanceMetrics| {
+        m.rows_read.load(std::sync::atomic::Ordering::Relaxed)
+    };
 
     // Snapshot de los contadores de tiempo por etapa (ns acumulados).
     fn stage_ns(m: &tachyon_metrics::InstanceMetrics) -> (u64, u64, u64, u64) {
@@ -366,7 +398,12 @@ async fn bench_e2e_sustained_drain() {
             }
         }
         if read(&metrics_read) >= total * 20 / 100 {
-            break (Instant::now(), read(&metrics_read), cpu_seconds(), stage_ns(&metrics_read));
+            break (
+                Instant::now(),
+                read(&metrics_read),
+                cpu_seconds(),
+                stage_ns(&metrics_read),
+            );
         }
         assert!(Instant::now() < deadline, "timeout esperando el 20%");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -374,7 +411,12 @@ async fn bench_e2e_sustained_drain() {
     // Punto 1: 80% consumido.
     let (t1, r1, cpu_t1, s1) = loop {
         if read(&metrics_read) >= total * 80 / 100 {
-            break (Instant::now(), read(&metrics_read), cpu_seconds(), stage_ns(&metrics_read));
+            break (
+                Instant::now(),
+                read(&metrics_read),
+                cpu_seconds(),
+                stage_ns(&metrics_read),
+            );
         }
         assert!(Instant::now() < deadline, "timeout esperando el 80%");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -385,7 +427,11 @@ async fn bench_e2e_sustained_drain() {
     let rows_s = drows as f64 / dt;
     let cpu_dt = cpu_t1 - cpu_t0;
     let cpu_pct = if dt > 0.0 { cpu_dt / dt * 100.0 } else { 0.0 };
-    let rows_cpu_s = if cpu_dt > 0.0 { drows as f64 / cpu_dt } else { 0.0 };
+    let rows_cpu_s = if cpu_dt > 0.0 {
+        drows as f64 / cpu_dt
+    } else {
+        0.0
+    };
     let rss = rss_mb();
 
     // Breakdown de tiempo por etapa en la ventana (% del wall de la etapa

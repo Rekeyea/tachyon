@@ -50,7 +50,11 @@ async fn ensure_topic() {
     let _ = admin.delete_topics(&[TOPIC], &Default::default()).await;
     admin
         .create_topics(
-            &[NewTopic::new(TOPIC, partitions(), TopicReplication::Fixed(1))],
+            &[NewTopic::new(
+                TOPIC,
+                partitions(),
+                TopicReplication::Fixed(1),
+            )],
             &Default::default(),
         )
         .await
@@ -179,8 +183,8 @@ async fn raw_consume_spike() {
         std::pin::Pin<
             Box<
                 dyn futures::Stream<
-                    Item = anyhow::Result<Vec<tachyon_source::record::SourceRecord>>,
-                > + Send,
+                        Item = anyhow::Result<Vec<tachyon_source::record::SourceRecord>>,
+                    > + Send,
             >,
         >,
     > = Vec::new();

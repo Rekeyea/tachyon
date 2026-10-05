@@ -13,12 +13,12 @@ use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use apache_avro::types::Value as AvroValue;
+use apache_avro::Schema as AvroSchema;
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use apache_avro::Schema as AvroSchema;
-use apache_avro::types::Value as AvroValue;
 
 /// El formato de decodificación del payload.
 #[derive(Debug, Clone)]
@@ -100,9 +100,8 @@ impl Decoder {
     ) -> Result<RecordBatch> {
         let mut records = Vec::with_capacity(values.len());
         for (row, payload) in values.iter().enumerate() {
-            let id = crate::schema_wire::envelope_id(payload).with_context(|| {
-                format!("el mensaje {row} no trae el id de schema (0x00 + id)")
-            })?;
+            let id = crate::schema_wire::envelope_id(payload)
+                .with_context(|| format!("el mensaje {row} no trae el id de schema (0x00 + id)"))?;
             let writer = cache.writer(id)?;
             let value = crate::schema_wire::decode_envelope(payload, &writer, &cache.reader)
                 .with_context(|| format!("mensaje {row}, schema {id}"))?;
@@ -323,7 +322,10 @@ mod tests {
     fn fast_json_coerces_int_to_float_and_handles_explicit_null() {
         let schema = orders_schema();
         let decoder = Decoder::new(schema.clone(), DecodeFormat::Json);
-        assert!(decoder.flat.is_some(), "el schema plano debe usar el decoder plano");
+        assert!(
+            decoder.flat.is_some(),
+            "el schema plano debe usar el decoder plano"
+        );
         // amount entero (sin punto) -> Float64; status null explícito -> null.
         let mut values = vec![
             br#"{"order_id":1,"status":null,"amount":100}"#.to_vec(),
@@ -361,7 +363,10 @@ mod tests {
         let schema = orders_schema();
         let decoder = Decoder::new(schema.clone(), DecodeFormat::Json);
         let mut values = vec![br#"[1,2,3]"#.to_vec()];
-        assert!(decoder.decode(&mut values).is_err(), "un array no es un registro");
+        assert!(
+            decoder.decode(&mut values).is_err(),
+            "un array no es un registro"
+        );
     }
 
     #[test]
@@ -411,7 +416,10 @@ mod tests {
         ]);
         let value2 = AvroValue::Record(vec![
             ("order_id".to_string(), AvroValue::Long(2)),
-            ("status".to_string(), AvroValue::String("shipped".to_string())),
+            (
+                "status".to_string(),
+                AvroValue::String("shipped".to_string()),
+            ),
             ("amount".to_string(), AvroValue::Double(200.0)),
         ]);
         let encoded = vec![

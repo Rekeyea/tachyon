@@ -161,7 +161,8 @@ mod tests {
         loop {
             match client.describe_stream().stream_name(stream).send().await {
                 Ok(r) => {
-                    if r.stream_description().map(|d| d.stream_status().to_string())
+                    if r.stream_description()
+                        .map(|d| d.stream_status().to_string())
                         == Some("ACTIVE".to_string())
                     {
                         return;

@@ -7,8 +7,8 @@
 //!   y la cierra una sola vez.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::Int64Array;
@@ -89,9 +89,7 @@ async fn fresh_topic(topic: &str) {
 
 async fn produce(producer: &FutureProducer, topic: &str, events: &[(i64, i64)]) {
     for (t, amount) in events {
-        let payload = format!(
-            "{{\"order_id\":1,\"event_time\":{t},\"amount\":{amount}}}"
-        );
+        let payload = format!("{{\"order_id\":1,\"event_time\":{t},\"amount\":{amount}}}");
         producer
             .send(
                 FutureRecord::to(topic).key("1").payload(&payload),
@@ -182,7 +180,8 @@ fn start(
         group_id: identity.to_string(),
         commit_user: identity.to_string(),
     };
-    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
+    let sink =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
     let codecs = HashMap::from([("orders".into(), PreparedInput::json(input_schema()))]);
     let metrics = Arc::new(InstanceMetrics::new());
     let metrics_task = metrics.clone();
@@ -207,7 +206,10 @@ async fn fresh_table(warehouse: &str) -> paimon::table::Table {
         "default",
         "orders_window",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             (
                 "window_start",
                 PDataType::BigInt(BigIntType::with_nullable(false)),
@@ -235,7 +237,8 @@ async fn live_window_restart_does_not_double_count() {
         .try_init();
 
     let topic = format!("tachyon-window-crash-{}", std::process::id());
-    let warehouse = std::env::temp_dir().join(format!("tachyon-window-crash-{}", std::process::id()));
+    let warehouse =
+        std::env::temp_dir().join(format!("tachyon-window-crash-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&warehouse);
     std::fs::create_dir_all(&warehouse).expect("warehouse");
     let warehouse = warehouse.to_string_lossy().to_string();
@@ -251,7 +254,11 @@ async fn live_window_restart_does_not_double_count() {
     let (task, _) = start(&warehouse, &topic, &table, &identity);
     let mut task = Some(task);
     let rows = wait_rows(&table, &mut task, |rows| rows == [(1, 0, 2, 15)]).await;
-    assert_eq!(rows, vec![(1, 0, 2, 15)], "la ventana cerrada antes del crash");
+    assert_eq!(
+        rows,
+        vec![(1, 0, 2, 15)],
+        "la ventana cerrada antes del crash"
+    );
     if let Some(task) = task.take() {
         task.abort();
         let _ = task.await;
@@ -300,7 +307,8 @@ async fn live_window_crash_before_snapshot_replays_once() {
         .try_init();
 
     let topic = format!("tachyon-window-open-{}", std::process::id());
-    let warehouse = std::env::temp_dir().join(format!("tachyon-window-open-{}", std::process::id()));
+    let warehouse =
+        std::env::temp_dir().join(format!("tachyon-window-open-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&warehouse);
     std::fs::create_dir_all(&warehouse).expect("warehouse");
     let warehouse = warehouse.to_string_lossy().to_string();

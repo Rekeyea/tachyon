@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use paimon::spec::{DataType as PDataType, BigIntType, DoubleType, VarCharType};
+use paimon::spec::{BigIntType, DataType as PDataType, DoubleType, VarCharType};
 use rdkafka::admin::{AdminClient, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
@@ -39,12 +39,10 @@ async fn recreate_topic(broker: &str) {
     let mut cc = ClientConfig::new();
     cc.set("bootstrap.servers", broker);
     let admin: AdminClient<DefaultClientContext> = cc.create().expect("admin client");
-    let _ = admin.delete_topics(&[ORDERS_TOPIC], &Default::default()).await;
-    let topic = NewTopic::new(
-        ORDERS_TOPIC,
-        2,
-        TopicReplication::Fixed(1),
-    );
+    let _ = admin
+        .delete_topics(&[ORDERS_TOPIC], &Default::default())
+        .await;
+    let topic = NewTopic::new(ORDERS_TOPIC, 2, TopicReplication::Fixed(1));
     admin
         .create_topics(&[topic], &Default::default())
         .await
@@ -66,9 +64,7 @@ async fn produce_orders(producer: &FutureProducer) {
             "{{\"order_id\":{order_id},\"status\":\"{status}\",\"source_version\":{version},\"amount\":{amount}}}"
         );
         let key = order_id.to_string();
-        let record = FutureRecord::to(ORDERS_TOPIC)
-            .key(&key)
-            .payload(&payload);
+        let record = FutureRecord::to(ORDERS_TOPIC).key(&key).payload(&payload);
         producer
             .send(record, Duration::from_secs(5))
             .await
@@ -125,10 +121,8 @@ async fn live_end_to_end_redpanda_to_paimon() {
         .try_init();
 
     // --- 0. Warehouse + tabla Paimon frescos ---
-    let warehouse = std::env::temp_dir().join(format!(
-        "tachyon-e2e-warehouse-{}",
-        std::process::id()
-    ));
+    let warehouse =
+        std::env::temp_dir().join(format!("tachyon-e2e-warehouse-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&warehouse);
     std::fs::create_dir_all(&warehouse).expect("creando warehouse");
     let warehouse = warehouse.to_string_lossy().to_string();
@@ -138,7 +132,10 @@ async fn live_end_to_end_redpanda_to_paimon() {
         DB,
         TABLE,
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("status", PDataType::VarChar(VarCharType::string_type())),
             ("source_version", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::Double(DoubleType::new())),
@@ -169,10 +166,8 @@ async fn live_end_to_end_redpanda_to_paimon() {
     // --- 3. Sink + schemas ---
     let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
         .expect("abriendo sink");
-    let input_schemas = HashMap::from([(
-        "orders".to_string(),
-        PreparedInput::json(orders_schema()),
-    )]);
+    let input_schemas =
+        HashMap::from([("orders".to_string(), PreparedInput::json(orders_schema()))]);
 
     // --- 4. Corre el pipeline en una tarea (el stream es infinito) ---
     let select_sql = "SELECT order_id, status, source_version, amount \

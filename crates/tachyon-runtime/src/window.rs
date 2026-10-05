@@ -136,10 +136,16 @@ impl std::fmt::Display for WindowFault {
                 "SUM no entra en i64 ({sum}) en la partición {partition} offset {offset}"
             ),
             WindowFault::TypeMix { partition, offset } => {
-                write!(f, "mezcla Int64 y Float64 en partición {partition} offset {offset}")
+                write!(
+                    f,
+                    "mezcla Int64 y Float64 en partición {partition} offset {offset}"
+                )
             }
             WindowFault::NonFinite { partition, offset } => {
-                write!(f, "Float64 no finito en partición {partition} offset {offset}")
+                write!(
+                    f,
+                    "Float64 no finito en partición {partition} offset {offset}"
+                )
             }
             WindowFault::ValueCount { expected, got } => {
                 write!(f, "la fila trae {got} medidas y el spec pide {expected}")
@@ -161,7 +167,11 @@ pub const PARTITION_COLUMN: &str = "_tachyon_partition";
 /// Schema que ve DataFusion: columnas del usuario más la partición de Kafka.
 pub fn schema_with_partition(schema: SchemaRef) -> SchemaRef {
     let mut fields = schema.fields().to_vec();
-    fields.push(Arc::new(Field::new(PARTITION_COLUMN, DataType::Int32, false)));
+    fields.push(Arc::new(Field::new(
+        PARTITION_COLUMN,
+        DataType::Int32,
+        false,
+    )));
     Arc::new(Schema::new(fields))
 }
 
@@ -183,6 +193,7 @@ pub fn output_field_names(shape: &WindowShape) -> Vec<String> {
     names.push("window_start".into());
     names.push("window_end".into());
     names.extend(shape.aggs.iter().map(|agg| agg.alias.clone()));
+    names.extend(shape.derived.iter().map(|item| item.alias.clone()));
     names
 }
 
@@ -203,6 +214,7 @@ pub fn spec_from_shape(shape: &WindowShape) -> WindowSpecId {
                 kind: agg.kind,
                 input: agg.input.clone(),
                 alias: agg.alias.clone(),
+                project: agg.project.clone(),
             })
             .collect(),
     }
@@ -379,7 +391,9 @@ impl<'a> GroupCol<'a> {
         Ok(match column.data_type() {
             DataType::Int64 => GroupCol::I64(column.as_any().downcast_ref::<Int64Array>().unwrap()),
             DataType::Utf8 => GroupCol::Str(column.as_any().downcast_ref::<StringArray>().unwrap()),
-            other => anyhow::bail!("clave de ventana '{name}' con tipo {other}, hace falta Int64 o Utf8"),
+            other => {
+                anyhow::bail!("clave de ventana '{name}' con tipo {other}, hace falta Int64 o Utf8")
+            }
         })
     }
 }
@@ -484,6 +498,11 @@ pub fn batch_from_closed(
         fields.push(field);
         columns.push(column);
     }
+    for item in &shape.derived {
+        let (field, column) = derived_column(closed, shape, item)?;
+        fields.push(field);
+        columns.push(column);
+    }
     let schema = Arc::new(Schema::new(fields));
     RecordBatch::try_new(schema, columns).map_err(|e| anyhow::anyhow!("batch de ventana: {e}"))
 }
@@ -558,9 +577,20 @@ fn agg_column(
     index: usize,
     agg: &WindowAgg,
 ) -> anyhow::Result<(Field, Arc<dyn Array>)> {
-    let slot = closed.first().map(|w| &w.acc.slots[index]);
-    match (agg.kind, slot) {
-        (AggKind::Count, _) => Ok((
+    let float = agg.kind == AggKind::Avg
+        || closed.iter().any(|window| {
+            matches!(
+                window.acc.slots.get(index),
+                Some(
+                    AggState::SumF64(_)
+                        | AggState::MinF64(_)
+                        | AggState::MaxF64(_)
+                        | AggState::Avg { .. }
+                )
+            )
+        });
+    if agg.kind == AggKind::Count {
+        return Ok((
             Field::new(&agg.alias, DataType::Int64, false),
             Arc::new(Int64Array::from(
                 closed
@@ -571,28 +601,196 @@ fn agg_column(
                     })
                     .collect::<Vec<_>>(),
             )),
-        )),
-        (AggKind::Avg, _) | (_, Some(AggState::SumF64(_)) | Some(AggState::MinF64(_)) | Some(AggState::MaxF64(_))) => {
-            let values = closed
-                .iter()
-                .map(|w| float_slot(&w.acc, index))
-                .collect::<Vec<_>>();
-            Ok((
-                Field::new(&agg.alias, DataType::Float64, true),
-                Arc::new(Float64Array::from(values)),
-            ))
-        }
-        _ => {
-            let values = closed
-                .iter()
-                .map(|w| int_slot(&w.acc, index))
-                .collect::<Vec<_>>();
-            Ok((
-                Field::new(&agg.alias, DataType::Int64, true),
-                Arc::new(Int64Array::from(values)),
-            ))
+        ));
+    }
+    if float {
+        let mut values = closed
+            .iter()
+            .map(|w| float_slot(&w.acc, index))
+            .collect::<Vec<_>>();
+        let nullable = fill_f64(&mut values, agg.fill.as_deref())?;
+        return Ok((
+            Field::new(&agg.alias, DataType::Float64, nullable),
+            Arc::new(Float64Array::from(values)),
+        ));
+    }
+    let mut values = closed
+        .iter()
+        .map(|w| int_slot(&w.acc, index))
+        .collect::<Vec<_>>();
+    let nullable = fill_i64(&mut values, agg.fill.as_deref())?;
+    Ok((
+        Field::new(&agg.alias, DataType::Int64, nullable),
+        Arc::new(Int64Array::from(values)),
+    ))
+}
+
+fn fill_i64(values: &mut [Option<i64>], fill: Option<&str>) -> anyhow::Result<bool> {
+    let Some(fill) = fill else {
+        return Ok(true);
+    };
+    if fill.contains(['.', 'e', 'E']) {
+        anyhow::bail!("COALESCE({fill}) no entra en un agregado entero");
+    }
+    let parsed: i64 = fill
+        .parse()
+        .map_err(|_| anyhow::anyhow!("COALESCE '{fill}' no es un entero"))?;
+    for value in values.iter_mut() {
+        if value.is_none() {
+            *value = Some(parsed);
         }
     }
+    Ok(false)
+}
+
+fn fill_f64(values: &mut [Option<f64>], fill: Option<&str>) -> anyhow::Result<bool> {
+    let Some(fill) = fill else {
+        return Ok(true);
+    };
+    let parsed: f64 = fill
+        .parse()
+        .map_err(|_| anyhow::anyhow!("COALESCE '{fill}' no es un número"))?;
+    if !parsed.is_finite() {
+        anyhow::bail!("COALESCE '{fill}' no es finito");
+    }
+    for value in values.iter_mut() {
+        if value.is_none() {
+            *value = Some(parsed);
+        }
+    }
+    Ok(false)
+}
+
+fn derived_column(
+    closed: &[ClosedWindow],
+    shape: &WindowShape,
+    item: &tachyon_sql::WindowDerived,
+) -> anyhow::Result<(Field, Arc<dyn Array>)> {
+    let indexes: Vec<usize> = item
+        .terms
+        .iter()
+        .map(|term| {
+            shape
+                .aggs
+                .iter()
+                .position(|agg| agg.alias == *term)
+                .ok_or_else(|| anyhow::anyhow!("'{}' no es un agregado", term))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let float = indexes.iter().any(|&index| {
+        shape.aggs[index].kind == AggKind::Avg
+            || closed.iter().any(|window| {
+                matches!(
+                    window.acc.slots.get(index),
+                    Some(
+                        AggState::SumF64(_)
+                            | AggState::MinF64(_)
+                            | AggState::MaxF64(_)
+                            | AggState::Avg { .. }
+                    )
+                )
+            })
+            || shape.aggs[index]
+                .fill
+                .as_deref()
+                .is_some_and(|fill| fill.contains(['.', 'e', 'E']))
+    });
+    if float {
+        let mut values = Vec::with_capacity(closed.len());
+        for window in closed {
+            values.push(sum_terms_f64(window, shape, &indexes)?);
+        }
+        let nullable = values.iter().any(Option::is_none);
+        return Ok((
+            Field::new(&item.alias, DataType::Float64, nullable),
+            Arc::new(Float64Array::from(values)),
+        ));
+    }
+    let mut values = Vec::with_capacity(closed.len());
+    for window in closed {
+        values.push(sum_terms_i64(window, shape, &indexes)?);
+    }
+    let nullable = values.iter().any(Option::is_none);
+    Ok((
+        Field::new(&item.alias, DataType::Int64, nullable),
+        Arc::new(Int64Array::from(values)),
+    ))
+}
+
+fn filled_i64(
+    window: &ClosedWindow,
+    shape: &WindowShape,
+    index: usize,
+) -> anyhow::Result<Option<i64>> {
+    if let Some(value) = int_slot(&window.acc, index) {
+        return Ok(Some(value));
+    }
+    match shape.aggs[index].fill.as_deref() {
+        None => Ok(None),
+        Some(fill) => {
+            if fill.contains(['.', 'e', 'E']) {
+                anyhow::bail!("COALESCE({fill}) no entra en un agregado entero");
+            }
+            fill.parse::<i64>()
+                .map(Some)
+                .map_err(|_| anyhow::anyhow!("COALESCE '{fill}' no es un entero"))
+        }
+    }
+}
+
+fn filled_f64(
+    window: &ClosedWindow,
+    shape: &WindowShape,
+    index: usize,
+) -> anyhow::Result<Option<f64>> {
+    if let Some(value) = float_slot(&window.acc, index) {
+        return Ok(Some(value));
+    }
+    if int_slot(&window.acc, index).is_some() {
+        return Ok(int_slot(&window.acc, index).map(|value| value as f64));
+    }
+    match shape.aggs[index].fill.as_deref() {
+        None => Ok(None),
+        Some(fill) => fill
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("COALESCE '{fill}' no es un número")),
+    }
+}
+
+fn sum_terms_i64(
+    window: &ClosedWindow,
+    shape: &WindowShape,
+    indexes: &[usize],
+) -> anyhow::Result<Option<i64>> {
+    let mut total: i64 = 0;
+    for index in indexes {
+        let Some(value) = filled_i64(window, shape, *index)? else {
+            return Ok(None);
+        };
+        total = total
+            .checked_add(value)
+            .ok_or_else(|| anyhow::anyhow!("la suma de la ventana no entra en i64"))?;
+    }
+    Ok(Some(total))
+}
+
+fn sum_terms_f64(
+    window: &ClosedWindow,
+    shape: &WindowShape,
+    indexes: &[usize],
+) -> anyhow::Result<Option<f64>> {
+    let mut total = 0.0;
+    for index in indexes {
+        let Some(value) = filled_f64(window, shape, *index)? else {
+            return Ok(None);
+        };
+        total += value;
+    }
+    if !total.is_finite() {
+        anyhow::bail!("la suma de la ventana no es finita");
+    }
+    Ok(Some(total))
 }
 
 fn int_slot(acc: &Accumulators, index: usize) -> Option<i64> {
@@ -658,6 +856,9 @@ pub struct WindowOperator {
     /// Falla de un batch aplicado sin undo (ver `apply`). El estado quedó a
     /// medio aplicar: toda llamada siguiente devuelve esta falla.
     poisoned: Option<WindowFault>,
+    /// Un snapshot se aplica entero contra el watermark anterior. El mínimo
+    /// sube una sola vez, al terminar el snapshot.
+    defer_close: bool,
 }
 
 /// Rollback de un batch fallido: los originales de las claves tocadas y los
@@ -702,7 +903,8 @@ fn state_for<'a>(
     if track && !saved.contains_key(key) {
         saved.insert(key.clone(), keys.get(key).cloned());
     }
-    keys.entry(key.clone()).or_insert_with(|| empty_key(partition))
+    keys.entry(key.clone())
+        .or_insert_with(|| empty_key(partition))
 }
 
 impl WindowOperator {
@@ -722,6 +924,7 @@ impl WindowOperator {
             min_holder: None,
             cap: None,
             poisoned: None,
+            defer_close: false,
         }
     }
 
@@ -806,7 +1009,8 @@ impl WindowOperator {
         self.released.remove(&partition);
         for (key, mut state) in keys {
             state.partition = partition;
-            self.keys.insert(WinKey::from_bytes(key, self.key_kind)?, state);
+            self.keys
+                .insert(WinKey::from_bytes(key, self.key_kind)?, state);
         }
         self.partitions.insert(
             partition,
@@ -840,6 +1044,26 @@ impl WindowOperator {
     /// salirse de i64), el batch va sin undo. La única falla que queda
     /// posible ahí (un tipo que no coincide con el del acumulador) deja el
     /// operador envenenado: esa falla vuelve en cada llamada siguiente.
+    /// Aplica el snapshot entero y recién después mueve el watermark.
+    ///
+    /// Una fila vieja que viene después de una nueva, dentro del mismo
+    /// snapshot, se agrega. Una fila anterior al watermark del snapshot
+    /// previo se descarta.
+    pub fn apply_epoch(
+        &mut self,
+        rows: &[WindowInput],
+        now: Instant,
+    ) -> Result<Vec<ClosedWindow>, WindowFault> {
+        self.defer_close = true;
+        let applied = self.apply(rows, now);
+        self.defer_close = false;
+        let mut closed = applied?;
+        let mut undo = BatchUndo::default();
+        self.raise_and_close(now, &mut undo);
+        closed.extend(undo.closed);
+        Ok(closed)
+    }
+
     pub fn apply(
         &mut self,
         rows: &[WindowInput],
@@ -1013,15 +1237,21 @@ impl WindowOperator {
         {
             return Ok(());
         }
-        let clock = self.partitions.entry(row.partition).or_insert(PartitionClock {
-            max_event_time_ms: None,
-            last_on_time: None,
-        });
+        let clock = self
+            .partitions
+            .entry(row.partition)
+            .or_insert(PartitionClock {
+                max_event_time_ms: None,
+                last_on_time: None,
+            });
         let prev_max = clock.max_event_time_ms;
         let raised = prev_max.is_none_or(|max| t > max);
         clock.max_event_time_ms = Some(prev_max.map_or(t, |max| max.max(t)));
         clock.last_on_time = Some(now);
         self.assign(key, t, row, undo)?;
+        if self.defer_close {
+            return Ok(());
+        }
         // Solo un máximo que sube puede subir el watermark (el mínimo sobre
         // las particiones activas es monótono con los máximos, y el de
         // instancia es `max` consigo mismo). Si esta fila no movió el de su
@@ -1080,7 +1310,13 @@ impl WindowOperator {
         row: &WindowInput,
         undo: &mut BatchUndo,
     ) -> Result<(), WindowFault> {
-        let state = state_for(&mut self.keys, &mut undo.saved, undo.track, key, row.partition);
+        let state = state_for(
+            &mut self.keys,
+            &mut undo.saved,
+            undo.track,
+            key,
+            row.partition,
+        );
         state.partition = row.partition;
         let is_new = !state.windows.contains_key(&start);
         let acc = state
@@ -1111,7 +1347,13 @@ impl WindowOperator {
         undo: &mut BatchUndo,
     ) -> Result<(), WindowFault> {
         let aggs = &self.spec.aggs;
-        let state = state_for(&mut self.keys, &mut undo.saved, undo.track, key, row.partition);
+        let state = state_for(
+            &mut self.keys,
+            &mut undo.saved,
+            undo.track,
+            key,
+            row.partition,
+        );
         state.partition = row.partition;
         let hit: Vec<usize> = state
             .sessions
@@ -1218,7 +1460,10 @@ impl WindowOperator {
         if self.poisoned.is_some() {
             return Vec::new();
         }
-        self.instance_watermark_ms = Some(self.instance_watermark_ms.map_or(watermark, |w| w.max(watermark)));
+        self.instance_watermark_ms = Some(
+            self.instance_watermark_ms
+                .map_or(watermark, |w| w.max(watermark)),
+        );
         let mut undo = BatchUndo::default();
         self.close_until(self.instance_watermark_ms.expect("watermark"), &mut undo);
         undo.closed
@@ -1444,13 +1689,7 @@ fn absorb(
                         });
                     }
                 }
-                apply_num(
-                    &mut acc.slots[i],
-                    &mut acc.present[i],
-                    agg.kind,
-                    num,
-                    row,
-                )?;
+                apply_num(&mut acc.slots[i], &mut acc.present[i], agg.kind, num, row)?;
             }
         }
     }
@@ -1558,11 +1797,13 @@ mod tests {
                     kind: AggKind::Count,
                     input: None,
                     alias: "n".into(),
+                    project: None,
                 },
                 AggSpec {
                     kind: AggKind::Sum,
                     input: Some("amount".into()),
                     alias: "amount".into(),
+                    project: None,
                 },
             ],
         }
@@ -1576,6 +1817,32 @@ mod tests {
             offset: t,
             values: vec![None, Some(Num::I64(amount))].into(),
         }
+    }
+
+    #[test]
+    fn an_epoch_keeps_an_older_event_that_arrives_after_a_newer_one() {
+        let t0 = Instant::now();
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 60_000, None, None),
+            10_000,
+            60_000,
+            KeyKind::I64,
+        );
+        // 70s subiría el watermark a 60s si se aplicara fila a fila, y el
+        // evento de 1s quedaría tarde. En el mismo snapshot entran los dos.
+        let closed = op
+            .apply_epoch(&[row(1, 70_000, 0, 3), row(1, 1_000, 0, 2)], t0)
+            .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].window_start, 0);
+        assert_eq!(sum_of(&closed[0]), 2);
+        // El de 70s sigue abierto. Un event time anterior al watermark nuevo se tira.
+        let closed = op
+            .apply_epoch(&[row(1, 2_000, 0, 9), row(1, 130_000, 0, 1)], t0)
+            .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].window_start, 60_000);
+        assert_eq!(sum_of(&closed[0]), 3);
     }
 
     fn count_of(window: &ClosedWindow) -> i64 {
@@ -1595,7 +1862,12 @@ mod tests {
     #[test]
     fn tumble_one_second_and_one_minute_close_on_watermark() {
         let t0 = Instant::now();
-        let mut second = WindowOperator::new(spec(WindowKind::Tumble, 1_000, None, None), 0, 60_000, KeyKind::I64);
+        let mut second = WindowOperator::new(
+            spec(WindowKind::Tumble, 1_000, None, None),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         let closed = second
             .apply(&[row(1, 1_500, 0, 10), row(1, 2_400, 0, 1)], t0)
             .unwrap();
@@ -1607,12 +1879,14 @@ mod tests {
         assert_eq!(sum_of(&closed[0]), 10);
         assert_eq!(second.open_windows(), 1);
 
-        let mut minute = WindowOperator::new(spec(WindowKind::Tumble, 60_000, None, None), 0, 60_000, KeyKind::I64);
+        let mut minute = WindowOperator::new(
+            spec(WindowKind::Tumble, 60_000, None, None),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         let closed = minute
-            .apply(
-                &[row(7, 30_000, 0, 4), row(7, 90_000, 0, 1)],
-                t0,
-            )
+            .apply(&[row(7, 30_000, 0, 4), row(7, 90_000, 0, 1)], t0)
             .unwrap();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].window_start, 0);
@@ -1623,7 +1897,12 @@ mod tests {
     #[test]
     fn hop_puts_each_event_in_two_windows() {
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Hop, 10_000, Some(5_000), None), 0, 60_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Hop, 10_000, Some(5_000), None),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         // t=12s cae en [5s,15s) y [10s,20s). Un evento a 20s cierra las dos.
         let closed = op
             .apply(&[row(1, 12_000, 0, 3), row(1, 20_000, 0, 1)], t0)
@@ -1636,12 +1915,22 @@ mod tests {
     #[test]
     fn session_merges_inside_the_gap_and_not_on_the_boundary() {
         let t0 = Instant::now();
-        let mut merged = WindowOperator::new(spec(WindowKind::Session, 0, None, Some(5_000)), 0, 60_000, KeyKind::I64);
+        let mut merged = WindowOperator::new(
+            spec(WindowKind::Session, 0, None, Some(5_000)),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         // 0 y 4 se fusionan. t=9 está justo en end+gap y no entra. El watermark
         // de ese evento cierra la sesión fusionada; t=20 cierra la otra.
         let closed = merged
             .apply(
-                &[row(1, 0, 0, 2), row(1, 4_000, 0, 3), row(1, 9_000, 0, 1), row(1, 20_000, 0, 1)],
+                &[
+                    row(1, 0, 0, 2),
+                    row(1, 4_000, 0, 3),
+                    row(1, 9_000, 0, 1),
+                    row(1, 20_000, 0, 1),
+                ],
                 t0,
             )
             .unwrap();
@@ -1653,9 +1942,17 @@ mod tests {
         assert_eq!(closed[1].window_start, 9_000);
         assert_eq!(count_of(&closed[1]), 1);
 
-        let mut apart = WindowOperator::new(spec(WindowKind::Session, 0, None, Some(5_000)), 0, 60_000, KeyKind::I64);
+        let mut apart = WindowOperator::new(
+            spec(WindowKind::Session, 0, None, Some(5_000)),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         let closed = apart
-            .apply(&[row(1, 0, 0, 1), row(1, 5_000, 0, 1), row(1, 30_000, 0, 1)], t0)
+            .apply(
+                &[row(1, 0, 0, 1), row(1, 5_000, 0, 1), row(1, 30_000, 0, 1)],
+                t0,
+            )
             .unwrap();
         assert_eq!(closed.len(), 2);
         assert_eq!(closed[0].window_end, 0);
@@ -1666,7 +1963,12 @@ mod tests {
     fn session_bridges_two_open_intervals() {
         let t0 = Instant::now();
         // lag de 5s: el evento a 10s no dispara la sesión de t=0 (fire a los 6s).
-        let mut op = WindowOperator::new(spec(WindowKind::Session, 0, None, Some(6_000)), 5_000, 60_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Session, 0, None, Some(6_000)),
+            5_000,
+            60_000,
+            KeyKind::I64,
+        );
         op.apply(&[row(1, 0, 0, 1), row(1, 10_000, 0, 1)], t0)
             .unwrap();
         assert_eq!(op.open_windows(), 2);
@@ -1682,7 +1984,12 @@ mod tests {
     #[test]
     fn late_event_does_not_move_the_clock() {
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 1_000, None, None), 0, 60_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 1_000, None, None),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         op.apply(&[row(1, 5_000, 0, 1)], t0).unwrap();
         assert_eq!(op.instance_watermark_ms(), Some(5_000));
         let closed = op.apply(&[row(1, 100, 0, 9)], t0).unwrap();
@@ -1694,7 +2001,12 @@ mod tests {
     #[test]
     fn an_idle_partition_releases_the_minimum() {
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 1_000, None, None), 0, 1_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 1_000, None, None),
+            0,
+            1_000,
+            KeyKind::I64,
+        );
         op.apply(&[row(1, 500, 0, 4)], t0).unwrap();
         assert_eq!(op.open_windows(), 1);
         // La partición 1 llega después: al cumplirse el idle de la 0, el mínimo
@@ -1714,17 +2026,29 @@ mod tests {
         // nada hace más que `idle`. Sigue teniendo log sin leer, así que
         // frena el watermark y su evento de 1500 cae en su ventana.
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 1_000, None, None), 0, 1_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 1_000, None, None),
+            0,
+            1_000,
+            KeyKind::I64,
+        );
         op.set_backlog([0, 1].into_iter().collect());
         op.apply(&[row(1, 1_200, 1, 1)], t0).unwrap();
-        op.apply(&[row(2, 30_000, 0, 1)], t0 + Duration::from_millis(100)).unwrap();
+        op.apply(&[row(2, 30_000, 0, 1)], t0 + Duration::from_millis(100))
+            .unwrap();
         let later = t0 + Duration::from_secs(5);
         assert!(op.on_tick(later).is_empty());
         assert_eq!(op.instance_watermark_ms(), Some(1_200));
-        let closed = op.apply(&[row(1, 1_500, 1, 1), row(1, 2_100, 1, 1)], later).unwrap();
+        let closed = op
+            .apply(&[row(1, 1_500, 1, 1), row(1, 2_100, 1, 1)], later)
+            .unwrap();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].window_end, 2_000);
-        assert_eq!(sum_of(&closed[0]), 2, "el 1500 de la partición lenta no se pierde");
+        assert_eq!(
+            sum_of(&closed[0]),
+            2,
+            "el 1500 de la partición lenta no se pierde"
+        );
     }
 
     #[test]
@@ -1732,15 +2056,29 @@ mod tests {
         // La 1 está asignada pero su consumidor todavía no trajo nada (p. ej.
         // la partición cambió de dueño en un rebalance): nada cierra.
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 1_000, None, None), 0, 1_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 1_000, None, None),
+            0,
+            1_000,
+            KeyKind::I64,
+        );
         op.set_backlog([0, 1].into_iter().collect());
-        let closed = op.apply(&[row(1, 500, 0, 1), row(1, 9_000, 0, 1)], t0).unwrap();
+        let closed = op
+            .apply(&[row(1, 500, 0, 1), row(1, 9_000, 0, 1)], t0)
+            .unwrap();
         assert!(closed.is_empty());
         assert_eq!(op.instance_watermark_ms(), None);
         let closed = op.apply(&[row(2, 700, 1, 1)], t0).unwrap();
-        assert!(closed.is_empty(), "la 1 va por 700: [0, 1000) sigue abierta");
+        assert!(
+            closed.is_empty(),
+            "la 1 va por 700: [0, 1000) sigue abierta"
+        );
         let closed = op.apply(&[row(2, 9_500, 1, 1)], t0).unwrap();
-        assert_eq!(closed.len(), 2, "con las dos en 9000+ cierran las dos claves de [0, 1000)");
+        assert_eq!(
+            closed.len(),
+            2,
+            "con las dos en 9000+ cierran las dos claves de [0, 1000)"
+        );
     }
 
     #[test]
@@ -1748,10 +2086,16 @@ mod tests {
         // Sin backlog vuelve la regla de siempre: la 0 lleva `idle` sin
         // eventos a tiempo y deja de frenar.
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 1_000, None, None), 0, 1_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 1_000, None, None),
+            0,
+            1_000,
+            KeyKind::I64,
+        );
         op.set_backlog([0].into_iter().collect());
         op.apply(&[row(1, 500, 0, 4)], t0).unwrap();
-        op.apply(&[row(1, 10_000, 1, 1)], t0 + Duration::from_millis(500)).unwrap();
+        op.apply(&[row(1, 10_000, 1, 1)], t0 + Duration::from_millis(500))
+            .unwrap();
         let at = t0 + Duration::from_millis(1_200);
         assert!(op.on_tick(at).is_empty(), "con backlog la 0 frena");
         op.set_backlog(Default::default());
@@ -1763,7 +2107,12 @@ mod tests {
     #[test]
     fn all_idle_does_not_emit() {
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 1_000, None, None), 0, 1_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 1_000, None, None),
+            0,
+            1_000,
+            KeyKind::I64,
+        );
         op.apply(&[row(1, 100, 0, 1)], t0).unwrap();
         assert_eq!(op.open_windows(), 1);
         let closed = op.on_tick(t0 + Duration::from_secs(30));
@@ -1777,7 +2126,12 @@ mod tests {
         // pre-chequeo (sin undo) y falla en el acumulador. El operador no
         // sigue con un estado a medias: la falla vuelve en cada llamada.
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 60_000, None, None), 0, 60_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 60_000, None, None),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         op.apply(&[row(1, 1_000, 0, 10)], t0).unwrap();
         let mut mixed = row(1, 1_100, 0, 0);
         mixed.values[1] = Some(Num::F64(1.5));
@@ -1791,11 +2145,14 @@ mod tests {
     #[test]
     fn overflow_reverts_the_batch() {
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 60_000, None, None), 0, 60_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 60_000, None, None),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         op.apply(&[row(1, 1_000, 0, 10)], t0).unwrap();
-        let err = op
-            .apply(&[row(1, 1_100, 0, i64::MAX)], t0)
-            .unwrap_err();
+        let err = op.apply(&[row(1, 1_100, 0, i64::MAX)], t0).unwrap_err();
         assert!(matches!(err, WindowFault::Overflow { .. }), "{err}");
         assert_eq!(op.open_windows(), 1);
         let closed = op.apply(&[row(1, 120_000, 0, 1)], t0).unwrap();
@@ -1805,7 +2162,12 @@ mod tests {
     #[test]
     fn restore_rebuilds_the_end_index() {
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 1_000, None, None), 0, 60_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 1_000, None, None),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         op.apply(&[row(1, 100, 0, 6)], t0).unwrap();
         let state = op.freeze_state();
         let watermark = op.instance_watermark_ms();
@@ -1828,7 +2190,12 @@ mod tests {
     #[test]
     fn releasing_a_partition_drops_its_keys_and_does_not_reopen_them() {
         let t0 = Instant::now();
-        let mut op = WindowOperator::new(spec(WindowKind::Tumble, 60_000, None, None), 0, 60_000, KeyKind::I64);
+        let mut op = WindowOperator::new(
+            spec(WindowKind::Tumble, 60_000, None, None),
+            0,
+            60_000,
+            KeyKind::I64,
+        );
         op.apply(&[row(1, 10_000, 0, 4), row(2, 10_000, 1, 9)], t0)
             .unwrap();
         assert_eq!(op.open_windows(), 2);
@@ -1851,7 +2218,9 @@ mod tests {
         let state = op.freeze_state();
         op.release_partition(0);
         assert_eq!(op.open_windows(), 0);
-        let closed = op.adopt_partition(0, state.keys, Some(10_000), t0).expect("adopt");
+        let closed = op
+            .adopt_partition(0, state.keys, Some(10_000), t0)
+            .expect("adopt");
         assert!(closed.is_empty());
         assert_eq!(op.open_windows(), 1);
         let closed = op.apply(&[row(1, 20_000, 0, 3)], t0).unwrap();
@@ -1862,7 +2231,11 @@ mod tests {
     }
 }
 
-fn merge_acc(dst: &mut Accumulators, src: &Accumulators, row: &WindowInput) -> Result<(), WindowFault> {
+fn merge_acc(
+    dst: &mut Accumulators,
+    src: &Accumulators,
+    row: &WindowInput,
+) -> Result<(), WindowFault> {
     if dst.present.len() != dst.slots.len() {
         dst.present = vec![true; dst.slots.len()];
     }
@@ -1898,13 +2271,7 @@ fn merge_acc(dst: &mut Accumulators, src: &Accumulators, row: &WindowInput) -> R
             (AggState::MinF64(a), AggState::MinF64(b)) => *a = a.min(*b),
             (AggState::MaxI64(a), AggState::MaxI64(b)) => *a = (*a).max(*b),
             (AggState::MaxF64(a), AggState::MaxF64(b)) => *a = a.max(*b),
-            (
-                AggState::Avg { sum, count },
-                AggState::Avg {
-                    sum: sb,
-                    count: cb,
-                },
-            ) => {
+            (AggState::Avg { sum, count }, AggState::Avg { sum: sb, count: cb }) => {
                 *sum += *sb;
                 *count += *cb;
             }

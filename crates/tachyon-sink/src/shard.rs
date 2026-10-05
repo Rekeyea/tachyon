@@ -149,7 +149,10 @@ fn hash_single_long(value: i64) -> i32 {
     const C2: u32 = 0x1b873593;
     fn mix(h1: u32, word: u32) -> u32 {
         let k1 = word.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
-        (h1 ^ k1).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64)
+        (h1 ^ k1)
+            .rotate_left(13)
+            .wrapping_mul(5)
+            .wrapping_add(0xe654_6b64)
     }
     let bits = value as u64;
     let mut h1 = 42u32;
@@ -292,10 +295,24 @@ mod tests {
 
     #[test]
     fn single_long_hash_matches_binary_row() {
-        let field = DataField::new(0, "k".to_string(), PaimonType::BigInt(paimon::spec::BigIntType::new()));
+        let field = DataField::new(
+            0,
+            "k".to_string(),
+            PaimonType::BigInt(paimon::spec::BigIntType::new()),
+        );
         let fields = vec![field];
         let values: Vec<i64> = vec![
-            0, 1, -1, 7, 42, 1_000_003, -987_654_321, i64::MAX, i64::MIN, 1 << 40, 123_456_789_012,
+            0,
+            1,
+            -1,
+            7,
+            42,
+            1_000_003,
+            -987_654_321,
+            i64::MAX,
+            i64::MIN,
+            1 << 40,
+            123_456_789_012,
         ];
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
@@ -304,7 +321,11 @@ mod tests {
         .unwrap();
         for (row, value) in values.iter().enumerate() {
             let reference = BinaryRow::from_arrow(&batch, row, &[0], &fields).unwrap();
-            assert_eq!(hash_single_long(*value), reference.hash_code(), "valor {value}");
+            assert_eq!(
+                hash_single_long(*value),
+                reference.hash_code(),
+                "valor {value}"
+            );
         }
         for value in (-50_000i64..50_000).step_by(7) {
             let batch = RecordBatch::try_new(
@@ -313,7 +334,11 @@ mod tests {
             )
             .unwrap();
             let reference = BinaryRow::from_arrow(&batch, 0, &[0], &fields).unwrap();
-            assert_eq!(hash_single_long(value), reference.hash_code(), "valor {value}");
+            assert_eq!(
+                hash_single_long(value),
+                reference.hash_code(),
+                "valor {value}"
+            );
         }
     }
 

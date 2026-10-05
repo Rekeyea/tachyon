@@ -35,11 +35,9 @@ use datafusion::physical_plan::streaming::PartitionStream;
 use futures::StreamExt;
 use rdkafka::consumer::Consumer;
 use rdkafka::ClientConfig;
-use tachyon_config::{
-    parse_fixed_duration, InputKind, PayloadFormat, PipelineConfig, StartFrom,
-};
+use tachyon_config::{parse_fixed_duration, InputKind, PayloadFormat, PipelineConfig, StartFrom};
 use tachyon_core::{
-    CheckpointBody, InputPosition, InputPositions, SourceOffsets, kafka_offsets, merge_positions,
+    kafka_offsets, merge_positions, CheckpointBody, InputPosition, InputPositions, SourceOffsets,
 };
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
 use tachyon_sink::kinesis::KinesisSink;
@@ -47,15 +45,17 @@ use tachyon_sink::redpanda::RedpandaSink;
 use tachyon_sink::sqs::SqsSink;
 use tachyon_sink::writer::{CheckpointEpoch, PaimonSink, PartitionTickets, Recovered};
 use tachyon_source::consumer::{CopiedCursor, LotRanges, RdkafkaSource};
+use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
 use tachyon_source::kinesis::{KinesisSource, LotPositions, StartPosition};
 use tachyon_source::sqs::SqsSource;
-use tachyon_source::stream::{OffsetTracker, PositionTracker, ReceiptsOut, RedpandaPartitionStream};
-use tachyon_source::{StateRequest, WindowHandoff};
-use tachyon_source::decode::{parse_avro_schema, DecodeFormat, Decoder};
+use tachyon_source::stream::{
+    OffsetTracker, PositionTracker, ReceiptsOut, RedpandaPartitionStream,
+};
 use tachyon_source::{
     arrow_from_avro, avro_json_from_arrow, encode_envelopes, latest_topic_schema,
     register_topic_schema, SchemaCache,
 };
+use tachyon_source::{StateRequest, WindowHandoff};
 use tachyon_sql::{LookupJoin, UnionBranch, WindowShape};
 
 use crate::budget::StatelessBudget;
@@ -77,7 +77,10 @@ pub(crate) enum Progress {
     /// Los tramos exactos que cubre el batch de un carril.
     Ranges(Vec<tachyon_core::OffsetRange>),
     /// Progreso de un input en una pipeline mixta (topic/kinesis/sqs).
-    Input { name: String, progress: InputProgress },
+    Input {
+        name: String,
+        progress: InputProgress,
+    },
 }
 
 /// Progreso que publica un input por batch.
@@ -93,9 +96,15 @@ pub(crate) enum InputProgress {
 /// Dónde publica cada input su progreso (nombre lógico -> mecanismo).
 #[derive(Clone)]
 pub(crate) enum InputProgressSource {
-    Offsets { topic: String, tracker: OffsetTracker },
+    Offsets {
+        topic: String,
+        tracker: OffsetTracker,
+    },
     Positions(PositionTracker),
-    Receipts { queue: String, out: ReceiptsOut },
+    Receipts {
+        queue: String,
+        out: ReceiptsOut,
+    },
 }
 
 /// Salida de un carril hacia el writer: rangos de topic o receipts SQS.
@@ -146,12 +155,16 @@ impl Drop for AbortOnDrop {
     }
 }
 
-fn same_window(stored: &tachyon_core::WindowSpecId, current: &tachyon_core::WindowSpecId) -> bool {
+pub(crate) fn same_window(
+    stored: &tachyon_core::WindowSpecId,
+    current: &tachyon_core::WindowSpecId,
+) -> bool {
     stored.kind == current.kind
         && stored.size_ms == current.size_ms
         && stored.slide_ms == current.slide_ms
         && stored.gap_ms == current.gap_ms
         && stored.group_columns == current.group_columns
+        && stored.aggs == current.aggs
 }
 
 fn release_lost_partitions(
@@ -229,10 +242,7 @@ fn input_table_schema(
         }
         return Ok(schema_with_partition(prepared_schema));
     }
-    if let Some(prepared) = lookup
-        .as_ref()
-        .filter(|item| item.fact == input_name)
-    {
+    if let Some(prepared) = lookup.as_ref().filter(|item| item.fact == input_name) {
         return Ok(prepared.enriched_schema.clone());
     }
     Ok(prepared_schema)
@@ -455,11 +465,7 @@ impl PreparedInput {
         let arrow = arrow_from_avro(&avro)?;
         Ok(Self {
             schema: arrow,
-            format: DecodeFormat::Registry(Arc::new(SchemaCache::new(
-                url.to_string(),
-                id,
-                avro,
-            ))),
+            format: DecodeFormat::Registry(Arc::new(SchemaCache::new(url.to_string(), id, avro))),
         })
     }
 }
@@ -547,7 +553,10 @@ pub(crate) async fn run_pipeline_with_lookup(
     let mut sink = sink
         .with_commit_user(&options.commit_user)
         .context("fijando el commit_user del sink")?;
-    let recovered = sink.recover().await.context("recuperando el último checkpoint")?;
+    let recovered = sink
+        .recover()
+        .await
+        .context("recuperando el último checkpoint")?;
     let (resume, resume_positions, restored_window) = match (&recovered, window) {
         (Recovered::None, _) => (None, None, None),
         (Recovered::PassThrough { offsets, .. }, None) => (Some(offsets.clone()), None, None),
@@ -574,23 +583,20 @@ pub(crate) async fn run_pipeline_with_lookup(
             );
         }
         (Recovered::Join { identifier, .. }, _) => {
-            anyhow::bail!(
-                "checkpoint {identifier} es de un join y el plan no lo es; se rechaza"
-            );
+            anyhow::bail!("checkpoint {identifier} es de un join y el plan no lo es; se rechaza");
         }
         (Recovered::Window { checkpoint, .. }, Some(shape)) => {
-            if checkpoint.spec.kind != shape.kind
-                || checkpoint.spec.size_ms != shape.size_ms
-                || checkpoint.spec.slide_ms != shape.slide_ms
-                || checkpoint.spec.gap_ms != shape.gap_ms
-                || checkpoint.spec.group_columns != shape.group_columns
-            {
+            if !same_window(&checkpoint.spec, &spec_from_shape(shape)) {
                 anyhow::bail!(
                     "el checkpoint de '{}' no coincide con la ventana de esta query",
                     options.commit_user
                 );
             }
-            (Some(checkpoint.applied.clone()), None, Some(checkpoint.clone()))
+            (
+                Some(checkpoint.applied.clone()),
+                None,
+                Some(checkpoint.clone()),
+            )
         }
     };
     let resume = resume;
@@ -614,7 +620,11 @@ pub(crate) async fn run_pipeline_with_lookup(
         std::collections::HashMap::new();
     let mut window_handoff: Option<Arc<WindowHandoff>> = None;
     let (adopt_tx, adopt_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut adopt_rx = if window.is_some() { Some(adopt_rx) } else { None };
+    let mut adopt_rx = if window.is_some() {
+        Some(adopt_rx)
+    } else {
+        None
+    };
     // El client de Redpanda solo se necesita si hay algún input de topic;
     // una pipeline de kinesis/sqs no declara connectors.redpanda.
     let cc = if config
@@ -636,9 +646,10 @@ pub(crate) async fn run_pipeline_with_lookup(
     let session_timeout_ms = window_session_timeout_ms(options.commit_interval);
     let prepared_lookup = match lookup {
         Some(join) if window.is_none() => {
-            let codec = input_codecs.get(&join.fact).cloned().with_context(|| {
-                format!("sin schema para el input '{}'", join.fact)
-            })?;
+            let codec = input_codecs
+                .get(&join.fact)
+                .cloned()
+                .with_context(|| format!("sin schema para el input '{}'", join.fact))?;
             Some(prepare_lookup(config, join, select_sql, codec.schema).await?)
         }
         _ => None,
@@ -846,7 +857,7 @@ pub(crate) async fn run_pipeline_with_lookup(
                     .kinesis
                     .as_ref()
                     .context("kinesis requiere connectors.kinesis.region")?;
-                let client = crate::aws::kinesis_client(kinesis_cfg).await?;
+                let session = crate::aws::kinesis_client(kinesis_cfg).await?;
                 let stream_name = input_def
                     .kinesis_stream()
                     .expect("la validación garantiza un stream")
@@ -855,9 +866,11 @@ pub(crate) async fn run_pipeline_with_lookup(
                     Some(StartFrom::TrimHorizon) => StartPosition::TrimHorizon,
                     _ => StartPosition::Latest,
                 };
-                let mut source =
-                    KinesisSource::new(client, &stream_name, start_from)
-                        .with_max_batch(budget.batch_size);
+                let mut source = KinesisSource::new(session.client, &stream_name, start_from)
+                    .with_max_batch(budget.batch_size);
+                if let Some(reader) = session.reader {
+                    source = source.with_reader(reader);
+                }
                 if let Some(resume_seq) = resume_positions
                     .as_ref()
                     .and_then(|positions| positions.get(&input_def.name))
@@ -897,7 +910,9 @@ pub(crate) async fn run_pipeline_with_lookup(
                 let client = crate::aws::sqs_client(sqs_cfg).await?;
                 let queue = crate::aws::queue_url(
                     &client,
-                    input_def.sqs_queue().expect("la validación garantiza una cola"),
+                    input_def
+                        .sqs_queue()
+                        .expect("la validación garantiza una cola"),
                 )
                 .await?;
                 let wait = input_def
@@ -985,39 +1000,43 @@ pub(crate) async fn run_pipeline_with_lookup(
                     // siguiente.
                     let per_lane = (decode_parallelism / sources.len().max(1)).max(2);
                     let lane_trackers = factory_trackers.clone();
-                    let partitions: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>> =
-                        sources
-                            .iter()
-                            .zip(lane_lots.iter())
-                            .zip(factory_outs.iter())
-                            .enumerate()
-                            .map(|(index, ((source, lots), out))| {
-                                let source = source.clone();
-                                let make_stream: Arc<dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync> =
-                                    Arc::new(move || source.record_stream());
-                                let lane = RedpandaPartitionStream::new(
-                                    index as i32,
-                                    inner_schema.clone(),
-                                    decoder.clone(),
-                                    batch_size,
-                                    make_stream,
-                                )
-                                .with_decode_parallelism(per_lane)
-                                .with_row_partitions(row_partitions);
-                                let lane = match lane_trackers.get(index) {
-                                    Some(tracker) => lane.with_offset_tracker(tracker.clone()),
-                                    None => {
-                                        let LaneOutput::Ranges(out) = out else {
-                                            unreachable!("un carril de topic publica rangos")
-                                        };
-                                        lane.with_lane(lots.clone(), out.clone())
-                                    }
-                                };
-                                Arc::new(lane) as Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
-                            })
-                            .collect();
-                    let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
-                        .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+                    let partitions: Vec<
+                        Arc<dyn datafusion::physical_plan::streaming::PartitionStream>,
+                    > = sources
+                        .iter()
+                        .zip(lane_lots.iter())
+                        .zip(factory_outs.iter())
+                        .enumerate()
+                        .map(|(index, ((source, lots), out))| {
+                            let source = source.clone();
+                            let make_stream: Arc<
+                                dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync,
+                            > = Arc::new(move || source.record_stream());
+                            let lane = RedpandaPartitionStream::new(
+                                index as i32,
+                                inner_schema.clone(),
+                                decoder.clone(),
+                                batch_size,
+                                make_stream,
+                            )
+                            .with_decode_parallelism(per_lane)
+                            .with_row_partitions(row_partitions);
+                            let lane = match lane_trackers.get(index) {
+                                Some(tracker) => lane.with_offset_tracker(tracker.clone()),
+                                None => {
+                                    let LaneOutput::Ranges(out) = out else {
+                                        unreachable!("un carril de topic publica rangos")
+                                    };
+                                    lane.with_lane(lots.clone(), out.clone())
+                                }
+                            };
+                            Arc::new(lane)
+                                as Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
+                        })
+                        .collect();
+                    let table =
+                        datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
+                            .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
                     return Ok(Arc::new(table.with_infinite_table(true)));
                 }
                 for source in &sources {
@@ -1029,10 +1048,8 @@ pub(crate) async fn run_pipeline_with_lookup(
                 // La factory se invoca una vez por ejecución, así que cada
                 // consumidor se `take()`a una vez.
                 let make_stream = Arc::new(move || {
-                    let streams: Vec<tachyon_source::consumer::RecordStream> = sources
-                        .iter()
-                        .map(|s| s.record_stream())
-                        .collect();
+                    let streams: Vec<tachyon_source::consumer::RecordStream> =
+                        sources.iter().map(|s| s.record_stream()).collect();
                     // Coerción explícita a `RecordStream` (el `SelectAll`
                     // concreto no se coercea solo a `Pin<Box<dyn Stream>>` en
                     // posición de retorno).
@@ -1040,22 +1057,15 @@ pub(crate) async fn run_pipeline_with_lookup(
                         Box::pin(futures::stream::select_all(streams));
                     merged
                 });
-                let inner = RedpandaPartitionStream::new(
-                    0,
-                    inner_schema,
-                    decoder,
-                    batch_size,
-                    make_stream,
-                )
-                .with_offset_tracker(tracker)
-                .with_decode_parallelism(decode_parallelism)
-                .with_row_partitions(row_partitions);
+                let inner =
+                    RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
+                        .with_offset_tracker(tracker)
+                        .with_decode_parallelism(decode_parallelism)
+                        .with_row_partitions(row_partitions);
                 let ps = as_partition(inner, &prepared_lookup, name);
-                let table = datafusion::catalog::streaming::StreamingTable::try_new(
-                    schema,
-                    vec![ps],
-                )
-                .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+                let table =
+                    datafusion::catalog::streaming::StreamingTable::try_new(schema, vec![ps])
+                        .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
                 Ok(Arc::new(table.with_infinite_table(true)))
             }
             InputSources::Kinesis {
@@ -1069,18 +1079,14 @@ pub(crate) async fn run_pipeline_with_lookup(
                 // `LotPositions` (ver `tachyon-source::kinesis`).
                 let positions = LotPositions::new();
                 let owned = (*source).clone().with_lot_positions(positions.clone());
-                let make_stream: Arc<dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync> =
-                    Arc::new(move || owned.record_stream());
-                let inner = RedpandaPartitionStream::new(
-                    0,
-                    inner_schema,
-                    decoder,
-                    batch_size,
-                    make_stream,
-                )
-                .with_position_tracker(tracker, positions)
-                .with_decode_parallelism(decode_parallelism)
-                .with_row_partitions(row_partitions);
+                let make_stream: Arc<
+                    dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync,
+                > = Arc::new(move || owned.record_stream());
+                let inner =
+                    RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
+                        .with_position_tracker(tracker, positions)
+                        .with_decode_parallelism(decode_parallelism)
+                        .with_row_partitions(row_partitions);
                 let table = datafusion::catalog::streaming::StreamingTable::try_new(
                     schema,
                     vec![Arc::new(inner)],
@@ -1099,60 +1105,55 @@ pub(crate) async fn run_pipeline_with_lookup(
                     // Un consumidor por carril; cada carril publica sus
                     // receipts en su propio `ReceiptsOut`.
                     let per_lane = (decode_parallelism / sources.len().max(1)).max(2);
-                    let partitions: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>> =
-                        sources
-                            .iter()
-                            .enumerate()
-                            .map(|(index, source)| {
-                                let source = source.clone();
-                                let make_stream: Arc<dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync> =
-                                    Arc::new(move || source.record_stream());
-                                let lane = RedpandaPartitionStream::new(
-                                    index as i32,
-                                    inner_schema.clone(),
-                                    decoder.clone(),
-                                    batch_size,
-                                    make_stream,
-                                )
-                                .with_decode_parallelism(per_lane)
-                                .with_row_partitions(row_partitions);
-                                let lane = match &factory_outs[index] {
-                                    LaneOutput::Receipts { out, .. } => {
-                                        lane.with_receipts(out.clone())
-                                    }
-                                    LaneOutput::Ranges(_) => {
-                                        unreachable!("un carril SQS publica receipts")
-                                    }
-                                };
-                                Arc::new(lane) as Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
-                            })
-                            .collect();
-                    let table = datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
-                        .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
+                    let partitions: Vec<
+                        Arc<dyn datafusion::physical_plan::streaming::PartitionStream>,
+                    > = sources
+                        .iter()
+                        .enumerate()
+                        .map(|(index, source)| {
+                            let source = source.clone();
+                            let make_stream: Arc<
+                                dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync,
+                            > = Arc::new(move || source.record_stream());
+                            let lane = RedpandaPartitionStream::new(
+                                index as i32,
+                                inner_schema.clone(),
+                                decoder.clone(),
+                                batch_size,
+                                make_stream,
+                            )
+                            .with_decode_parallelism(per_lane)
+                            .with_row_partitions(row_partitions);
+                            let lane = match &factory_outs[index] {
+                                LaneOutput::Receipts { out, .. } => lane.with_receipts(out.clone()),
+                                LaneOutput::Ranges(_) => {
+                                    unreachable!("un carril SQS publica receipts")
+                                }
+                            };
+                            Arc::new(lane)
+                                as Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
+                        })
+                        .collect();
+                    let table =
+                        datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
+                            .map_err(|e| anyhow::anyhow!("creando StreamingTable: {e}"))?;
                     return Ok(Arc::new(table.with_infinite_table(true)));
                 }
                 // N consumidores compitiendo, fusionados con `select_all`: los
                 // receipts viajan con los registros (`position`) y el decode
                 // los extrae por batch.
                 let make_stream = Arc::new(move || {
-                    let streams: Vec<tachyon_source::consumer::RecordStream> = sources
-                        .iter()
-                        .map(|s| s.record_stream())
-                        .collect();
+                    let streams: Vec<tachyon_source::consumer::RecordStream> =
+                        sources.iter().map(|s| s.record_stream()).collect();
                     let merged: tachyon_source::consumer::RecordStream =
                         Box::pin(futures::stream::select_all(streams));
                     merged
                 });
-                let inner = RedpandaPartitionStream::new(
-                    0,
-                    inner_schema,
-                    decoder,
-                    batch_size,
-                    make_stream,
-                )
-                .with_receipts(receipts)
-                .with_decode_parallelism(decode_parallelism)
-                .with_row_partitions(row_partitions);
+                let inner =
+                    RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
+                        .with_receipts(receipts)
+                        .with_decode_parallelism(decode_parallelism)
+                        .with_row_partitions(row_partitions);
                 let table = datafusion::catalog::streaming::StreamingTable::try_new(
                     schema,
                     vec![Arc::new(inner)],
@@ -1230,7 +1231,8 @@ pub(crate) async fn run_pipeline_with_lookup(
             .with_context(|| format!("sin schema para '{}'", shape.source))?
             .schema
             .clone();
-        let (lag_ms, idle_ms) = validate_window(config, shape, user_schema.as_ref(), &sink.field_names())?;
+        let (lag_ms, idle_ms) =
+            validate_window(config, shape, user_schema.as_ref(), &sink.field_names())?;
         let ticket_table = sink.tickets();
         return drive_window(
             shape,
@@ -1498,8 +1500,9 @@ pub(crate) async fn run_pipeline_with_lookup(
                     // este batch ya salió en él o en uno anterior.
                     let progress = match &out {
                         LaneOutput::Ranges(out) => {
-                            let ranges =
-                                std::mem::take(&mut *out.lock().expect("lock de rangos del carril"));
+                            let ranges = std::mem::take(
+                                &mut *out.lock().expect("lock de rangos del carril"),
+                            );
                             Progress::Ranges(ranges)
                         }
                         LaneOutput::Receipts { queue, out } => {
@@ -1558,12 +1561,10 @@ pub(crate) async fn run_pipeline_with_lookup(
                                 .collect();
                             Progress::Snapshot(batch_offsets)
                         }
-                        Some((name, InputProgressSource::Positions(tracker))) => {
-                            Progress::Input {
-                                name: name.clone(),
-                                progress: InputProgress::Positions(tracker.snapshot()),
-                            }
-                        }
+                        Some((name, InputProgressSource::Positions(tracker))) => Progress::Input {
+                            name: name.clone(),
+                            progress: InputProgress::Positions(tracker.snapshot()),
+                        },
                         Some((name, InputProgressSource::Receipts { queue, out })) => {
                             let handles = out
                                 .lock()
@@ -1659,16 +1660,7 @@ pub(crate) async fn run_topic_pipeline_with_lookup(
         if lookup.is_some() {
             anyhow::bail!("UNION ALL no se mezcla con una ventana, un join o un lookup");
         }
-        return run_union_topic(
-            config,
-            branches,
-            options,
-            topic,
-            key,
-            input_codecs,
-            metrics,
-        )
-        .await;
+        return run_union_topic(config, branches, options, topic, key, input_codecs, metrics).await;
     }
     if config.inputs.len() != 1 {
         anyhow::bail!(
@@ -1759,10 +1751,9 @@ pub(crate) async fn run_topic_pipeline_with_lookup(
         let decoder = Decoder::new(decode_schema, decoder_format.clone());
         let sources = input_sources.clone();
         let make_stream = Arc::new(move || {
-            let merged: tachyon_source::consumer::RecordStream =
-                Box::pin(futures::stream::select_all(
-                    sources.iter().map(|s| s.record_stream()),
-                ));
+            let merged: tachyon_source::consumer::RecordStream = Box::pin(
+                futures::stream::select_all(sources.iter().map(|s| s.record_stream())),
+            );
             merged
         });
         let inner = RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
@@ -1822,8 +1813,10 @@ pub(crate) async fn run_topic_pipeline_with_lookup(
     // El snapshot se toma cuando `next()` vuelve, antes de tirar del siguiente
     // lote: en un pass-through ese mapa es exactamente lo que esta salida cubre.
     let snap_tracker = tracker;
-    let (batch_tx, mut batch_rx) =
-        tokio::sync::mpsc::channel::<(Result<arrow::array::RecordBatch, datafusion::error::DataFusionError>, BTreeMap<i32, i64>)>(1);
+    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<(
+        Result<arrow::array::RecordBatch, datafusion::error::DataFusionError>,
+        BTreeMap<i32, i64>,
+    )>(1);
     let stream_task = tokio::spawn(async move {
         while let Some(item) = stream.next().await {
             let snap = snap_tracker.snapshot();
@@ -1902,14 +1895,14 @@ async fn commit_topic_epoch(
     input_topic: &str,
     offsets: &SourceOffsets,
 ) -> Result<()> {
-    let parts = offsets
-        .get(input_topic)
-        .cloned()
-        .unwrap_or_default();
+    let parts = offsets.get(input_topic).cloned().unwrap_or_default();
     if parts.is_empty() {
         anyhow::bail!("el epoch publicó filas y no tiene offsets de entrada");
     }
-    let metadata = source.group_metadata().await.context("metadata del grupo")?;
+    let metadata = source
+        .group_metadata()
+        .await
+        .context("metadata del grupo")?;
     sink.send_input_offsets(metadata.as_ptr(), input_topic, &parts)
         .context("adjuntando offsets a la transacción")?;
     sink.commit().await?;
@@ -1962,7 +1955,10 @@ fn assemble_union_sources(
             .find(|(name, _)| name == &branch.source)
             .map(|(_, progress)| progress.clone())
             .with_context(|| {
-                format!("UNION ALL lee un input y '{}' no es un input", branch.source)
+                format!(
+                    "UNION ALL lee un input y '{}' no es un input",
+                    branch.source
+                )
             })?;
         let schema = inputs
             .iter()
@@ -2040,7 +2036,9 @@ enum AwsProgress {
 
 /// Qué persistir en cada intervalo de commit.
 enum AwsCommit {
-    Topic { source: Arc<RdkafkaSource> },
+    Topic {
+        source: Arc<RdkafkaSource>,
+    },
     Sqs {
         client: aws_sdk_sqs::Client,
         queue: String,
@@ -2143,7 +2141,7 @@ pub(crate) async fn run_aws_pipeline(
                 .kinesis
                 .as_ref()
                 .context("kinesis requiere connectors.kinesis.region")?;
-            let client = crate::aws::kinesis_client(kinesis_cfg).await?;
+            let session = crate::aws::kinesis_client(kinesis_cfg).await?;
             let stream_name = input_def
                 .kinesis_stream()
                 .expect("la validación garantiza un stream")
@@ -2152,8 +2150,11 @@ pub(crate) async fn run_aws_pipeline(
                 Some(StartFrom::TrimHorizon) => StartPosition::TrimHorizon,
                 _ => StartPosition::Latest,
             };
-            let source = KinesisSource::new(client, &stream_name, start_from)
+            let mut source = KinesisSource::new(session.client, &stream_name, start_from)
                 .with_max_batch(budget.batch_size);
+            if let Some(reader) = session.reader {
+                source = source.with_reader(reader);
+            }
             AwsStreamState::Kinesis {
                 source: Arc::new(source),
             }
@@ -2167,7 +2168,9 @@ pub(crate) async fn run_aws_pipeline(
             let client = crate::aws::sqs_client(sqs_cfg).await?;
             let queue = crate::aws::queue_url(
                 &client,
-                input_def.sqs_queue().expect("la validación garantiza una cola"),
+                input_def
+                    .sqs_queue()
+                    .expect("la validación garantiza una cola"),
             )
             .await?;
             let wait = input_def
@@ -2181,8 +2184,8 @@ pub(crate) async fn run_aws_pipeline(
             // que vuelve a ser visible antes del commit se consume dos veces y
             // el consumidor dedup.
             let visibility = options.commit_interval + Duration::from_secs(60);
-            let source = SqsSource::new(client.clone(), &queue, wait)
-                .with_visibility_timeout(visibility);
+            let source =
+                SqsSource::new(client.clone(), &queue, wait).with_visibility_timeout(visibility);
             AwsStreamState::Sqs {
                 source: Arc::new(source),
                 client,
@@ -2276,7 +2279,9 @@ pub(crate) async fn run_aws_pipeline(
                 RedpandaPartitionStream::new(0, inner_schema, decoder, batch_size, make_stream)
                     .with_decode_parallelism(decode_parallelism)
             }
-            AwsStreamState::Sqs { source, receipts, .. } => {
+            AwsStreamState::Sqs {
+                source, receipts, ..
+            } => {
                 let source = source.clone();
                 let make_stream: Arc<
                     dyn Fn() -> tachyon_source::consumer::RecordStream + Send + Sync,
@@ -2556,14 +2561,13 @@ async fn run_union_topic(
                 ));
             merged
         });
-        let inner = RedpandaPartitionStream::new(0, schema.clone(), decoder, batch_size, make_stream)
-            .with_offset_tracker(tracker)
-            .with_decode_parallelism(decode_parallelism);
-        let table = datafusion::catalog::streaming::StreamingTable::try_new(
-            schema,
-            vec![Arc::new(inner)],
-        )
-        .map_err(|err| anyhow::anyhow!("creando StreamingTable: {err}"))?;
+        let inner =
+            RedpandaPartitionStream::new(0, schema.clone(), decoder, batch_size, make_stream)
+                .with_offset_tracker(tracker)
+                .with_decode_parallelism(decode_parallelism);
+        let table =
+            datafusion::catalog::streaming::StreamingTable::try_new(schema, vec![Arc::new(inner)])
+                .map_err(|err| anyhow::anyhow!("creando StreamingTable: {err}"))?;
         Ok(Arc::new(table.with_infinite_table(true)))
     });
 
@@ -2666,7 +2670,11 @@ async fn run_union_topic(
     })
 }
 
-pub(crate) async fn ensure_topic_partitions(brokers: &str, topic: &str, expected: usize) -> Result<()> {
+pub(crate) async fn ensure_topic_partitions(
+    brokers: &str,
+    topic: &str,
+    expected: usize,
+) -> Result<()> {
     let probe: rdkafka::consumer::BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()
@@ -2691,7 +2699,7 @@ pub(crate) async fn ensure_topic_partitions(brokers: &str, topic: &str, expected
     Ok(())
 }
 
-fn validate_window(
+pub(crate) fn validate_window(
     config: &PipelineConfig,
     shape: &WindowShape,
     schema: &arrow::datatypes::Schema,
@@ -2720,10 +2728,12 @@ fn validate_window(
             shape.event_time
         );
     }
-    let lag_ms = parse_fixed_duration(&watermark.lag)
-        .map_err(|e| anyhow::anyhow!("watermark.lag: {e}"))?;
+    let lag_ms =
+        parse_fixed_duration(&watermark.lag).map_err(|e| anyhow::anyhow!("watermark.lag: {e}"))?;
     let idle_ms = match &watermark.idle {
-        Some(idle) => parse_fixed_duration(idle).map_err(|e| anyhow::anyhow!("watermark.idle: {e}"))?,
+        Some(idle) => {
+            parse_fixed_duration(idle).map_err(|e| anyhow::anyhow!("watermark.idle: {e}"))?
+        }
         None => lag_ms,
     };
     let time = schema
@@ -2752,9 +2762,7 @@ fn validate_window(
     }
     let expected = output_field_names(shape);
     if table_fields != expected.as_slice() {
-        anyhow::bail!(
-            "la tabla tiene campos {table_fields:?} y la ventana escribe {expected:?}"
-        );
+        anyhow::bail!("la tabla tiene campos {table_fields:?} y la ventana escribe {expected:?}");
     }
     Ok((lag_ms, idle_ms))
 }
@@ -2865,7 +2873,10 @@ async fn drive_window(
             match msg {
                 WindowMsg::Rows(batch) => {
                     let t_write = Instant::now();
-                    sink_writer.write(&batch).await.context("escribiendo ventana")?;
+                    sink_writer
+                        .write(&batch)
+                        .await
+                        .context("escribiendo ventana")?;
                     writer_metrics.add_write_ns(t_write.elapsed().as_nanos() as u64);
                     writer_metrics.inc_rows_written(batch.num_rows() as u64);
                     dirty = true;
@@ -2963,8 +2974,7 @@ async fn drive_window(
                     .as_ref()
                     .map(|gate| gate.topic().to_string())
                     .unwrap_or_default();
-                let reply = match ticket_table.read(&topic, req.partition).await
-                {
+                let reply = match ticket_table.read(&topic, req.partition).await {
                     Ok(Some(ticket)) => {
                         if !same_window(operator.spec(), &ticket.spec) {
                             Err(format!(
@@ -3059,7 +3069,9 @@ async fn drive_window(
                 let closed = operator.on_tick(Instant::now());
                 if !closed.is_empty() {
                     let out = batch_from_closed(&closed, shape, user_schema.as_ref())?;
-                    tx.send(WindowMsg::Rows(out)).await.context("enviando filas de ventana")?;
+                    tx.send(WindowMsg::Rows(out))
+                        .await
+                        .context("enviando filas de ventana")?;
                 }
             }
         }
@@ -3103,6 +3115,8 @@ async fn drive_window(
                 instance_watermark_ms: operator.instance_watermark_ms(),
                 spec: spec_from_shape(shape),
                 state: operator.freeze_state(),
+                source_snapshot: None,
+                source_snapshots: BTreeMap::new(),
             }))
             .await
             .context("enviando la barrera de ventana")?;

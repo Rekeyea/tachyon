@@ -29,7 +29,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
-use paimon::spec::{DataType as PDataType, BigIntType, DoubleType, VarCharType};
+use paimon::spec::{BigIntType, DataType as PDataType, DoubleType, VarCharType};
 use tachyon_runtime::{execute_query, InputSource, StreamTableFactory};
 use tachyon_sink::writer::{create_test_table, PaimonSink};
 use tachyon_source::decode::{DecodeFormat, Decoder};
@@ -63,7 +63,11 @@ fn rss_mb() -> f64 {
 /// Imprime un resumen de benchmark: rows/s, CPU, rows/CPU-s, RSS.
 fn report(name: &str, rows: usize, wall: f64, cpu: f64, rss: f64) {
     let rows_s = rows as f64 / wall;
-    let rows_cpu_s = if cpu > 0.0 { rows as f64 / cpu } else { f64::NAN };
+    let rows_cpu_s = if cpu > 0.0 {
+        rows as f64 / cpu
+    } else {
+        f64::NAN
+    };
     let cpu_pct = if wall > 0.0 { cpu / wall * 100.0 } else { 0.0 };
     println!(
         "\n=== {name} ===\n  filas:        {rows}\n  wall:         {wall:.3}s\n  CPU:          {cpu:.3}s ({cpu_pct:.0}% del wall)\n  throughput:   {rows_s:.0} rows/s\n  por CPU-s:    {rows_cpu_s:.0} rows/CPU-s\n  RSS:          {rss:.0} MB"
@@ -152,7 +156,9 @@ async fn bench_json_decode() {
     // El chunk replica el lote de producción (un drenado del broker = un batch).
     let chunk = 32768;
     // Warmup sobre una copia: el fast path SIMD muta los buffers in-place.
-    let _ = decoder.decode(&mut payloads[..chunk].to_vec()).expect("warmup decode");
+    let _ = decoder
+        .decode(&mut payloads[..chunk].to_vec())
+        .expect("warmup decode");
     // Timed.
     let t0 = Instant::now();
     let cpu0 = cpu_seconds();
@@ -192,7 +198,9 @@ async fn bench_datafusion_transform() {
               FROM orders WHERE status <> 'cancelled'";
     // Warmup: planificar + correr un tramo (el plan se re-crea por llamada).
     {
-        let s = execute_query(sql, &inputs, &factory).await.expect("warmup plan");
+        let s = execute_query(sql, &inputs, &factory)
+            .await
+            .expect("warmup plan");
         let mut s = s;
         let mut n = 0;
         while n < chunk && s.next().await.is_some() {
@@ -209,17 +217,21 @@ async fn bench_datafusion_transform() {
     }
     let wall = t0.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu0;
-    report("2. DataFusion transform (filter+project)", rows, wall, cpu, rss_mb());
+    report(
+        "2. DataFusion transform (filter+project)",
+        rows,
+        wall,
+        cpu,
+        rss_mb(),
+    );
 }
 
 /// Etapa 3: escritura + commit a Paimon (LSM local).
 #[tokio::test]
 #[ignore = "benchmark: cargo test --release -p tachyon-runtime --test bench_stages -- --ignored"]
 async fn bench_paimon_write_commit() {
-    let warehouse = std::env::temp_dir().join(format!(
-        "tachyon-bench-paimon-{}",
-        std::process::id()
-    ));
+    let warehouse =
+        std::env::temp_dir().join(format!("tachyon-bench-paimon-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&warehouse);
     std::fs::create_dir_all(&warehouse).expect("warehouse");
     let warehouse = warehouse.to_string_lossy().to_string();
@@ -229,7 +241,10 @@ async fn bench_paimon_write_commit() {
         "default",
         "bench",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("status", PDataType::VarChar(VarCharType::string_type())),
             ("source_version", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::Double(DoubleType::new())),
@@ -243,8 +258,8 @@ async fn bench_paimon_write_commit() {
 
     let chunk = 10_000;
     let batches = build_batches(N, chunk);
-    let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
-        .expect("sink");
+    let mut sink =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version")).expect("sink");
 
     // Warmup: un write + commit pequeño.
     {
@@ -266,8 +281,17 @@ async fn bench_paimon_write_commit() {
     sink.commit().await.expect("commit");
     let wall = t0.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu0;
-    report("3. Paimon write+commit (LSM local)", rows, wall, cpu, rss_mb());
-    println!("  (write amortizado: {write_wall:.3}s -> {:.0} rows/s)", rows as f64 / write_wall);
+    report(
+        "3. Paimon write+commit (LSM local)",
+        rows,
+        wall,
+        cpu,
+        rss_mb(),
+    );
+    println!(
+        "  (write amortizado: {write_wall:.3}s -> {:.0} rows/s)",
+        rows as f64 / write_wall
+    );
 
     let _ = std::fs::remove_dir_all(&warehouse);
 }

@@ -150,7 +150,11 @@ async fn two_consumers_apply_a_mixed_lot_once() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(blocked, "el revoke no dejó una partición en espera: admitted={:?}", gate.admitted_map());
+    assert!(
+        blocked,
+        "el revoke no dejó una partición en espera: admitted={:?}",
+        gate.admitted_map()
+    );
 
     // Mientras el apply no publica, nadie vuelve a entregar el lote ya copiado.
     let during = drain(&mut stream0, Duration::from_millis(400)).await;

@@ -66,7 +66,9 @@ pub async fn compact_table(table: &Table, min_files: usize) -> Result<CompactOut
             });
         }
 
-        let batches = read_table_rows(table).await.context("leyendo las filas vigentes")?;
+        let batches = read_table_rows(table)
+            .await
+            .context("leyendo las filas vigentes")?;
         let messages = write_merged(table, &batches).await?;
         if !batches.is_empty() && messages.iter().all(|message| message.new_files.is_empty()) {
             anyhow::bail!("la compactación leyó filas y no escribió un archivo");
@@ -78,14 +80,22 @@ pub async fn compact_table(table: &Table, min_files: usize) -> Result<CompactOut
             .await
             .context("releyendo el snapshot")?;
         if current != Some(latest.id()) {
-            tracing::info!(attempt, snapshot = latest.id(), "el writer avanzó; la compactación reintenta");
+            tracing::info!(
+                attempt,
+                snapshot = latest.id(),
+                "el writer avanzó; la compactación reintenta"
+            );
             continue;
         }
 
         let files = active_files(table).await?;
         let snapshot_id = publish_compact(table, &latest, &files, &messages).await?;
         if snapshot_id.is_none() {
-            tracing::info!(attempt, snapshot = latest.id(), "otro snapshot ocupó el id; la compactación reintenta");
+            tracing::info!(
+                attempt,
+                snapshot = latest.id(),
+                "otro snapshot ocupó el id; la compactación reintenta"
+            );
             continue;
         }
         let files_after = active_files(table).await?.len();
@@ -237,7 +247,10 @@ async fn publish_compact(
         .await
         .context("midiendo el manifest")?
         .size as i64;
-    let added = messages.iter().map(|message| message.new_files.len() as i64).sum();
+    let added = messages
+        .iter()
+        .map(|message| message.new_files.len() as i64)
+        .sum();
     let (min_bucket, max_bucket, min_level, max_level) = bucket_level_stats(files, messages);
     let delta_meta = ManifestFileMeta::new(
         delta_name,
@@ -255,11 +268,19 @@ async fn publish_compact(
     ManifestList::write(file_io, &format!("{manifest_dir}/{base_list}"), &base_metas)
         .await
         .context("escribiendo la lista base")?;
-    ManifestList::write(file_io, &format!("{manifest_dir}/{delta_list}"), &[delta_meta])
-        .await
-        .context("escribiendo la lista delta")?;
+    ManifestList::write(
+        file_io,
+        &format!("{manifest_dir}/{delta_list}"),
+        &[delta_meta],
+    )
+    .await
+    .context("escribiendo la lista delta")?;
 
-    let added: i64 = messages.iter().flat_map(|message| &message.new_files).map(|file| file.row_count).sum();
+    let added: i64 = messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .map(|file| file.row_count)
+        .sum();
     let removed: i64 = files.iter().map(|file| file.file.row_count).sum();
     let delta_records = added - removed;
     let total_records = latest.total_record_count().unwrap_or(0) + delta_records;
@@ -337,9 +358,14 @@ mod tests {
                 Field::new("name", DataType::Utf8, true),
             ])),
             vec![
-                Arc::new(Int64Array::from(pairs.iter().map(|row| row.0).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(
+                    pairs.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
                 Arc::new(StringArray::from(
-                    pairs.iter().map(|row| Some(row.1.to_string())).collect::<Vec<_>>(),
+                    pairs
+                        .iter()
+                        .map(|row| Some(row.1.to_string()))
+                        .collect::<Vec<_>>(),
                 )),
             ],
         )
@@ -373,7 +399,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "tachyon-compact-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).expect("reloj").as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("reloj")
+                .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("warehouse");
@@ -382,7 +411,10 @@ mod tests {
             "default",
             "customers",
             &[
-                ("customer_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+                (
+                    "customer_id",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
                 ("name", PDataType::VarChar(VarCharType::string_type())),
             ],
             &["customer_id"],
@@ -409,18 +441,36 @@ mod tests {
     #[tokio::test]
     async fn a_compact_snapshot_folds_the_bucket_and_a_later_write_wins() {
         let (dir, table) = warehouse().await;
-        for batch in [rows(&[(1, "ana"), (2, "bea")]), rows(&[(3, "caro")]), rows(&[(1, "eva")])] {
-            let mut sink = PaimonSink::from_table(table.clone(), "customer_id", 1, None).expect("sink");
+        for batch in [
+            rows(&[(1, "ana"), (2, "bea")]),
+            rows(&[(3, "caro")]),
+            rows(&[(1, "eva")]),
+        ] {
+            let mut sink =
+                PaimonSink::from_table(table.clone(), "customer_id", 1, None).expect("sink");
             sink.write(&batch).await.expect("write");
             sink.commit().await.expect("commit");
         }
-        let before = table.snapshot_manager().get_latest_snapshot_id().await.expect("id").unwrap();
+        let before = table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .expect("id")
+            .unwrap();
         let outcome = compact_table(&table, 2).await.expect("compact");
         let snapshot_id = outcome.snapshot_id.expect("publicó");
-        assert!(outcome.files_before >= 2, "archivos antes: {}", outcome.files_before);
+        assert!(
+            outcome.files_before >= 2,
+            "archivos antes: {}",
+            outcome.files_before
+        );
         assert_eq!(outcome.files_after, 1, "el bucket queda en un archivo");
 
-        let snapshot = table.snapshot_manager().get_snapshot(snapshot_id).await.expect("snapshot");
+        let snapshot = table
+            .snapshot_manager()
+            .get_snapshot(snapshot_id)
+            .await
+            .expect("snapshot");
         assert_eq!(snapshot.commit_kind(), &CommitKind::COMPACT);
         assert_eq!(snapshot.commit_user(), COMPACT_USER);
         assert_eq!(snapshot.commit_identifier(), i64::MAX);
@@ -448,7 +498,9 @@ mod tests {
         );
 
         let mut sink = PaimonSink::from_table(table.clone(), "customer_id", 1, None).expect("sink");
-        sink.write(&rows(&[(1, "ina"), (4, "dora")])).await.expect("write");
+        sink.write(&rows(&[(1, "ina"), (4, "dora")]))
+            .await
+            .expect("write");
         sink.commit().await.expect("commit");
         assert_eq!(
             names(&read_table_rows(&table).await.expect("lectura")),

@@ -37,7 +37,13 @@ pub struct ShardedWindow {
 }
 
 impl ShardedWindow {
-    pub fn new(spec: WindowSpecId, lag_ms: i64, idle_ms: i64, key_kind: KeyKind, shards: usize) -> Self {
+    pub fn new(
+        spec: WindowSpecId,
+        lag_ms: i64,
+        idle_ms: i64,
+        key_kind: KeyKind,
+        shards: usize,
+    ) -> Self {
         let shards = (0..shards.max(1))
             .map(|_| WindowOperator::new(spec.clone(), lag_ms, idle_ms, key_kind))
             .collect();
@@ -144,7 +150,11 @@ impl ShardedWindow {
     /// Aplica un batch: cada fila en el shard de su partición, en paralelo.
     /// Una falla en un shard deja a todos envenenados (el batch quedó a
     /// medias en los otros): cada llamada siguiente devuelve esa falla.
-    pub fn apply(&mut self, rows: Vec<WindowInput>, now: Instant) -> Result<Vec<ClosedWindow>, WindowFault> {
+    pub fn apply(
+        &mut self,
+        rows: Vec<WindowInput>,
+        now: Instant,
+    ) -> Result<Vec<ClosedWindow>, WindowFault> {
         if let Some(fault) = self.shards.iter().find_map(|shard| shard.poison().cloned()) {
             return Err(fault);
         }
@@ -168,31 +178,33 @@ impl ShardedWindow {
                 }
             }
         } else {
-            let mut split: Vec<Vec<WindowInput>> =
-                (0..count).map(|_| Vec::with_capacity(rows.len() / count + 1)).collect();
+            let mut split: Vec<Vec<WindowInput>> = (0..count)
+                .map(|_| Vec::with_capacity(rows.len() / count + 1))
+                .collect();
             for row in rows {
                 split[shard_of(row.partition, count)].push(row);
             }
-            let results: Vec<Result<Vec<ClosedWindow>, WindowFault>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = self
-                    .shards
-                    .iter_mut()
-                    .zip(split)
-                    .map(|(shard, part)| {
-                        scope.spawn(move || {
-                            if part.is_empty() {
-                                Ok(Vec::new())
-                            } else {
-                                shard.apply(&part, now)
-                            }
+            let results: Vec<Result<Vec<ClosedWindow>, WindowFault>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = self
+                        .shards
+                        .iter_mut()
+                        .zip(split)
+                        .map(|(shard, part)| {
+                            scope.spawn(move || {
+                                if part.is_empty() {
+                                    Ok(Vec::new())
+                                } else {
+                                    shard.apply(&part, now)
+                                }
+                            })
                         })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().expect("un shard de ventana entró en pánico"))
-                    .collect()
-            });
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().expect("un shard de ventana entró en pánico"))
+                        .collect()
+                });
             for result in results {
                 match result {
                     Ok(done) => closed.extend(done),
@@ -285,8 +297,18 @@ mod tests {
             gap_ms: None,
             group_columns: vec!["k".into()],
             aggs: vec![
-                AggSpec { kind: AggKind::Count, input: None, alias: "n".into() },
-                AggSpec { kind: AggKind::Sum, input: Some("v".into()), alias: "s".into() },
+                AggSpec {
+                    kind: AggKind::Count,
+                    input: None,
+                    alias: "n".into(),
+                    project: None,
+                },
+                AggSpec {
+                    kind: AggKind::Sum,
+                    input: Some("v".into()),
+                    alias: "s".into(),
+                    project: None,
+                },
             ],
         }
     }
@@ -341,18 +363,30 @@ mod tests {
                 clocks[partition as usize] += (x >> 8) as i64 % (3 + partition as i64);
                 offsets[partition as usize] += 1;
                 let key = ((x >> 20) % 8) as i64 * 8 + partition as i64;
-                rows.push(row(key, clocks[partition as usize], partition, offsets[partition as usize], (x >> 30) as i64 % 100));
+                rows.push(row(
+                    key,
+                    clocks[partition as usize],
+                    partition,
+                    offsets[partition as usize],
+                    (x >> 30) as i64 % 100,
+                ));
             }
             out_single.extend(single.apply(&rows, t0).unwrap());
             out_sharded.extend(sharded.apply(rows, t0).unwrap());
         }
         // Un evento muy adelante en cada partición cierra todo lo abierto.
-        let far: Vec<WindowInput> = (0..8).map(|p| row(p as i64, 10_000_000, p, 1_000_000, 0)).collect();
+        let far: Vec<WindowInput> = (0..8)
+            .map(|p| row(p as i64, 10_000_000, p, 1_000_000, 0))
+            .collect();
         out_single.extend(single.apply(&far, t0).unwrap());
         out_sharded.extend(sharded.apply(far, t0).unwrap());
         let a = summarize(&out_single);
         let b = summarize(&out_sharded);
-        assert!(a.len() > 100, "el test tiene que cerrar ventanas: {}", a.len());
+        assert!(
+            a.len() > 100,
+            "el test tiene que cerrar ventanas: {}",
+            a.len()
+        );
         assert_eq!(a, b);
         assert_eq!(single.open_windows(), sharded.open_windows());
     }
@@ -362,7 +396,8 @@ mod tests {
         let t0 = Instant::now();
         let mut op = ShardedWindow::new(spec(), 0, 60_000, KeyKind::I64, 2);
         // La partición 0 (shard 0) va por 5000; la 1 (shard 1) por 1500.
-        op.apply(vec![row(0, 5_000, 0, 1, 1), row(1, 1_500, 1, 1, 1)], t0).unwrap();
+        op.apply(vec![row(0, 5_000, 0, 1, 1), row(1, 1_500, 1, 1, 1)], t0)
+            .unwrap();
         assert_eq!(op.instance_watermark_ms(), Some(1_500));
         // [1000, 2000) de la clave 1 sigue abierta hasta que la 1 pase 2000.
         assert_eq!(op.open_windows(), 2);
@@ -379,7 +414,16 @@ mod tests {
         op.apply(rows, t0).unwrap();
         let state = op.freeze_state();
         assert_eq!(state.keys.len(), 9);
-        let back = ShardedWindow::restore(spec(), 0, 60_000, state.clone(), op.instance_watermark_ms(), KeyKind::I64, 3).unwrap();
+        let back = ShardedWindow::restore(
+            spec(),
+            0,
+            60_000,
+            state.clone(),
+            op.instance_watermark_ms(),
+            KeyKind::I64,
+            3,
+        )
+        .unwrap();
         assert_eq!(back.freeze_state(), state);
         assert_eq!(back.open_windows(), 9);
     }

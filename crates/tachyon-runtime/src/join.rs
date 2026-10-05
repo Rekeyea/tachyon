@@ -5,13 +5,13 @@
 //! par emite una fila. El buffer y los offsets aplicados entran en el mismo
 //! snapshot de Paimon.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::array::{Array, Float64Array, Int64Array, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use tachyon_config::{parse_fixed_duration, InputKind, PipelineConfig};
 use tachyon_core::{
     CheckpointBody, JoinCell, JoinCheckpointV1, JoinColumnSpec, JoinEvent, JoinKeyState, JoinSpec,
@@ -93,8 +93,13 @@ impl JoinOperator {
         match side {
             Side::Left => {
                 for other in &buf.right {
-                    if pairs(event.time_ms, other.time_ms, self.lower_ms, self.upper_ms, self.base_is_left)
-                    {
+                    if pairs(
+                        event.time_ms,
+                        other.time_ms,
+                        self.lower_ms,
+                        self.upper_ms,
+                        self.base_is_left,
+                    ) {
                         emitted.push(zip(&event.values, &other.values));
                     }
                 }
@@ -105,8 +110,13 @@ impl JoinOperator {
             }
             Side::Right => {
                 for other in &buf.left {
-                    if pairs(other.time_ms, event.time_ms, self.lower_ms, self.upper_ms, self.base_is_left)
-                    {
+                    if pairs(
+                        other.time_ms,
+                        event.time_ms,
+                        self.lower_ms,
+                        self.upper_ms,
+                        self.base_is_left,
+                    ) {
                         emitted.push(zip(&other.values, &event.values));
                     }
                 }
@@ -141,12 +151,26 @@ impl JoinOperator {
         let right_wm = watermark(&self.right_clock, self.right_lag_ms);
         for buf in self.keys.values_mut() {
             if let Some(right_wm) = right_wm {
-                buf.left
-                    .retain(|event| !expired_left(event.time_ms, right_wm, self.lower_ms, self.upper_ms, self.base_is_left));
+                buf.left.retain(|event| {
+                    !expired_left(
+                        event.time_ms,
+                        right_wm,
+                        self.lower_ms,
+                        self.upper_ms,
+                        self.base_is_left,
+                    )
+                });
             }
             if let Some(left_wm) = left_wm {
-                buf.right
-                    .retain(|event| !expired_right(event.time_ms, left_wm, self.lower_ms, self.upper_ms, self.base_is_left));
+                buf.right.retain(|event| {
+                    !expired_right(
+                        event.time_ms,
+                        left_wm,
+                        self.lower_ms,
+                        self.upper_ms,
+                        self.base_is_left,
+                    )
+                });
             }
         }
         self.keys
@@ -186,7 +210,11 @@ fn expired_right(time: i64, left_wm: i64, lower: i64, upper: i64, base_is_left: 
 }
 
 fn watermark(clock: &BTreeMap<i32, i64>, lag_ms: i64) -> Option<i64> {
-    clock.values().copied().min().map(|max| max.saturating_sub(lag_ms))
+    clock
+        .values()
+        .copied()
+        .min()
+        .map(|max| max.saturating_sub(lag_ms))
 }
 
 fn zip(left: &[JoinCell], right: &[JoinCell]) -> Vec<JoinCell> {
@@ -226,9 +254,7 @@ pub async fn run_join_pipeline(
         .iter()
         .any(|input| input.kind() != InputKind::Topic)
     {
-        anyhow::bail!(
-            "el join lee topics; kinesis y sqs publican una tabla (pass-through)"
-        );
+        anyhow::bail!("el join lee topics; kinesis y sqs publican una tabla (pass-through)");
     }
     let left_lag = side_lag(config, &join.left, &join.left_time, &join.left_key)?;
     let right_lag = side_lag(config, &join.right, &join.right_time, &join.right_key)?;
@@ -247,7 +273,10 @@ pub async fn run_join_pipeline(
     let mut sink = sink
         .with_commit_user(&options.commit_user)
         .context("fijando el commit_user del sink")?;
-    let recovered = sink.recover().await.context("recuperando el último checkpoint")?;
+    let recovered = sink
+        .recover()
+        .await
+        .context("recuperando el último checkpoint")?;
     let restored = match recovered {
         Recovered::None => None,
         Recovered::Join { checkpoint, .. } => {
@@ -267,7 +296,9 @@ pub async fn run_join_pipeline(
             anyhow::bail!("checkpoint {identifier} es pass-through y el plan es un join")
         }
         Recovered::Positions { identifier, .. } => {
-            anyhow::bail!("checkpoint {identifier} es de inputs mixtos y el plan es un join; se rechaza")
+            anyhow::bail!(
+                "checkpoint {identifier} es de inputs mixtos y el plan es un join; se rechaza"
+            )
         }
         Recovered::Window { identifier, .. } => {
             anyhow::bail!("checkpoint {identifier} es de una ventana y el plan es un join")
@@ -356,14 +387,26 @@ pub async fn run_join_pipeline(
             }
         }
     }
-    flush(&mut sink, &operator, &spec, &applied, &out_schema, &mut pending, metrics).await?;
+    flush(
+        &mut sink,
+        &operator,
+        &spec,
+        &applied,
+        &out_schema,
+        &mut pending,
+        metrics,
+    )
+    .await?;
     Ok(crate::run::PipelineHandle {
         metrics_addr,
         metrics: metrics.clone(),
     })
 }
 
-fn input_def<'a>(config: &'a PipelineConfig, name: &str) -> Result<&'a tachyon_config::schema::InputDef> {
+fn input_def<'a>(
+    config: &'a PipelineConfig,
+    name: &str,
+) -> Result<&'a tachyon_config::schema::InputDef> {
     config
         .inputs
         .iter()
@@ -454,7 +497,14 @@ fn spawn_input(
         let mut stream = source.record_stream();
         while let Some(item) = stream.next().await {
             let decoded = item.and_then(|records| {
-                decode_records(&decoder, &records, side_left, &columns, &key_column, &time_column)
+                decode_records(
+                    &decoder,
+                    &records,
+                    side_left,
+                    &columns,
+                    &key_column,
+                    &time_column,
+                )
             });
             if tx.send(decoded).is_err() {
                 break;
@@ -568,7 +618,11 @@ fn time_ms(column: &dyn Array, row: usize) -> Result<Option<i64>> {
     }
     match column.data_type() {
         DataType::Int64 => Ok(Some(
-            column.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
         )),
         DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(Some(
             column
@@ -587,10 +641,18 @@ fn cell_at(column: &dyn Array, row: usize) -> Result<JoinCell> {
     }
     match column.data_type() {
         DataType::Int64 => Ok(JoinCell::I64(
-            column.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
         )),
         DataType::Float64 => Ok(JoinCell::F64(
-            column.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
+            column
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row),
         )),
         DataType::Utf8 => Ok(JoinCell::Text(
             column
@@ -604,11 +666,7 @@ fn cell_at(column: &dyn Array, row: usize) -> Result<JoinCell> {
     }
 }
 
-fn output_schema(
-    left: &Schema,
-    right: &Schema,
-    columns: &[JoinSelect],
-) -> Result<SchemaRef> {
+fn output_schema(left: &Schema, right: &Schema, columns: &[JoinSelect]) -> Result<SchemaRef> {
     let mut fields = Vec::with_capacity(columns.len());
     for column in columns {
         let schema = if column.side_left { left } else { right };
@@ -659,10 +717,15 @@ fn batch_from_rows(schema: &SchemaRef, rows: &[Vec<JoinCell>]) -> Result<RecordB
     for (index, field) in schema.fields().iter().enumerate() {
         columns.push(column_from_cells(field, rows, index)?);
     }
-    RecordBatch::try_new(schema.clone(), columns).map_err(|err| anyhow::anyhow!("batch de join: {err}"))
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|err| anyhow::anyhow!("batch de join: {err}"))
 }
 
-fn column_from_cells(field: &Field, rows: &[Vec<JoinCell>], index: usize) -> Result<Arc<dyn Array>> {
+fn column_from_cells(
+    field: &Field,
+    rows: &[Vec<JoinCell>],
+    index: usize,
+) -> Result<Arc<dyn Array>> {
     match field.data_type() {
         DataType::Int64 => {
             let values: Int64Array = rows

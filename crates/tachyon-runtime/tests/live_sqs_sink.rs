@@ -60,11 +60,7 @@ async fn recreate_queue(client: &aws_sdk_sqs::Client, queue: &str) -> String {
     resp.queue_url().unwrap().to_string()
 }
 
-async fn put_orders(
-    client: &aws_sdk_sqs::Client,
-    url: &str,
-    orders: &[(i64, &str, i64, f64)],
-) {
+async fn put_orders(client: &aws_sdk_sqs::Client, url: &str, orders: &[(i64, &str, i64, f64)]) {
     for (order_id, status, version, amount) in orders {
         let payload = format!(
             r#"{{"order_id":{order_id},"status":"{status}","source_version":{version},"amount":{amount}}}"#
@@ -86,9 +82,7 @@ async fn count_output(client: &aws_sdk_sqs::Client, url: &str) -> usize {
     let resp = client
         .get_queue_attributes()
         .queue_url(url)
-        .attribute_names(
-            aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages,
-        )
+        .attribute_names(aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
         .attribute_names(
             aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
         )
@@ -97,10 +91,7 @@ async fn count_output(client: &aws_sdk_sqs::Client, url: &str) -> usize {
         .expect("get_queue_attributes");
     let attrs = resp.attributes().cloned().unwrap_or_default();
     let get = |name: aws_sdk_sqs::types::QueueAttributeName| {
-        attrs
-            .get(&name)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+        attrs.get(&name).and_then(|v| v.parse().ok()).unwrap_or(0)
     };
     get(aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
         + get(aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
@@ -173,9 +164,7 @@ const SQL: &str = "INSERT INTO orders_out \
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requiere floCi en localhost:4566"]
 async fn live_sqs_sink_at_least_once() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     // --- 1. Colas frescas + 6 orders (1 cancelled) en el input ---
     let client = sqs_client().await;

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use paimon::spec::{DataType as PDataType, BigIntType, DoubleType, VarCharType};
+use paimon::spec::{BigIntType, DataType as PDataType, DoubleType, VarCharType};
 use rdkafka::admin::{AdminClient, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
@@ -48,7 +48,9 @@ async fn recreate_topic(broker: &str) {
     let mut cc = ClientConfig::new();
     cc.set("bootstrap.servers", broker);
     let admin: AdminClient<DefaultClientContext> = cc.create().expect("admin client");
-    let _ = admin.delete_topics(&[ORDERS_TOPIC], &Default::default()).await;
+    let _ = admin
+        .delete_topics(&[ORDERS_TOPIC], &Default::default())
+        .await;
     let topic = NewTopic::new(ORDERS_TOPIC, 2, TopicReplication::Fixed(1));
     admin
         .create_topics(&[topic], &Default::default())
@@ -63,9 +65,7 @@ async fn produce_orders(producer: &FutureProducer, orders: &[(i64, &str, i64, f6
             "{{\"order_id\":{order_id},\"status\":\"{status}\",\"source_version\":{version},\"amount\":{amount}}}"
         );
         let key = order_id.to_string();
-        let record = FutureRecord::to(ORDERS_TOPIC)
-            .key(&key)
-            .payload(&payload);
+        let record = FutureRecord::to(ORDERS_TOPIC).key(&key).payload(&payload);
         producer
             .send(record, Duration::from_secs(5))
             .await
@@ -141,8 +141,10 @@ async fn start_instance(
     table: &paimon::table::Table,
     group_id: &str,
     select_sql: &str,
-) -> (tokio::task::JoinHandle<Result<tachyon_runtime::PipelineHandle, anyhow::Error>>, Arc<InstanceMetrics>)
-{
+) -> (
+    tokio::task::JoinHandle<Result<tachyon_runtime::PipelineHandle, anyhow::Error>>,
+    Arc<InstanceMetrics>,
+) {
     let config = Arc::new(config_yaml(warehouse));
     let options = RunOptions {
         commit_interval: Duration::from_secs(2),
@@ -150,19 +152,25 @@ async fn start_instance(
         group_id: group_id.to_string(),
         commit_user: group_id.to_string(),
     };
-    let sink =
-        PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
-            .expect("abriendo sink");
-    let input_schemas = HashMap::from([(
-        "orders".to_string(),
-        PreparedInput::json(orders_schema()),
-    )]);
+    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("source_version"))
+        .expect("abriendo sink");
+    let input_schemas =
+        HashMap::from([("orders".to_string(), PreparedInput::json(orders_schema()))]);
     let metrics = Arc::new(InstanceMetrics::new());
     let select_sql = select_sql.to_string();
     let task = tokio::spawn({
         let metrics = metrics.clone();
         async move {
-            run_pipeline(&config, &select_sql, &options, sink, &input_schemas, &metrics, None).await
+            run_pipeline(
+                &config,
+                &select_sql,
+                &options,
+                sink,
+                &input_schemas,
+                &metrics,
+                None,
+            )
+            .await
         }
     });
     (task, metrics)
@@ -183,10 +191,8 @@ async fn live_recovery_restart_from_committed_offset() {
     let group_id = format!("tachyon-recovery-{}", std::process::id());
 
     // --- 0. Warehouse + tabla Paimon frescos ---
-    let warehouse = std::env::temp_dir().join(format!(
-        "tachyon-recovery-warehouse-{}",
-        std::process::id()
-    ));
+    let warehouse =
+        std::env::temp_dir().join(format!("tachyon-recovery-warehouse-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&warehouse);
     std::fs::create_dir_all(&warehouse).expect("creando warehouse");
     let warehouse = warehouse.to_string_lossy().to_string();
@@ -196,7 +202,10 @@ async fn live_recovery_restart_from_committed_offset() {
         DB,
         TABLE,
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("status", PDataType::VarChar(VarCharType::string_type())),
             ("source_version", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::Double(DoubleType::new())),
@@ -215,7 +224,11 @@ async fn live_recovery_restart_from_committed_offset() {
     let producer: FutureProducer = producer_config.create().expect("producer");
 
     // --- 2. Lote 1: orders 1-3 (3 es cancelled) -> 2 pasan ---
-    let lote1 = [(1i64, "paid", 10i64, 100.0f64), (2, "shipped", 11, 200.0), (3, "cancelled", 12, 300.0)];
+    let lote1 = [
+        (1i64, "paid", 10i64, 100.0f64),
+        (2, "shipped", 11, 200.0),
+        (3, "cancelled", 12, 300.0),
+    ];
     produce_orders(&producer, &lote1).await;
 
     // --- 3. Instancia 1: consume el lote 1 y commita (Paimon + offsets) ---
@@ -251,7 +264,11 @@ async fn live_recovery_restart_from_committed_offset() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // --- 5. Lote 2: orders 4-6 (5 es cancelled) -> 2 pasan ---
-    let lote2 = [(4i64, "paid", 20i64, 400.0f64), (5, "cancelled", 21, 500.0), (6, "shipped", 22, 600.0)];
+    let lote2 = [
+        (4i64, "paid", 20i64, 400.0f64),
+        (5, "cancelled", 21, 500.0),
+        (6, "shipped", 22, 600.0),
+    ];
     produce_orders(&producer, &lote2).await;
 
     // --- 6. Instancia 2: MISMO consumer group -> re-consume desde el offset commitado ---
@@ -285,7 +302,9 @@ async fn live_recovery_restart_from_committed_offset() {
     // Si hubiera re-consumido desde el inicio, rows_read sería 4 (los 2 del
     // lote 1 + los 2 del lote 2). Al re-consumir desde el offset commitado,
     // solo lee los 2 eventos nuevos.
-    let rows_read = metrics2.rows_read.load(std::sync::atomic::Ordering::Relaxed);
+    let rows_read = metrics2
+        .rows_read
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         rows_read, 2,
         "la instancia reiniciada debe leer solo los 2 eventos nuevos (re-consumo desde el offset commitado), no desde el inicio"

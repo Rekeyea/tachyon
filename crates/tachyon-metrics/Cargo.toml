@@ -4,6 +4,7 @@ description = "Métricas de Tachyon (OpenTelemetry)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # MVP: métricas básicas + endpoint HTTP minimalista (sin OpenTelemetry todavía;

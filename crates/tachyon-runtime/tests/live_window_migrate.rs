@@ -67,13 +67,44 @@ deployment:
 fn rows(batches: &[arrow::array::RecordBatch]) -> Vec<(i64, i64, i64, i64, i64)> {
     let mut out = Vec::new();
     for batch in batches {
-        let ids = batch.column_by_name("order_id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let starts = batch.column_by_name("window_start").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let ends = batch.column_by_name("window_end").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let ns = batch.column_by_name("n").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let amounts = batch.column_by_name("amount").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let ids = batch
+            .column_by_name("order_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let starts = batch
+            .column_by_name("window_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ends = batch
+            .column_by_name("window_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ns = batch
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let amounts = batch
+            .column_by_name("amount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
-            out.push((ids.value(i), starts.value(i), ends.value(i), ns.value(i), amounts.value(i)));
+            out.push((
+                ids.value(i),
+                starts.value(i),
+                ends.value(i),
+                ns.value(i),
+                amounts.value(i),
+            ));
         }
     }
     out.sort();
@@ -120,8 +151,14 @@ async fn live_partition_moves_to_another_commit_user_without_double_count() {
         "default",
         "orders_migrate",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-            ("window_start", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            (
+                "window_start",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("window_end", PDataType::BigInt(BigIntType::new())),
             ("n", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::BigInt(BigIntType::new())),
@@ -139,7 +176,10 @@ async fn live_partition_moves_to_another_commit_user_without_double_count() {
         .expect("admin");
     let _ = admin.delete_topics(&[&topic], &Default::default()).await;
     admin
-        .create_topics(&[NewTopic::new(&topic, 1, TopicReplication::Fixed(1))], &Default::default())
+        .create_topics(
+            &[NewTopic::new(&topic, 1, TopicReplication::Fixed(1))],
+            &Default::default(),
+        )
         .await
         .expect("topic");
 
@@ -161,7 +201,8 @@ async fn live_partition_moves_to_another_commit_user_without_double_count() {
         group_id: group.clone(),
         commit_user: format!("{group}-a"),
     };
-    let sink_a = PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
+    let sink_a =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
     let codecs_a = HashMap::from([("orders".to_string(), PreparedInput::json(input_schema()))]);
     let metrics_a = Arc::new(tachyon_metrics::InstanceMetrics::new());
     let window_a = window.clone();
@@ -196,7 +237,11 @@ async fn live_partition_moves_to_another_commit_user_without_double_count() {
             }
         }
     }
-    assert_eq!(got, vec![(1, 0, 60_000, 2, 15)], "el primer minuto no cerró: {got:?}");
+    assert_eq!(
+        got,
+        vec![(1, 0, 60_000, 2, 15)],
+        "el primer minuto no cerró: {got:?}"
+    );
     tokio::time::sleep(Duration::from_secs(2)).await;
     task_a.abort();
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -208,7 +253,8 @@ async fn live_partition_moves_to_another_commit_user_without_double_count() {
         group_id: group.clone(),
         commit_user: format!("{group}-b"),
     };
-    let sink_b = PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
+    let sink_b =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
     let codecs_b = HashMap::from([("orders".to_string(), PreparedInput::json(input_schema()))]);
     let metrics_b = Arc::new(tachyon_metrics::InstanceMetrics::new());
     let watch = metrics_b.clone();

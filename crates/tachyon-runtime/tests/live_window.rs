@@ -82,9 +82,7 @@ async fn produce(topic: &str, events: &[(i64, i64)]) {
         .create()
         .expect("producer");
     for (t, amount) in events {
-        let payload = format!(
-            "{{\"order_id\":1,\"event_time\":{t},\"amount\":{amount}}}"
-        );
+        let payload = format!("{{\"order_id\":1,\"event_time\":{t},\"amount\":{amount}}}");
         producer
             .send(
                 FutureRecord::to(topic).key("1").payload(&payload),
@@ -98,13 +96,44 @@ async fn produce(topic: &str, events: &[(i64, i64)]) {
 fn read_windows(batches: &[arrow::array::RecordBatch]) -> Vec<(i64, i64, i64, i64, i64)> {
     let mut rows = Vec::new();
     for batch in batches {
-        let ids = batch.column_by_name("order_id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let starts = batch.column_by_name("window_start").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let ends = batch.column_by_name("window_end").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let ns = batch.column_by_name("n").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let amounts = batch.column_by_name("amount").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let ids = batch
+            .column_by_name("order_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let starts = batch
+            .column_by_name("window_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ends = batch
+            .column_by_name("window_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ns = batch
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let amounts = batch
+            .column_by_name("amount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
-            rows.push((ids.value(i), starts.value(i), ends.value(i), ns.value(i), amounts.value(i)));
+            rows.push((
+                ids.value(i),
+                starts.value(i),
+                ends.value(i),
+                ns.value(i),
+                amounts.value(i),
+            ));
         }
     }
     rows.sort();
@@ -131,7 +160,10 @@ async fn live_tumble_minute_closes_into_paimon() {
         "default",
         "orders_window",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             (
                 "window_start",
                 PDataType::BigInt(BigIntType::with_nullable(false)),
@@ -165,9 +197,7 @@ async fn live_tumble_minute_closes_into_paimon() {
         .expect("producer");
     // 10s y 20s caen en el minuto [0, 60s). 70s abre el siguiente y cierra el primero.
     for (t, amount) in [(10_000i64, 10i64), (20_000, 5), (70_000, 1)] {
-        let payload = format!(
-            "{{\"order_id\":1,\"event_time\":{t},\"amount\":{amount}}}"
-        );
+        let payload = format!("{{\"order_id\":1,\"event_time\":{t},\"amount\":{amount}}}");
         producer
             .send(
                 FutureRecord::to(TOPIC).key("1").payload(&payload),
@@ -189,8 +219,8 @@ async fn live_tumble_minute_closes_into_paimon() {
         group_id: format!("tachyon-window-{}", std::process::id()),
         commit_user: format!("tachyon-window-{}", std::process::id()),
     };
-    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end"))
-        .expect("sink");
+    let sink =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
     let codecs = HashMap::from([("orders".to_string(), PreparedInput::json(input_schema()))]);
     let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
     let window = parsed.window.expect("ventana");
@@ -286,8 +316,14 @@ async fn live_hop_puts_one_event_in_two_windows() {
         "default",
         "orders_hop",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-            ("window_start", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            (
+                "window_start",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("window_end", PDataType::BigInt(BigIntType::new())),
             ("n", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::BigInt(BigIntType::new())),
@@ -336,8 +372,14 @@ async fn live_session_merges_inside_the_gap() {
         "default",
         "orders_session",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-            ("window_start", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            (
+                "window_start",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("window_end", PDataType::BigInt(BigIntType::new())),
             ("n", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::BigInt(BigIntType::new())),
@@ -383,7 +425,8 @@ async fn run_until(
         group_id: format!("tachyon-{table_name}-{}", std::process::id()),
         commit_user: format!("tachyon-{table_name}-{}", std::process::id()),
     };
-    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
+    let sink =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
     let codecs = HashMap::from([("orders".to_string(), PreparedInput::json(input_schema()))]);
     let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
     let run_task = tokio::spawn(async move {
@@ -440,8 +483,14 @@ async fn live_two_consumers_count_each_partition_once() {
         "default",
         "orders_two",
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-            ("window_start", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
+            (
+                "window_start",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("window_end", PDataType::BigInt(BigIntType::new())),
             ("n", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::BigInt(BigIntType::new())),
@@ -472,9 +521,7 @@ async fn live_two_consumers_count_each_partition_once() {
     // después, cuando las dos particiones ya entraron al operador: si el
     // de 70s llegara antes, el watermark dejaría tarde al otro.
     for (partition, order_id, t, amount) in [(0, 1, 10_000, 10), (1, 2, 20_000, 7)] {
-        let payload = format!(
-            "{{\"order_id\":{order_id},\"event_time\":{t},\"amount\":{amount}}}"
-        );
+        let payload = format!("{{\"order_id\":{order_id},\"event_time\":{t},\"amount\":{amount}}}");
         producer
             .send(
                 FutureRecord::to(&topic)
@@ -532,7 +579,8 @@ deployment:
         group_id: format!("tachyon-two-{}", std::process::id()),
         commit_user: format!("tachyon-two-{}", std::process::id()),
     };
-    let sink = PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
+    let sink =
+        PaimonSink::from_table(table.clone(), "order_id", 1, Some("window_end")).expect("sink");
     let codecs = HashMap::from([("orders".to_string(), PreparedInput::json(input_schema()))]);
     let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
     let watch = metrics.clone();
@@ -569,9 +617,7 @@ deployment:
         "no llegaron los dos eventos abiertos"
     );
     for (partition, order_id, t, amount) in [(0, 1, 70_000, 1), (1, 2, 70_000, 1)] {
-        let payload = format!(
-            "{{\"order_id\":{order_id},\"event_time\":{t},\"amount\":{amount}}}"
-        );
+        let payload = format!("{{\"order_id\":{order_id},\"event_time\":{t},\"amount\":{amount}}}");
         producer
             .send(
                 FutureRecord::to(&topic)

@@ -64,10 +64,7 @@ impl UnionFeed {
         let mut seen = Vec::new();
         for source in sources {
             if seen.iter().any(|name: &String| name == &source.name) {
-                anyhow::bail!(
-                    "UNION ALL lee el input '{}' en una sola rama",
-                    source.name
-                );
+                anyhow::bail!("UNION ALL lee el input '{}' en una sola rama", source.name);
             }
             seen.push(source.name.clone());
         }
@@ -323,9 +320,7 @@ mod tests {
             ("web", [(1, 10), (2, 20)].as_slice()),
             ("app", [(3, 30)].as_slice()),
         ]));
-        let mut feed = UnionFeed::start(&sources, &factory)
-            .await
-            .expect("feed");
+        let mut feed = UnionFeed::start(&sources, &factory).await.expect("feed");
         let mut rows = Vec::new();
         while let Some(item) = feed.next().await {
             let (batch, progress) = item.expect("batch");
@@ -336,7 +331,11 @@ mod tests {
             else {
                 panic!("el batch de una rama de topic trae offsets");
             };
-            assert_eq!(offsets.len(), 1, "el batch cubre una sola rama: {offsets:?}");
+            assert_eq!(
+                offsets.len(),
+                1,
+                "el batch cubre una sola rama: {offsets:?}"
+            );
             let topic = offsets.keys().next().expect("topic").clone();
             let ids = ids_of(&batch);
             if topic == "web-topic" {
@@ -364,9 +363,6 @@ mod tests {
         let Err(err) = UnionFeed::start(&sources, &factory).await else {
             panic!("debería fallar");
         };
-        assert!(
-            err.to_string().contains("las mismas columnas"),
-            "{err:#}"
-        );
+        assert!(err.to_string().contains("las mismas columnas"), "{err:#}");
     }
 }

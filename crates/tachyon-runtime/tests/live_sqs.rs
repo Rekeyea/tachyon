@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use paimon::spec::{DataType as PDataType, BigIntType, DoubleType, VarCharType};
+use paimon::spec::{BigIntType, DataType as PDataType, DoubleType, VarCharType};
 use tachyon_config::PipelineConfig;
 use tachyon_runtime::{run_pipeline, PreparedInput, RunOptions};
 use tachyon_sink::writer::{create_test_table, read_table_rows, PaimonSink};
@@ -208,15 +208,10 @@ async fn start_pipeline(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requiere floCi en localhost:4566"]
 async fn live_sqs_at_least_once_and_resume() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     // --- 0. Warehouse + tabla Paimon frescos ---
-    let warehouse = std::env::temp_dir().join(format!(
-        "tachyon-sqs-wh-{}",
-        std::process::id()
-    ));
+    let warehouse = std::env::temp_dir().join(format!("tachyon-sqs-wh-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&warehouse);
     std::fs::create_dir_all(&warehouse).expect("creando warehouse");
     let warehouse = warehouse.to_string_lossy().to_string();
@@ -226,7 +221,10 @@ async fn live_sqs_at_least_once_and_resume() {
         DB,
         TABLE,
         &[
-            ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                PDataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("status", PDataType::VarChar(VarCharType::string_type())),
             ("source_version", PDataType::BigInt(BigIntType::new())),
             ("amount", PDataType::Double(DoubleType::new())),

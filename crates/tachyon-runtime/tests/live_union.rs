@@ -141,8 +141,8 @@ fn read_committed(topic: &str, wait: Duration) -> Vec<(String, String)> {
 fn tally(rows: &[(String, String)]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for (_, payload) in rows {
-        let value: serde_json::Value =
-            serde_json::from_str(payload).unwrap_or_else(|err| panic!("payload no es json: {payload} ({err})"));
+        let value: serde_json::Value = serde_json::from_str(payload)
+            .unwrap_or_else(|err| panic!("payload no es json: {payload} ({err})"));
         let canon = value.to_string();
         *counts.entry(canon).or_insert(0) += 1;
     }
@@ -162,9 +162,7 @@ fn pipeline_died(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn live_union_keeps_both_sides_once_and_a_restart_does_not_repeat() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let pid = std::process::id();
     let web = format!("tachyon-union-web-{pid}");
     let app = format!("tachyon-union-app-{pid}");
@@ -178,8 +176,14 @@ async fn live_union_keeps_both_sides_once_and_a_restart_does_not_repeat() {
     let cfg = config(&format!("union-{pid}"), &web, &app, &output);
     let pipeline = Pipeline::new(&cfg, SQL).expect("plan");
     let codecs = HashMap::from([
-        ("web".to_string(), tachyon_runtime::PreparedInput::json(schema())),
-        ("app".to_string(), tachyon_runtime::PreparedInput::json(schema())),
+        (
+            "web".to_string(),
+            tachyon_runtime::PreparedInput::json(schema()),
+        ),
+        (
+            "app".to_string(),
+            tachyon_runtime::PreparedInput::json(schema()),
+        ),
     ]);
     let task = tokio::spawn(async move { pipeline.run(&codecs).await });
 
@@ -192,8 +196,14 @@ async fn live_union_keeps_both_sides_once_and_a_restart_does_not_repeat() {
     }
     task.abort();
     let mut expected = BTreeMap::new();
-    expected.insert(serde_json::json!({"order_id": 2, "amount": 20}).to_string(), 1);
-    expected.insert(serde_json::json!({"order_id": 3, "amount": 30}).to_string(), 1);
+    expected.insert(
+        serde_json::json!({"order_id": 2, "amount": 20}).to_string(),
+        1,
+    );
+    expected.insert(
+        serde_json::json!({"order_id": 3, "amount": 30}).to_string(),
+        1,
+    );
     assert_eq!(
         tally(&got),
         expected,
@@ -203,8 +213,14 @@ async fn live_union_keeps_both_sides_once_and_a_restart_does_not_repeat() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let pipeline = Pipeline::new(&cfg, SQL).expect("plan");
     let codecs = HashMap::from([
-        ("web".to_string(), tachyon_runtime::PreparedInput::json(schema())),
-        ("app".to_string(), tachyon_runtime::PreparedInput::json(schema())),
+        (
+            "web".to_string(),
+            tachyon_runtime::PreparedInput::json(schema()),
+        ),
+        (
+            "app".to_string(),
+            tachyon_runtime::PreparedInput::json(schema()),
+        ),
     ]);
     let task = tokio::spawn(async move { pipeline.run(&codecs).await });
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -221,7 +237,10 @@ async fn live_union_keeps_both_sides_once_and_a_restart_does_not_repeat() {
         panic!("el reinicio murió: {}", pipeline_died(task.await));
     }
     task.abort();
-    expected.insert(serde_json::json!({"order_id": 4, "amount": 40}).to_string(), 1);
+    expected.insert(
+        serde_json::json!({"order_id": 4, "amount": 40}).to_string(),
+        1,
+    );
     assert_eq!(
         tally(&again),
         expected,

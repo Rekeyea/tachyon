@@ -22,11 +22,11 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 
 use crate::consumer::{LotRanges, RecordStream};
-use crate::kinesis::LotPositions;
-use tachyon_core::OffsetRange;
 use crate::decode::Decoder;
+use crate::kinesis::LotPositions;
 use crate::record::SourceRecord;
 use futures::stream::FuturesOrdered;
+use tachyon_core::OffsetRange;
 
 /// Progreso de una fuente: partición -> próximo offset a consumir (último
 /// offset emitido + 1).
@@ -498,8 +498,11 @@ fn spawn_decode(
             .map_err(|e| DataFusionError::Execution(e.to_string()))
             .and_then(|batch| {
                 if row_partitions {
-                    let partitions: Vec<i32> =
-                        lots.iter().flatten().map(|record| record.partition).collect();
+                    let partitions: Vec<i32> = lots
+                        .iter()
+                        .flatten()
+                        .map(|record| record.partition)
+                        .collect();
                     append_partition_column(batch, &partitions, schema)
                 } else {
                     Ok(batch)
@@ -557,9 +560,13 @@ mod tests {
         let ps = RedpandaPartitionStream::new(0, schema.clone(), decoder, 100, make_stream);
         let table = StreamingTable::try_new(schema, vec![Arc::new(ps)]).expect("tabla");
         let ctx = SessionContext::new();
-        ctx.register_table("orders", Arc::new(table)).expect("register");
+        ctx.register_table("orders", Arc::new(table))
+            .expect("register");
 
-        let df = ctx.sql("SELECT order_id, status FROM orders").await.expect("plan");
+        let df = ctx
+            .sql("SELECT order_id, status FROM orders")
+            .await
+            .expect("plan");
         let batches = df.collect().await.expect("collect");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 3, "se esperaban 3 filas");
@@ -584,9 +591,8 @@ mod tests {
         let make_stream: Arc<dyn Fn() -> crate::consumer::RecordStream + Send + Sync> =
             Arc::new(move || {
                 Box::pin(
-                    futures::stream::iter(std::iter::once(Ok(vec![record.clone()]))).chain(
-                        futures::stream::pending(),
-                    ),
+                    futures::stream::iter(std::iter::once(Ok(vec![record.clone()])))
+                        .chain(futures::stream::pending()),
                 )
             });
 
@@ -594,7 +600,8 @@ mod tests {
             .with_max_batch_delay(std::time::Duration::from_millis(50));
         let table = StreamingTable::try_new(schema, vec![Arc::new(ps)]).expect("tabla");
         let ctx = SessionContext::new();
-        ctx.register_table("orders", Arc::new(table)).expect("register");
+        ctx.register_table("orders", Arc::new(table))
+            .expect("register");
 
         let df = ctx
             .sql("SELECT order_id FROM orders LIMIT 1")
@@ -619,7 +626,8 @@ mod tests {
         let ps = RedpandaPartitionStream::new(0, schema.clone(), decoder, 2, make_stream);
         let table = StreamingTable::try_new(schema, vec![Arc::new(ps)]).expect("tabla");
         let ctx = SessionContext::new();
-        ctx.register_table("orders", Arc::new(table)).expect("register");
+        ctx.register_table("orders", Arc::new(table))
+            .expect("register");
 
         let df = ctx.sql("SELECT order_id FROM orders").await.expect("plan");
         let batches = df.collect().await.expect("collect");
@@ -676,7 +684,11 @@ mod tests {
             );
         }
         assert_eq!(batches, 3, "un batch por cada lote de 2 records");
-        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6], "los batches se emiten en orden");
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5, 6],
+            "los batches se emiten en orden"
+        );
         assert_eq!(tracker.snapshot(), BTreeMap::from([(0, 6)]));
     }
 

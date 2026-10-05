@@ -38,14 +38,12 @@ impl Stream for ConvertedStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let inner = Pin::new(&mut self.inner);
         match futures::Stream::poll_next(inner, cx) {
-            Poll::Ready(Some(Ok(batch))) => {
-                match self.converter.convert(&batch) {
-                    Ok(converted) => Poll::Ready(Some(Ok(converted))),
-                    Err(err) => Poll::Ready(Some(Err(DataFusionError::External(
-                        anyhow::Error::from(err).into(),
-                    )))),
-                }
-            }
+            Poll::Ready(Some(Ok(batch))) => match self.converter.convert(&batch) {
+                Ok(converted) => Poll::Ready(Some(Ok(converted))),
+                Err(err) => Poll::Ready(Some(Err(DataFusionError::External(
+                    anyhow::Error::from(err).into(),
+                )))),
+            },
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,

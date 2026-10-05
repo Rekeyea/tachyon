@@ -4,7 +4,8 @@ description = "Parsing de pipeline.sql (DataFusion SQL + extensiones de streamin
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
-tachyon-core = { path = "../tachyon-core" }
+tachyon-core = { version = "0.1.0", path = "../tachyon-core" }
 datafusion.workspace = true

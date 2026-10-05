@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-use paimon::spec::{DataType, BigIntType, DoubleType, VarCharType};
+use paimon::spec::{BigIntType, DataType, DoubleType, VarCharType};
 use tachyon_core::CheckpointBody;
 use tachyon_sink::writer::{create_test_table, read_table_rows, PaimonSink, Recovered};
 
@@ -98,7 +98,10 @@ async fn write_commit_and_dedup_by_sequence() {
                 "order_id".into(),
                 DataType::BigInt(BigIntType::with_nullable(false)),
             ),
-            ("status".into(), DataType::VarChar(VarCharType::string_type())),
+            (
+                "status".into(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
             ("source_version".into(), DataType::BigInt(BigIntType::new())),
             ("amount".into(), DataType::Double(DoubleType::new())),
         ],
@@ -149,14 +152,9 @@ async fn write_commit_and_dedup_by_sequence() {
     );
 
     // --- 3. Evento late: order 1 con sequence MENOR (v9) no sobrescribe ---
-    sink.write(&batch(
-        vec![1],
-        vec!["cancelled"],
-        vec![9],
-        vec![0.0],
-    ))
-    .await
-    .expect("write batch late");
+    sink.write(&batch(vec![1], vec!["cancelled"], vec![9], vec![0.0]))
+        .await
+        .expect("write batch late");
     sink.commit().await.expect("commit 3");
 
     let rows = rows_sorted(&read_table_rows(&table).await.expect("lectura 3"));
@@ -203,10 +201,7 @@ async fn rejects_unknown_key_column() {
 }
 
 fn offsets(entries: &[(i32, i64)]) -> tachyon_core::SourceOffsets {
-    tachyon_core::SourceOffsets::from([(
-        "orders".to_string(),
-        entries.iter().copied().collect(),
-    )])
+    tachyon_core::SourceOffsets::from([("orders".to_string(), entries.iter().copied().collect())])
 }
 
 /// Exactly-once: `commit_checkpoint` persiste los offsets atómicamente con el
@@ -221,7 +216,10 @@ async fn checkpoint_offsets_survive_restart() {
         DB,
         TABLE,
         &[
-            ("order_id", DataType::BigInt(BigIntType::with_nullable(false))),
+            (
+                "order_id",
+                DataType::BigInt(BigIntType::with_nullable(false)),
+            ),
             ("status", DataType::VarChar(VarCharType::string_type())),
             ("source_version", DataType::BigInt(BigIntType::new())),
             ("amount", DataType::Double(DoubleType::new())),
@@ -252,9 +250,14 @@ async fn checkpoint_offsets_survive_restart() {
     );
 
     // --- Dos checkpoints ---
-    sink.write(&batch(vec![1, 2], vec!["paid", "paid"], vec![1, 2], vec![1.0, 2.0]))
-        .await
-        .expect("write 1");
+    sink.write(&batch(
+        vec![1, 2],
+        vec!["paid", "paid"],
+        vec![1, 2],
+        vec![1.0, 2.0],
+    ))
+    .await
+    .expect("write 1");
     assert_eq!(
         sink.commit_checkpoint(&CheckpointBody::Offsets(offsets(&[(0, 2)])))
             .await
@@ -309,10 +312,16 @@ async fn checkpoint_offsets_survive_restart() {
 
     // --- Otro commit_user no ve estos checkpoints ---
     let mut other = open("tachyon-eos-otra-instancia");
-    assert_eq!(other.recover().await.expect("recover otro"), Recovered::None);
+    assert_eq!(
+        other.recover().await.expect("recover otro"),
+        Recovered::None
+    );
 
     let rows = rows_sorted(&read_table_rows(&table).await.expect("lectura"));
-    assert_eq!(rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
     let _ = std::fs::remove_dir_all(&warehouse);
 }
 
@@ -358,7 +367,10 @@ async fn empty_commit_does_not_create_a_snapshot() {
                 "order_id".into(),
                 DataType::BigInt(BigIntType::with_nullable(false)),
             ),
-            ("status".into(), DataType::VarChar(VarCharType::string_type())),
+            (
+                "status".into(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
             ("source_version".into(), DataType::BigInt(BigIntType::new())),
             ("amount".into(), DataType::Double(DoubleType::new())),
         ],
@@ -468,7 +480,10 @@ async fn window_checkpoint_roundtrips_with_the_snapshot() {
                 "order_id".into(),
                 DataType::BigInt(BigIntType::with_nullable(false)),
             ),
-            ("status".into(), DataType::VarChar(VarCharType::string_type())),
+            (
+                "status".into(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
             ("source_version".into(), DataType::BigInt(BigIntType::new())),
             ("amount".into(), DataType::Double(DoubleType::new())),
         ],
@@ -522,9 +537,12 @@ async fn window_checkpoint_roundtrips_with_the_snapshot() {
                 kind: AggKind::Count,
                 input: None,
                 alias: "n".into(),
+                project: None,
             }],
         },
         state: OperatorState { keys },
+        source_snapshot: None,
+        source_snapshots: BTreeMap::new(),
     };
     assert_eq!(
         sink.commit_checkpoint(&CheckpointBody::Window(checkpoint.clone()))

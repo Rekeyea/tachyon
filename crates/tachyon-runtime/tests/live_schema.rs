@@ -139,9 +139,7 @@ fn options(id: &str) -> RunOptions {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn live_the_reader_uses_the_schema_registered_by_the_select() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let pid = std::process::id();
     let input = format!("tachyon-schema-in-{pid}");
     let avro = format!("tachyon-schema-avro-{pid}");
@@ -176,9 +174,16 @@ async fn live_the_reader_uses_the_schema_registered_by_the_select() {
     });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while writer_metrics.commits.load(std::sync::atomic::Ordering::Relaxed) < 1 {
+    while writer_metrics
+        .commits
+        .load(std::sync::atomic::Ordering::Relaxed)
+        < 1
+    {
         if writer_task.is_finished() {
-            panic!("el publicador terminó: {}", pipeline_died(writer_task.await));
+            panic!(
+                "el publicador terminó: {}",
+                pipeline_died(writer_task.await)
+            );
         }
         if std::time::Instant::now() > deadline {
             panic!("el publicador no registró ni commiteó");
@@ -226,7 +231,11 @@ async fn live_the_reader_uses_the_schema_registered_by_the_select() {
         .map(|row| row["order_id"].as_i64().unwrap_or_default())
         .collect();
     ids.sort();
-    assert_eq!(ids, vec![1, 2], "el lector no reconstruyó las filas: {rows:?}");
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "el lector no reconstruyó las filas: {rows:?}"
+    );
 
     let drifted = r#"{"type":"record","name":"tachyon","fields":[{"name":"order_id","type":"long"},{"name":"amount","type":"long"},{"name":"extra","type":"long"}]}"#;
     let err = register_topic_schema(REGISTRY, &avro, drifted).expect_err("schema incompatible");

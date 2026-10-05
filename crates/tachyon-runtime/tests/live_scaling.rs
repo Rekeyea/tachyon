@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use paimon::spec::{DataType as PDataType, BigIntType, DoubleType, VarCharType};
+use paimon::spec::{BigIntType, DataType as PDataType, DoubleType, VarCharType};
 use rdkafka::admin::{AdminClient, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
@@ -50,12 +50,10 @@ async fn recreate_topic(broker: &str) {
     let mut cc = ClientConfig::new();
     cc.set("bootstrap.servers", broker);
     let admin: AdminClient<DefaultClientContext> = cc.create().expect("admin client");
-    let _ = admin.delete_topics(&[ORDERS_TOPIC], &Default::default()).await;
-    let topic = NewTopic::new(
-        ORDERS_TOPIC,
-        NUM_PARTITIONS,
-        TopicReplication::Fixed(1),
-    );
+    let _ = admin
+        .delete_topics(&[ORDERS_TOPIC], &Default::default())
+        .await;
+    let topic = NewTopic::new(ORDERS_TOPIC, NUM_PARTITIONS, TopicReplication::Fixed(1));
     admin
         .create_topics(&[topic], &Default::default())
         .await
@@ -77,9 +75,7 @@ async fn produce_orders(producer: &FutureProducer) {
             "{{\"order_id\":{order_id},\"status\":\"{status}\",\"source_version\":{version},\"amount\":{amount}}}"
         );
         let key = order_id.to_string();
-        let record = FutureRecord::to(ORDERS_TOPIC)
-            .key(&key)
-            .payload(&payload);
+        let record = FutureRecord::to(ORDERS_TOPIC).key(&key).payload(&payload);
         producer
             .send(record, Duration::from_secs(5))
             .await
@@ -182,7 +178,10 @@ async fn live_scaling_two_instances_disjoint_partitions() {
             DB,
             TABLE,
             &[
-                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
+                (
+                    "order_id",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
                 ("status", PDataType::VarChar(VarCharType::string_type())),
                 ("source_version", PDataType::BigInt(BigIntType::new())),
                 ("amount", PDataType::Double(DoubleType::new())),
@@ -209,10 +208,8 @@ async fn live_scaling_two_instances_disjoint_partitions() {
     // instancia consume un subconjunto disjunto de claves.
     let select_sql = "SELECT order_id, status, source_version, amount \
                       FROM orders WHERE status <> 'cancelled'";
-    let input_schemas = HashMap::from([(
-        "orders".to_string(),
-        PreparedInput::json(orders_schema()),
-    )]);
+    let input_schemas =
+        HashMap::from([("orders".to_string(), PreparedInput::json(orders_schema()))]);
     let group_id = format!("tachyon-scaling-{}", std::process::id());
 
     let mut run_tasks = Vec::new();
@@ -234,7 +231,10 @@ async fn live_scaling_two_instances_disjoint_partitions() {
         let schemas = input_schemas.clone();
         let metrics = Arc::new(tachyon_metrics::InstanceMetrics::new());
         run_tasks.push(tokio::spawn(async move {
-            run_pipeline(&config, select_sql, &options, sink, &schemas, &metrics, None).await
+            run_pipeline(
+                &config, select_sql, &options, sink, &schemas, &metrics, None,
+            )
+            .await
         }));
     }
 
@@ -280,7 +280,10 @@ async fn live_scaling_two_instances_disjoint_partitions() {
 
     // Ambos pipelines siguen corriendo (streams infinitos).
     for (i, task) in run_tasks.iter().enumerate() {
-        assert!(!task.is_finished(), "la instancia {i} debe seguir corriendo");
+        assert!(
+            !task.is_finished(),
+            "la instancia {i} debe seguir corriendo"
+        );
     }
 
     // --- Limpieza ---

@@ -16,7 +16,9 @@ use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
+};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 /// Una tabla streaming (el esquema y el executor) para un input del pipeline.
@@ -27,8 +29,7 @@ pub type StreamTable = Arc<StreamingTable>;
 /// Devuelve un mapa `nombre_lógico -> StreamingTable`. La implementación de
 /// producción cablea el conector Redpanda; los tests inyectan una factory
 /// in-memory.
-pub type StreamTableFactory =
-    dyn Fn(&str, SchemaRef) -> Result<StreamTable> + Send + Sync;
+pub type StreamTableFactory = dyn Fn(&str, SchemaRef) -> Result<StreamTable> + Send + Sync;
 
 /// El resultado de ejecutar la transformación: un stream de `RecordBatch`
 /// (la salida transformada, lista para el sink).
@@ -198,8 +199,7 @@ mod tests {
     fn in_memory_factory(
         batches: &std::collections::HashMap<String, RecordBatch>,
     ) -> Box<dyn Fn(&str, SchemaRef) -> Result<StreamTable> + Send + Sync> {
-        let map: std::collections::HashMap<String, RecordBatch> =
-            batches.clone();
+        let map: std::collections::HashMap<String, RecordBatch> = batches.clone();
         Box::new(move |name, schema| {
             let batch = map
                 .get(name)
@@ -304,16 +304,16 @@ mod tests {
             orders_batch(),
         )]));
 
-        let stream = execute_query(
-            "SELECT status, amount FROM orders",
-            &inputs,
-            &factory,
-        )
-        .await
-        .expect("query de project");
+        let stream = execute_query("SELECT status, amount FROM orders", &inputs, &factory)
+            .await
+            .expect("query de project");
 
         let batches = collect_all(stream).await;
-        assert_eq!(total_rows(&batches), 4, "el project no cambia el nº de filas");
+        assert_eq!(
+            total_rows(&batches),
+            4,
+            "el project no cambia el nº de filas"
+        );
         // El schema de salida tiene solo las columnas proyectadas.
         let out_schema = batches[0].schema();
         let names: Vec<&str> = out_schema
@@ -460,7 +460,11 @@ mod tests {
             ],
         )
         .expect("rewrite");
-        assert!(!rewritten.sql.to_uppercase().contains("JOIN"), "{}", rewritten.sql);
+        assert!(
+            !rewritten.sql.to_uppercase().contains("JOIN"),
+            "{}",
+            rewritten.sql
+        );
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("order_id", DataType::Int64, false),

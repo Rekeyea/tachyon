@@ -14,7 +14,7 @@ use arrow::compute::take;
 use arrow::datatypes::{Field, SchemaRef};
 use futures::TryStreamExt;
 
-use crate::writer::{open_table, projection_schema};
+use crate::writer::{open_table_with, projection_schema};
 
 /// Clave de probe. El tipo es el de la columna, así que no se mezclan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -42,9 +42,10 @@ struct IndexedDimension {
 
 impl IndexedDimension {
     fn build(name: &str, batch: RecordBatch, key: &str, budget: u64) -> Result<Self> {
-        let key_index = batch.schema().index_of(key).map_err(|_| {
-            anyhow::anyhow!("la dimensión {name} no tiene la columna '{key}'")
-        })?;
+        let key_index = batch
+            .schema()
+            .index_of(key)
+            .map_err(|_| anyhow::anyhow!("la dimensión {name} no tiene la columna '{key}'"))?;
         let keys = keys_of(batch.column(key_index))
             .with_context(|| format!("la clave '{key}' de la dimensión {name}"))?;
         let mut index = HashMap::with_capacity(keys.len());
@@ -58,9 +59,7 @@ impl IndexedDimension {
         }
         let bytes = footprint(&batch, &index);
         if bytes > budget {
-            anyhow::bail!(
-                "la dimensión {name} ocupa {bytes} bytes y el presupuesto es {budget}"
-            );
+            anyhow::bail!("la dimensión {name} ocupa {bytes} bytes y el presupuesto es {budget}");
         }
         Ok(Self { index, batch })
     }
@@ -73,9 +72,10 @@ impl IndexedDimension {
         outputs: &[(String, String)],
         schema: &SchemaRef,
     ) -> Result<RecordBatch> {
-        let key_index = facts.schema().index_of(fact_key).map_err(|_| {
-            anyhow::anyhow!("el stream no tiene la columna '{fact_key}'")
-        })?;
+        let key_index = facts
+            .schema()
+            .index_of(fact_key)
+            .map_err(|_| anyhow::anyhow!("el stream no tiene la columna '{fact_key}'"))?;
         let fact_keys = keys_of(facts.column(key_index))?;
         if keep_misses {
             let mut dim_rows = UInt32Builder::with_capacity(facts.num_rows());
@@ -97,7 +97,9 @@ impl IndexedDimension {
         let mut dim_rows: Vec<u32> = Vec::new();
         for (row, key) in fact_keys.iter().enumerate() {
             let Some(key) = key else { continue };
-            let Some(dim_row) = self.index.get(key) else { continue };
+            let Some(dim_row) = self.index.get(key) else {
+                continue;
+            };
             fact_rows.push(row as u32);
             dim_rows.push(*dim_row);
         }
@@ -139,7 +141,21 @@ impl DimensionCache {
         columns: &[String],
         budget: u64,
     ) -> Result<Self> {
-        let table = open_table(warehouse, database, table_name)
+        let catalog = HashMap::from([(String::from("warehouse"), warehouse.to_string())]);
+        Self::load_with(&catalog, database, table_name, name, key, columns, budget).await
+    }
+
+    /// Como `load`, con el mapa de catálogo (warehouse y, si hace falta, rustfs).
+    pub async fn load_with(
+        catalog: &HashMap<String, String>,
+        database: &str,
+        table_name: &str,
+        name: &str,
+        key: &str,
+        columns: &[String],
+        budget: u64,
+    ) -> Result<Self> {
+        let table = open_table_with(catalog, database, table_name)
             .await
             .with_context(|| format!("abriendo la dimensión {name}"))?;
         let (snapshot_id, batch) = read_snapshot(&table, name, columns).await?;
@@ -248,7 +264,10 @@ async fn read_snapshot(
     let stream = read
         .to_arrow(&plan.splits())
         .context("leyendo la dimensión")?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await.context("batches de la dimensión")?;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .context("batches de la dimensión")?;
     let batch = if batches.is_empty() {
         RecordBatch::new_empty(schema)
     } else {
@@ -303,10 +322,7 @@ fn keys_of(column: &ArrayRef) -> Result<Vec<Option<LookupKey>>> {
             })
             .collect());
     }
-    anyhow::bail!(
-        "es {}; hace falta Int64, Int32 o Utf8",
-        column.data_type()
-    )
+    anyhow::bail!("es {}; hace falta Int64, Int32 o Utf8", column.data_type())
 }
 
 fn footprint(batch: &RecordBatch, index: &HashMap<LookupKey, u32>) -> u64 {
@@ -359,7 +375,10 @@ mod tests {
             ])),
             vec![
                 Arc::new(Int64Array::from(
-                    ids.iter().enumerate().map(|(i, _)| i as i64 + 1).collect::<Vec<_>>(),
+                    ids.iter()
+                        .enumerate()
+                        .map(|(i, _)| i as i64 + 1)
+                        .collect::<Vec<_>>(),
                 )),
                 Arc::new(Int64Array::from(ids.to_vec())),
             ],

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use aws_sdk_sqs::Client;
 
-use crate::consumer::{RecordStream, ReceiverStream};
+use crate::consumer::{ReceiverStream, RecordStream};
 use crate::record::SourceRecord;
 
 /// Tope de mensajes por `ReceiveMessage` (límite de la API).
@@ -83,7 +83,15 @@ impl SqsSource {
         let visibility_timeout = self.visibility_timeout;
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
-            sqs_poll_loop(client, queue_url, wait, max_messages, visibility_timeout, tx).await;
+            sqs_poll_loop(
+                client,
+                queue_url,
+                wait,
+                max_messages,
+                visibility_timeout,
+                tx,
+            )
+            .await;
         });
         Box::pin(ReceiverStream { rx })
     }
@@ -99,8 +107,8 @@ async fn sqs_poll_loop(
 ) {
     let wait_seconds = wait.as_secs().clamp(1, MAX_WAIT_SECONDS as u64) as i32;
     let max_messages = max_messages.min(MAX_MESSAGES as usize) as i32;
-    let visibility = visibility_timeout
-        .map(|t| t.as_secs().clamp(0, MAX_VISIBILITY_SECONDS as u64) as i32);
+    let visibility =
+        visibility_timeout.map(|t| t.as_secs().clamp(0, MAX_VISIBILITY_SECONDS as u64) as i32);
     tracing::info!(queue = %queue_url, wait_seconds, "consumo SQS arrancado");
     loop {
         if tx.is_closed() {

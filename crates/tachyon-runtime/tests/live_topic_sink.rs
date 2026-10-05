@@ -133,7 +133,9 @@ fn read_committed(topic: &str, wait: Duration) -> Vec<(String, String)> {
     rows
 }
 
-fn pipeline_died(result: Result<Result<tachyon_runtime::PipelineHandle, anyhow::Error>, tokio::task::JoinError>) -> String {
+fn pipeline_died(
+    result: Result<Result<tachyon_runtime::PipelineHandle, anyhow::Error>, tokio::task::JoinError>,
+) -> String {
     match result {
         Ok(Err(err)) => format!("{err:#}"),
         Ok(Ok(_)) => "terminó sin error".to_string(),
@@ -153,9 +155,7 @@ fn options(id: &str) -> RunOptions {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn live_topic_publishes_once_and_a_restart_does_not_repeat() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let pid = std::process::id();
     let input = format!("tachyon-topic-in-{pid}");
     let output = format!("tachyon-topic-out-{pid}");
@@ -174,9 +174,7 @@ async fn live_topic_publishes_once_and_a_restart_does_not_repeat() {
         let metrics = metrics.clone();
         let opt = opt.clone();
         let output = output.clone();
-        async move {
-            run_topic_pipeline(&cfg, SQL, &opt, &output, "order_id", &codecs, &metrics).await
-        }
+        async move { run_topic_pipeline(&cfg, SQL, &opt, &output, "order_id", &codecs, &metrics).await }
     });
 
     let topic = output.clone();
@@ -201,9 +199,7 @@ async fn live_topic_publishes_once_and_a_restart_does_not_repeat() {
         let metrics = metrics.clone();
         let opt = opt.clone();
         let output = output.clone();
-        async move {
-            run_topic_pipeline(&cfg, SQL, &opt, &output, "order_id", &codecs, &metrics).await
-        }
+        async move { run_topic_pipeline(&cfg, SQL, &opt, &output, "order_id", &codecs, &metrics).await }
     });
     tokio::time::sleep(Duration::from_secs(4)).await;
     if task.is_finished() {
@@ -220,9 +216,7 @@ async fn live_topic_publishes_once_and_a_restart_does_not_repeat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn live_topic_hides_rows_until_the_transaction_commits() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let pid = std::process::id();
     let input = format!("tachyon-topic-open-in-{pid}");
     let output = format!("tachyon-topic-open-out-{pid}");
@@ -241,20 +235,22 @@ async fn live_topic_hides_rows_until_the_transaction_commits() {
         let metrics = metrics.clone();
         let opt = opt.clone();
         let output = output.clone();
-        async move {
-            run_topic_pipeline(&cfg, SQL, &opt, &output, "order_id", &codecs, &metrics).await
-        }
+        async move { run_topic_pipeline(&cfg, SQL, &opt, &output, "order_id", &codecs, &metrics).await }
     });
     tokio::time::sleep(Duration::from_secs(3)).await;
     if task.is_finished() {
-        panic!("el pipeline cayó antes del abort: {}", pipeline_died(task.await));
+        panic!(
+            "el pipeline cayó antes del abort: {}",
+            pipeline_died(task.await)
+        );
     }
     task.abort();
     tokio::time::sleep(Duration::from_secs(1)).await;
     let topic = output.clone();
-    let hidden = tokio::task::spawn_blocking(move || read_committed(&topic, Duration::from_secs(5)))
-        .await
-        .expect("lectura");
+    let hidden =
+        tokio::task::spawn_blocking(move || read_committed(&topic, Duration::from_secs(5)))
+            .await
+            .expect("lectura");
     assert!(
         hidden.is_empty(),
         "una transacción abierta se vio en el topic: {hidden:?}"
@@ -274,5 +270,9 @@ async fn live_topic_hides_rows_until_the_transaction_commits() {
         panic!("el reinicio terminó: {}", pipeline_died(task.await));
     }
     task.abort();
-    assert_eq!(got.len(), 2, "el reinicio no publicó el lote una vez: {got:?}");
+    assert_eq!(
+        got.len(),
+        2,
+        "el reinicio no publicó el lote una vez: {got:?}"
+    );
 }

@@ -22,7 +22,7 @@ use rdkafka::{Offset, TopicPartitionList};
 use tachyon_config::{PayloadFormat, PipelineConfig};
 use tachyon_metrics::{InstanceMetrics, MetricsServer};
 use tachyon_sink::redpanda::RedpandaSink;
-use tachyon_sink::writer::{open_table, stream_schema, tail_appends};
+use tachyon_sink::writer::{open_table_with, stream_schema, tail_appends};
 use tachyon_source::{
     avro_json_from_arrow, encode_envelopes, parse_avro_schema, register_topic_schema,
 };
@@ -65,14 +65,13 @@ pub async fn run_table_stream(
     }
 
     let (database, table_name) = split_table(&table_id)?;
-    let warehouse = config
+    let catalog = config
         .connectors
         .paimon
         .as_ref()
         .context("leer una tabla requiere connectors.paimon")?
-        .warehouse
-        .clone();
-    let table = open_table(&warehouse, &database, &table_name)
+        .catalog_options();
+    let table = open_table_with(&catalog, &database, &table_name)
         .await
         .with_context(|| format!("abriendo {table_id}"))?;
     let columns = match parsed.columns {
@@ -201,12 +200,9 @@ pub async fn run_table_stream(
             rows += publish(&sink, &wire, key, batch).await?;
         }
         let payload = tail.through.to_string().into_bytes();
-        sink.write_to(
-            &cursor_topic,
-            &[(options.commit_user.clone(), payload)],
-        )
-        .await
-        .context("publicando el cursor")?;
+        sink.write_to(&cursor_topic, &[(options.commit_user.clone(), payload)])
+            .await
+            .context("publicando el cursor")?;
         sink.commit().await?;
         cursor = tail.through;
         metrics.inc_rows_read(rows as u64);
@@ -229,7 +225,12 @@ enum TopicWire {
     },
 }
 
-async fn publish(sink: &RedpandaSink, wire: &TopicWire, key: &str, batch: &RecordBatch) -> Result<usize> {
+async fn publish(
+    sink: &RedpandaSink,
+    wire: &TopicWire,
+    key: &str,
+    batch: &RecordBatch,
+) -> Result<usize> {
     if batch.num_rows() == 0 {
         return Ok(0);
     }
@@ -367,9 +368,7 @@ fn read_cursor(brokers: &str, topic: &str, commit_user: &str) -> Result<i64> {
                     .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                     .unwrap_or_default();
                 if key == commit_user {
-                    let payload = message
-                        .payload()
-                        .context("el cursor no tiene payload")?;
+                    let payload = message.payload().context("el cursor no tiene payload")?;
                     let text = std::str::from_utf8(payload)
                         .with_context(|| format!("cursor de '{topic}' no es utf-8"))?;
                     cursor = Some(text.parse::<i64>().with_context(|| {

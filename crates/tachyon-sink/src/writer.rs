@@ -29,13 +29,13 @@
 //! lee el último identifier commiteado y sus offsets, y el consumo se
 //! re-posiciona exactamente ahí: sin pérdida ni duplicados.
 
-use std::collections::HashMap;
 use anyhow::{Context, Result};
 use arrow::array::{Array, RecordBatch};
 use paimon::catalog::Identifier;
 use paimon::spec::CommitKind;
 use paimon::table::IncrementalScanMode;
 use paimon::{CatalogFactory, Options};
+use std::collections::HashMap;
 use tachyon_core::{
     parse_checkpoint, partition_tickets, CheckpointBody, InputPositions, PartitionTicketV1,
     SourceOffsets, MAX_SIDECAR_BYTES,
@@ -88,11 +88,28 @@ impl PaimonSink {
         bucket: i32,
         sequence_field: Option<&str>,
     ) -> Result<Self> {
-        let options = Options::from_map(
-            [(String::from("warehouse"), warehouse.to_string())]
-                .into_iter()
-                .collect(),
-        );
+        Self::open_with(
+            warehouse_options(warehouse),
+            database,
+            table,
+            key_column,
+            bucket,
+            sequence_field,
+        )
+        .await
+    }
+
+    /// Como `open`, con las opciones del catálogo (warehouse y, si hace falta,
+    /// endpoint de rustfs).
+    pub async fn open_with(
+        options: HashMap<String, String>,
+        database: &str,
+        table: &str,
+        key_column: &str,
+        bucket: i32,
+        sequence_field: Option<&str>,
+    ) -> Result<Self> {
+        let options = Options::from_map(options);
         let catalog = CatalogFactory::create(options)
             .await
             .context("creando catalog Paimon")?;
@@ -233,7 +250,10 @@ impl PaimonSink {
             .map_err(|e| anyhow::anyhow!("checkpoint {identifier} corrupto ({path}): {e}"))?;
         self.next_identifier = identifier + 1;
         match body {
-            CheckpointBody::Offsets(offsets) => Ok(Recovered::PassThrough { identifier, offsets }),
+            CheckpointBody::Offsets(offsets) => Ok(Recovered::PassThrough {
+                identifier,
+                offsets,
+            }),
             CheckpointBody::Positions(positions) => Ok(Recovered::Positions {
                 identifier,
                 positions,
@@ -271,13 +291,24 @@ impl PaimonSink {
     /// caso no se escribe sidecar: paimon 0.3 no crea snapshot con mensajes
     /// vacíos, y un archivo sin snapshot no es un commit.
     pub async fn commit_checkpoint(&mut self, body: &CheckpointBody) -> Result<Option<i64>> {
-        let messages = self.writer.prepare_commit().await.context("prepare_commit")?;
+        let messages = self
+            .writer
+            .prepare_commit()
+            .await
+            .context("prepare_commit")?;
         if messages.is_empty() {
             return Ok(None);
         }
         let identifier = self.next_identifier;
-        publish_checkpoint(&self.table, &self.commit_user, &self.committer, messages, identifier, body)
-            .await?;
+        publish_checkpoint(
+            &self.table,
+            &self.commit_user,
+            &self.committer,
+            messages,
+            identifier,
+            body,
+        )
+        .await?;
         self.next_identifier = identifier + 1;
         Ok(Some(identifier))
     }
@@ -346,7 +377,11 @@ impl PaimonSink {
     /// para el checkpoint de la Fase 1: prepare en la barrier, commit al
     /// completar).
     pub async fn commit(&mut self) -> Result<()> {
-        let messages = self.writer.prepare_commit().await.context("prepare_commit")?;
+        let messages = self
+            .writer
+            .prepare_commit()
+            .await
+            .context("prepare_commit")?;
         self.committer
             .commit(messages)
             .await
@@ -356,14 +391,14 @@ impl PaimonSink {
 
     /// Solo la fase prepare (Fase 1: barrier de checkpoint).
     pub async fn prepare(&mut self) -> Result<Vec<paimon::table::CommitMessage>> {
-        self.writer
-            .prepare_commit()
-            .await
-            .context("prepare_commit")
+        self.writer.prepare_commit().await.context("prepare_commit")
     }
 
     /// Solo la fase commit (Fase 1: completado del checkpoint).
-    pub async fn finish_commit(&mut self, messages: Vec<paimon::table::CommitMessage>) -> Result<()> {
+    pub async fn finish_commit(
+        &mut self,
+        messages: Vec<paimon::table::CommitMessage>,
+    ) -> Result<()> {
         self.committer
             .commit(messages)
             .await
@@ -511,7 +546,12 @@ impl PaimonWriterHalf {
                 let mut replies = Vec::with_capacity(shards.len());
                 for shard in shards.iter_mut() {
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    if shard.tx.send(crate::shard::ShardMsg::Rotate(tx)).await.is_err() {
+                    if shard
+                        .tx
+                        .send(crate::shard::ShardMsg::Rotate(tx))
+                        .await
+                        .is_err()
+                    {
                         return Err(shard_failure(shard).await);
                     }
                     replies.push(rx);
@@ -683,7 +723,10 @@ pub struct CheckpointEpoch {
 /// Último identifier commiteado por este `commit_user` (recorre los
 /// snapshots del más nuevo al más viejo). Ignora los commits batch
 /// (`i64::MAX`), que no son checkpoints.
-async fn last_committed_identifier(table: &paimon::table::Table, commit_user: &str) -> Result<Option<i64>> {
+async fn last_committed_identifier(
+    table: &paimon::table::Table,
+    commit_user: &str,
+) -> Result<Option<i64>> {
     let snapshots = table.snapshot_manager();
     let Some(latest) = snapshots
         .get_latest_snapshot_id()
@@ -702,9 +745,7 @@ async fn last_committed_identifier(table: &paimon::table::Table, commit_user: &s
             .get_snapshot(id)
             .await
             .with_context(|| format!("leyendo snapshot {id}"))?;
-        if snapshot.commit_user() == commit_user
-            && snapshot.commit_identifier() != i64::MAX
-        {
+        if snapshot.commit_user() == commit_user && snapshot.commit_identifier() != i64::MAX {
             return Ok(Some(snapshot.commit_identifier()));
         }
     }
@@ -736,9 +777,12 @@ async fn write_partition_tickets(
     commit_user: &str,
 ) -> Result<()> {
     for ticket in partition_tickets(checkpoint, commit_user) {
-        let bytes = ticket
-            .to_bytes()
-            .map_err(|e| anyhow::anyhow!("serializando la ficha de la partición {}: {e}", ticket.partition))?;
+        let bytes = ticket.to_bytes().map_err(|e| {
+            anyhow::anyhow!(
+                "serializando la ficha de la partición {}: {e}",
+                ticket.partition
+            )
+        })?;
         if bytes.len() > MAX_SIDECAR_BYTES {
             anyhow::bail!(
                 "la ficha de la partición {} pesa {} bytes, tope {MAX_SIDECAR_BYTES}",
@@ -906,43 +950,42 @@ async fn create_test_table_with(
         .create_table(&identifier, schema, false)
         .await
         .context("creando tabla")?;
-    catalog
-        .get_table(&identifier)
-        .await
-        .context("get_table")
+    catalog.get_table(&identifier).await.context("get_table")
 }
 
 /// Lee el contenido actual de una tabla Paimon (último snapshot).
 /// Utilidad para tests y verificación post-commit.
-pub async fn read_table_rows(
-    table: &paimon::table::Table,
-) -> Result<Vec<RecordBatch>> {
+pub async fn read_table_rows(table: &paimon::table::Table) -> Result<Vec<RecordBatch>> {
     let read_builder = table.new_read_builder();
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.context("scan.plan")?;
     let read = read_builder.new_read().context("new_read")?;
-    let stream = read
-        .to_arrow(&plan.splits())
-        .context("to_arrow")?;
+    let stream = read.to_arrow(&plan.splits()).context("to_arrow")?;
     use futures::TryStreamExt;
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .context("leyendo batches")?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await.context("leyendo batches")?;
     Ok(batches)
 }
 
 /// Abre una tabla existente para leerla. No crea un writer.
+fn warehouse_options(warehouse: &str) -> HashMap<String, String> {
+    HashMap::from([(String::from("warehouse"), warehouse.to_string())])
+}
+
 pub async fn open_table(
     warehouse: &str,
     database: &str,
     table: &str,
 ) -> Result<paimon::table::Table> {
-    let options = Options::from_map(
-        [(String::from("warehouse"), warehouse.to_string())]
-            .into_iter()
-            .collect(),
-    );
+    open_table_with(&warehouse_options(warehouse), database, table).await
+}
+
+/// Abre una tabla con el mapa de catálogo completo (warehouse + S3/rustfs).
+pub async fn open_table_with(
+    options: &HashMap<String, String>,
+    database: &str,
+    table: &str,
+) -> Result<paimon::table::Table> {
+    let options = Options::from_map(options.clone());
     let catalog = CatalogFactory::create(options)
         .await
         .context("creando catalog Paimon")?;
@@ -1023,12 +1066,12 @@ fn change_source(table: &paimon::table::Table) -> Result<ChangeRead> {
         ("none", false) => Ok(ChangeRead::Append),
         ("none", true) => Ok(ChangeRead::ValueKind),
         ("input", false) => Ok(ChangeRead::Changelog),
-        ("input", true) => anyhow::bail!(
-            "Paimon no combina rowkind.field con changelog-producer=input"
-        ),
-        (other, _) => anyhow::bail!(
-            "changelog-producer '{other}' no lo lee la cola; hace falta input o none"
-        ),
+        ("input", true) => {
+            anyhow::bail!("Paimon no combina rowkind.field con changelog-producer=input")
+        }
+        (other, _) => {
+            anyhow::bail!("changelog-producer '{other}' no lo lee la cola; hace falta input o none")
+        }
     }
 }
 
@@ -1059,12 +1102,7 @@ fn rowkind_column(table: &paimon::table::Table, field: &str) -> Result<usize> {
     if !is_string_type(column.data_type()) {
         anyhow::bail!("rowkind '{field}' tiene que ser texto");
     }
-    if table
-        .schema()
-        .primary_keys()
-        .iter()
-        .any(|key| key == field)
-    {
+    if table.schema().primary_keys().iter().any(|key| key == field) {
         anyhow::bail!("rowkind '{field}' no puede ser parte de la clave");
     }
     Ok(index)
@@ -1075,9 +1113,9 @@ pub(crate) fn prepare_batch<'a>(
     rowkind: &Option<(String, usize, RowkindWrite)>,
 ) -> Result<std::borrow::Cow<'a, RecordBatch>> {
     match rowkind {
-        Some((field, index, RowkindWrite::Stamp)) => {
-            Ok(std::borrow::Cow::Owned(stamp_rowkind(batch, field, *index)?))
-        }
+        Some((field, index, RowkindWrite::Stamp)) => Ok(std::borrow::Cow::Owned(stamp_rowkind(
+            batch, field, *index,
+        )?)),
         Some((field, index, RowkindWrite::Native)) => {
             check_rowkind_column(batch, field, *index)?;
             Ok(std::borrow::Cow::Borrowed(batch))
@@ -1110,8 +1148,11 @@ fn stamp_rowkind(batch: &RecordBatch, field: &str, index: usize) -> Result<Recor
         false,
     )));
     columns.push(std::sync::Arc::new(arrow::array::Int8Array::from(kinds)));
-    RecordBatch::try_new(std::sync::Arc::new(arrow::datatypes::Schema::new(fields)), columns)
-        .context("agregando _VALUE_KIND")
+    RecordBatch::try_new(
+        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+        columns,
+    )
+    .context("agregando _VALUE_KIND")
 }
 
 fn check_rowkind_column(batch: &RecordBatch, field: &str, index: usize) -> Result<()> {
@@ -1274,7 +1315,10 @@ pub async fn tail_appends(
                 through = id;
             }
             CommitKind::OVERWRITE => {
-                tracing::info!(snapshot = id, "snapshot OVERWRITE; la cola se detiene antes");
+                tracing::info!(
+                    snapshot = id,
+                    "snapshot OVERWRITE; la cola se detiene antes"
+                );
                 blocked_at = Some(id);
                 break;
             }
@@ -1332,6 +1376,103 @@ pub async fn tail_appends(
     })
 }
 
+/// El snapshot `after + 1`, si existe.
+///
+/// El loop de una tabla aplica un snapshot y recién ahí puede commitear. Un
+/// rango de varios snapshots mezclaría event times antes de mover el watermark.
+/// OVERWRITE sin changelog no se publica: `blocked_at` es ese id.
+pub async fn tail_next_append(
+    table: &paimon::table::Table,
+    after: i64,
+    columns: &[String],
+) -> Result<AppendTail> {
+    if publishes_rowkind(table)? {
+        anyhow::bail!(
+            "el source de tabla en el loop lee appends; una tabla con changelog no entra en este corte"
+        );
+    }
+    if columns.is_empty() {
+        anyhow::bail!("la proyección de la tabla está vacía");
+    }
+    let manager = table.snapshot_manager();
+    let Some(latest) = manager
+        .get_latest_snapshot_id()
+        .await
+        .context("leyendo el último snapshot")?
+    else {
+        return Ok(AppendTail {
+            through: after,
+            batches: Vec::new(),
+            blocked_at: None,
+        });
+    };
+    if latest <= after {
+        return Ok(AppendTail {
+            through: after,
+            batches: Vec::new(),
+            blocked_at: None,
+        });
+    }
+    let earliest = manager
+        .earliest_snapshot_id()
+        .await
+        .context("leyendo el snapshot más viejo")?
+        .unwrap_or(latest);
+    if after < earliest - 1 {
+        anyhow::bail!(
+            "el cursor {after} quedó atrás del snapshot {earliest}; no se puede reanudar sin releer la tabla"
+        );
+    }
+    let id = after + 1;
+    let snapshot = manager
+        .get_snapshot(id)
+        .await
+        .with_context(|| format!("leyendo snapshot {id}"))?;
+    match snapshot.commit_kind() {
+        CommitKind::OVERWRITE => {
+            return Ok(AppendTail {
+                through: after,
+                batches: Vec::new(),
+                blocked_at: Some(id),
+            });
+        }
+        CommitKind::APPEND | CommitKind::COMPACT | CommitKind::ANALYZE => {}
+    }
+    let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+    let mut builder = table.new_read_builder();
+    builder
+        .with_projection(&refs)
+        .map_err(|err| anyhow::anyhow!("proyección: {err}"))?;
+    let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, after, id);
+    let plan = scan
+        .plan()
+        .await
+        .with_context(|| format!("plan incremental ({after}, {id}]"))?;
+    if plan.data_splits().is_empty() {
+        return Ok(AppendTail {
+            through: id,
+            batches: Vec::new(),
+            blocked_at: None,
+        });
+    }
+    let read = builder
+        .new_read()
+        .map_err(|err| anyhow::anyhow!("new_read: {err}"))?;
+    let stream = read
+        .to_incremental_arrow(&plan)
+        .map_err(|err| anyhow::anyhow!("leyendo el delta: {err}"))?;
+    use futures::TryStreamExt;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|err| anyhow::anyhow!("leyendo batches del delta: {err}"))?;
+    Ok(AppendTail {
+        through: id,
+        batches,
+        blocked_at: None,
+    })
+}
+
 #[cfg(test)]
 mod tail_tests {
     use super::*;
@@ -1341,7 +1482,11 @@ mod tail_tests {
     use std::sync::Arc;
 
     async fn kinds(table: &paimon::table::Table) -> String {
-        let snapshots = table.snapshot_manager().list_all().await.expect("snapshots");
+        let snapshots = table
+            .snapshot_manager()
+            .list_all()
+            .await
+            .expect("snapshots");
         snapshots
             .iter()
             .map(|snapshot| format!("{}={}", snapshot.id(), snapshot.commit_kind()))
@@ -1419,8 +1564,14 @@ mod tail_tests {
             "default",
             "paid_orders",
             &[
-                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-                ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+                (
+                    "order_id",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
+                (
+                    "amount",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
                 ("note", PDataType::VarChar(VarCharType::string_type())),
             ],
             &["order_id"],
@@ -1439,7 +1590,11 @@ mod tail_tests {
         let first = tail_appends(&table, 0, &columns).await.expect("cola");
         let first_kinds = kinds(&table).await;
         assert!(first.blocked_at.is_none(), "{first_kinds}");
-        assert_eq!(pairs(&first.batches), vec![(1, 10), (2, 20)], "{first_kinds}");
+        assert_eq!(
+            pairs(&first.batches),
+            vec![(1, 10), (2, 20)],
+            "{first_kinds}"
+        );
 
         let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None).expect("sink");
         sink.write(&batch(&[(3, 30, "c")])).await.expect("write");
@@ -1513,7 +1668,11 @@ mod tail_tests {
                 .downcast_ref::<Int64Array>()
                 .expect("amount");
             for row in 0..batch.num_rows() {
-                out.push((kinds.value(row).to_string(), ids.value(row), amounts.value(row)));
+                out.push((
+                    kinds.value(row).to_string(),
+                    ids.value(row),
+                    amounts.value(row),
+                ));
             }
         }
         out
@@ -1532,14 +1691,21 @@ mod tail_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("warehouse");
         let warehouse = dir.to_string_lossy().to_string();
-        let op = PDataType::VarChar(VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap());
+        let op =
+            PDataType::VarChar(VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap());
         let table = create_test_table_with(
             &warehouse,
             "default",
             "paid_orders",
             &[
-                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-                ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+                (
+                    "order_id",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
+                (
+                    "amount",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
                 ("op", op),
             ],
             &["order_id"],
@@ -1557,8 +1723,14 @@ mod tail_tests {
             "default",
             "plain_orders",
             &[
-                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-                ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+                (
+                    "order_id",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
+                (
+                    "amount",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
             ],
             &["order_id"],
             1,
@@ -1569,7 +1741,10 @@ mod tail_tests {
         let rejected = PaimonSink::from_table(plain, "order_id", 1, None)
             .expect("sink")
             .align_rowkind(Some("op"));
-        assert!(rejected.is_err(), "una tabla sin changelog no acepta rowkind");
+        assert!(
+            rejected.is_err(),
+            "una tabla sin changelog no acepta rowkind"
+        );
 
         let mut sink = PaimonSink::from_table(table.clone(), "order_id", 1, None)
             .expect("sink")
@@ -1584,10 +1759,7 @@ mod tail_tests {
         assert!(first.blocked_at.is_none(), "{first_kinds}");
         assert_eq!(
             changes(&first.batches),
-            vec![
-                ("+I".to_string(), 1, 10),
-                ("+I".to_string(), 2, 20),
-            ],
+            vec![("+I".to_string(), 1, 10), ("+I".to_string(), 2, 20),],
             "{first_kinds}"
         );
         let published = first.batches.first().expect("filas");
@@ -1614,10 +1786,7 @@ mod tail_tests {
         assert!(second.blocked_at.is_none(), "{second_kinds}");
         assert_eq!(
             changes(&second.batches),
-            vec![
-                ("-U".to_string(), 1, 10),
-                ("+U".to_string(), 1, 30),
-            ],
+            vec![("-U".to_string(), 1, 10), ("+U".to_string(), 1, 30),],
             "kinds={second_kinds} through={}",
             second.through
         );
@@ -1675,16 +1844,21 @@ mod tail_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("warehouse");
         let warehouse = dir.to_string_lossy().to_string();
-        let op = PDataType::VarChar(
-            VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap(),
-        );
+        let op =
+            PDataType::VarChar(VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap());
         let table = create_test_table_with(
             &warehouse,
             "default",
             "native_orders",
             &[
-                ("order_id", PDataType::BigInt(BigIntType::with_nullable(false))),
-                ("amount", PDataType::BigInt(BigIntType::with_nullable(false))),
+                (
+                    "order_id",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
+                (
+                    "amount",
+                    PDataType::BigInt(BigIntType::with_nullable(false)),
+                ),
                 ("op", op),
             ],
             &["order_id"],
@@ -1707,10 +1881,7 @@ mod tail_tests {
         let first_kinds = kinds(&table).await;
         assert_eq!(
             changes(&first.batches),
-            vec![
-                ("+I".to_string(), 1, 10),
-                ("+I".to_string(), 2, 20),
-            ],
+            vec![("+I".to_string(), 1, 10), ("+I".to_string(), 2, 20),],
             "{first_kinds}"
         );
 

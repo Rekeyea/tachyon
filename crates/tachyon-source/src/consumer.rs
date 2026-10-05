@@ -95,12 +95,22 @@ impl CopiedCursor {
     }
 
     fn get(&self, partition: i32) -> Option<i64> {
-        self.0.lock().expect("lock del cursor").copied.get(&partition).copied()
+        self.0
+            .lock()
+            .expect("lock del cursor")
+            .copied
+            .get(&partition)
+            .copied()
     }
 
     /// Primer offset que este proceso leyó de `partition` (ver `Frontier`).
     pub fn origin(&self, partition: i32) -> Option<i64> {
-        self.0.lock().expect("lock del cursor").origin.get(&partition).copied()
+        self.0
+            .lock()
+            .expect("lock del cursor")
+            .origin
+            .get(&partition)
+            .copied()
     }
 
     fn set_origin(&self, partition: i32, start: i64) {
@@ -359,7 +369,6 @@ impl NativeConsumer {
         }
         Ok(())
     }
-
 }
 
 /// `(low, high)` watermark de una partición (FFI directo). Función libre (no
@@ -383,7 +392,10 @@ fn ffi_watermarks(
         )
     };
     if err != rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
-        return Err(format!("watermarks (partición {partition}): {}", err_str(err)));
+        return Err(format!(
+            "watermarks (partición {partition}): {}",
+            err_str(err)
+        ));
     }
     Ok((low, high))
 }
@@ -397,7 +409,10 @@ fn ffi_seek(
 ) -> Result<(), String> {
     let err = unsafe { rdsys::rd_kafka_seek(rkt, partition, offset, timeout_ms) };
     if err != rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
-        return Err(format!("seek (partición {partition}, offset {offset}): {}", err_str(err)));
+        return Err(format!(
+            "seek (partición {partition}, offset {offset}): {}",
+            err_str(err)
+        ));
     }
     Ok(())
 }
@@ -766,7 +781,11 @@ unsafe extern "C" fn native_rebalance_cb(
         state.verified.clear();
         state.expect.clear();
         if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS {
-            let n = if partitions.is_null() { 0 } else { (*partitions).cnt };
+            let n = if partitions.is_null() {
+                0
+            } else {
+                (*partitions).cnt
+            };
             tracing::info!(partitions = n, "rebalance: asignación de particiones");
             position_assignment(state, partitions);
             rdsys::rd_kafka_assign(rk, partitions);
@@ -783,7 +802,10 @@ unsafe extern "C" fn native_rebalance_cb(
     }
     let ids = partition_ids(partitions);
     if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS {
-        tracing::info!(partitions = ids.len(), "rebalance: asignación de particiones");
+        tracing::info!(
+            partitions = ids.len(),
+            "rebalance: asignación de particiones"
+        );
         state.at_end.clear();
         rdsys::rd_kafka_assign(rk, partitions);
         // Pausa local hasta que el poll, entre llamadas, decida el seek.
@@ -796,7 +818,10 @@ unsafe extern "C" fn native_rebalance_cb(
         state.live.clear();
         state.assign_gen = state.assign_gen.wrapping_add(1);
     } else {
-        tracing::info!(partitions = ids.len(), "rebalance: revocación de particiones");
+        tracing::info!(
+            partitions = ids.len(),
+            "rebalance: revocación de particiones"
+        );
         // Publica lo ya copiado en este poll antes de soltar el dueño.
         state.flush_local_admitted();
         if let Some(handoff) = &state.handoff {
@@ -832,7 +857,10 @@ unsafe fn position_assignment(
         // Lo ya copiado en el proceso lo resuelve `align_with_cursor` (seek
         // al primer mensaje: ahí siempre hay mensajes, el dueño anterior los
         // estaba leyendo). Acá solo el checkpoint.
-        let copied = state.cursor.as_ref().and_then(|cursor| cursor.get(elem.partition));
+        let copied = state
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.get(elem.partition));
         if copied.is_none() {
             if let Some(start) = state.resume.pending_for(elem.partition) {
                 elem.offset = start;
@@ -1042,7 +1070,9 @@ impl RdkafkaSource {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.commit_tx
             .send(PollCommand::GroupMetadata { reply: reply_tx })
-            .map_err(|_| anyhow::anyhow!("task de poll no disponible para el metadata del grupo"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("task de poll no disponible para el metadata del grupo")
+            })?;
         let result = tokio::time::timeout(Duration::from_secs(10), reply_rx)
             .await
             .map_err(|_| anyhow::anyhow!("timeout esperando el metadata del grupo"))?
@@ -1089,7 +1119,11 @@ impl RdkafkaSource {
             .take()
             .expect("canal de commit presente");
         let resume = ResumeFilter::new(
-            self.resume.lock().expect("lock de resume").take().unwrap_or_default(),
+            self.resume
+                .lock()
+                .expect("lock de resume")
+                .take()
+                .unwrap_or_default(),
         );
         let handoff = self.handoff.lock().expect("lock del handoff").take();
         let cursor = self.cursor.lock().expect("lock del cursor").take();
@@ -1401,7 +1435,12 @@ impl ResumeFilter {
         ffi_seek(rkt, partition, target, timeout_ms).map_err(|e| {
             format!("seek al checkpoint falló (partición {partition}, offset {target}): {e}")
         })?;
-        tracing::info!(partition, from = offset, to = target, "seek al offset del checkpoint");
+        tracing::info!(
+            partition,
+            from = offset,
+            to = target,
+            "seek al offset del checkpoint"
+        );
         self.pending.insert(partition, target);
         Ok(false)
     }
@@ -1415,7 +1454,11 @@ impl ResumeFilter {
     /// Otro consumidor del proceso ya entregó `partition` hasta `copied`: si
     /// el checkpoint pendiente es anterior, ya no hay que volver a él.
     fn covered(&mut self, partition: i32, copied: i64) {
-        if self.pending.get(&partition).is_some_and(|&next| next <= copied) {
+        if self
+            .pending
+            .get(&partition)
+            .is_some_and(|&next| next <= copied)
+        {
             self.pending.remove(&partition);
             self.seeked.remove(&partition);
         }
@@ -1447,10 +1490,7 @@ impl futures::Stream for ReceiverStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         match std::pin::Pin::new(&mut self.rx).poll_recv(cx) {
             std::task::Poll::Ready(Some(Ok(batch))) => {
-                tracing::debug!(
-                    rows = batch.len(),
-                    "lote consumido de Redpanda"
-                );
+                tracing::debug!(rows = batch.len(), "lote consumido de Redpanda");
                 std::task::Poll::Ready(Some(Ok(batch)))
             }
             std::task::Poll::Ready(Some(Err(e))) => {
@@ -1582,7 +1622,11 @@ impl DrainState {
         }
         for (partition, first, next) in high {
             let from = self.chain.get(&partition).copied().unwrap_or(first);
-            self.staged.push(OffsetRange { partition, from, to: next });
+            self.staged.push(OffsetRange {
+                partition,
+                from,
+                to: next,
+            });
             self.chain.insert(partition, next);
         }
         self.ranged = self.batch.len();
@@ -1671,7 +1715,10 @@ unsafe extern "C" fn native_consume_cb(
                     }
                 }
             }
-            match state.resume.admit(state.rk, state.rkt, &state.topic, partition, offset) {
+            match state
+                .resume
+                .admit(state.rk, state.rkt, &state.topic, partition, offset)
+            {
                 Ok(true) => {
                     if state.handoff.is_some() {
                         state.note_local(partition, offset + 1);
@@ -1721,7 +1768,10 @@ fn align_with_cursor(state: &mut DrainState, partition: i32, offset: i64) -> Res
         state.start_partition(partition, target);
         return Ok(true);
     }
-    let copied = state.cursor.as_ref().and_then(|cursor| cursor.get(partition));
+    let copied = state
+        .cursor
+        .as_ref()
+        .and_then(|cursor| cursor.get(partition));
     let Some(copied) = copied else {
         // Nadie del proceso la copió: se empieza en el checkpoint si hay
         // (el filtro de resume reposiciona ahí), si no en este mensaje.
@@ -1740,7 +1790,12 @@ fn align_with_cursor(state: &mut DrainState, partition: i32, offset: i64) -> Res
     ffi_seek(state.rkt, partition, copied, 10_000).map_err(|e| {
         format!("seek a lo ya copiado falló (partición {partition}, offset {copied}): {e}")
     })?;
-    tracing::info!(partition, from = offset, to = copied, "la partición cambió de consumidor: sigue donde quedó");
+    tracing::info!(
+        partition,
+        from = offset,
+        to = copied,
+        "la partición cambió de consumidor: sigue donde quedó"
+    );
     state.expect.insert(partition, copied);
     Ok(false)
 }
