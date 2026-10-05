@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Benchmarks — Tachyon vs Flink</title>
+<meta name="description" content="Tachyon measured against Flink 2.2.1 on the same machine: Redpanda, Kinesis, and SQS, into Paimon and back out to Kinesis and SQS. Throughput, CPU, memory, latency, and row-level verification.">
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body class="bench-page">
+
+<nav class="nav">
+  <div class="container nav-inner">
+    <a href="./index.html" class="nav-logo"><img src="./logo.svg" alt="Tachyon" class="nav-logo-mark">tachyon<span class="dot">.</span></a>
+    <div class="nav-links">
+      <a href="./index.html#philosophy">Philosophy</a>
+      <a href="./index.html#deploy">Deploy &amp; operate</a>
+      <a href="./index.html#use-cases">Use cases</a>
+      <a href="./benchmarks.html" aria-current="page">Benchmarks</a>
+      <a href="https://github.com/Rekeyea/tachyon" class="nav-cta">GitHub →</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-hero">
+  <div class="container">
+    <span class="badge">Tachyon benchfast · Flink 2.2.1 · Paimon 1.4.2</span>
+    <h1>Measured against Flink, run for run.</h1>
+    <p class="hero-sub">
+      One engine at a time. Four pinned CPUs, a 4.6 GiB cgroup cap, the same input,
+      and an output that is checked against the generator before the run counts.
+    </p>
+    <nav class="jump" aria-label="Scenarios">
+      <a href="#rules">Rules</a>
+      <a href="#redpanda">Redpanda</a>
+      <a href="#kinesis">Kinesis source</a>
+      <a href="#sqs">SQS source</a>
+      <a href="#kinesis-sink">Kinesis sink</a>
+      <a href="#sqs-sink">SQS sink</a>
+      <a href="#news2">NEWS2</a>
+    </nav>
+  </div>
+  <div class="hero-glow"></div>
+</header>
+
+<section id="rules">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">How a run counts</span>
+      <h2>The harness sits outside both engines</h2>
+      <p class="section-sub">
+        <code>bench/harness/bench.py</code> reads progress, CPU, and memory from the
+        container cgroup. The engine's own metrics are never the score.
+      </p>
+    </div>
+    <div class="rules">
+      <article class="rule" data-reveal>
+        <strong>Same budget</strong>
+        <p>CPUs 4–7 and 4,608 MiB for each engine. Flink runs JobManager and TaskManager in that one cgroup, parallelism 4. The broker and the harness sit on other cores.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>Throughput is the steady slope</strong>
+        <p>A preloaded backlog is drained from the start. The rate is a line fit through commit jumps between 20% and 95% of the backlog, after the first commit.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>Every row is checked</strong>
+        <p>The expected table is recomputed from the generator formula. A run with a missing row, an extra row, a wrong value, or a duplicate version is dropped.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>Latency is the clock</strong>
+        <p>Producers stamp <code>event_time</code> with wall time. For Paimon, latency is the snapshot that makes the row visible. For a Kinesis sink, it is the moment the tail reads the record back.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="redpanda" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Apple M5 · Redpanda · September 2026</span>
+      <h2>Into a Paimon table</h2>
+      <p class="section-sub">
+        Median of three alternating runs, tag <code>final4</code>, 60 million events,
+        commit every 1 second. Exactly-once on both sides: the Kafka offsets live in the Paimon snapshot.
+      </p>
+    </div>
+    <div class="bench-grid">
+      <div class="bench-card" data-reveal>
+        <h3>ETL throughput</h3>
+        <p class="bench-desc">JSON decode, drop the 10% cancelled, write a primary-key table. Tachyon used 2.78 of the 4 cores; Flink used 3.67.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">5.42M r/s</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 51.5%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">2.79M r/s</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Tachyon / Flink: <strong>1.94×</strong> · 2.00M vs 758K rows per CPU-second</span>
+      </div>
+      <div class="bench-card" data-reveal>
+        <h3>Window throughput</h3>
+        <p class="bench-desc">Tumbling 1 second per <code>order_id</code>, COUNT and SUM, watermark on event time. Tachyon 2.63 cores, Flink 3.55.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">5.17M r/s</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 59.4%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">3.07M r/s</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Tachyon / Flink: <strong>1.68×</strong> · 2.00M vs 918K rows per CPU-second</span>
+      </div>
+      <div class="bench-card full-width" data-reveal>
+        <h3>End-to-end latency at 1M events/s</h3>
+        <p class="bench-desc">Event time to the Paimon snapshot that publishes the row. Median of two runs per cell. Lower is better.</p>
+        <div class="latency-table-wrap">
+          <table class="latency-table">
+            <thead>
+              <tr>
+                <th><span class="th-long">Workload</span><span class="th-short">Work</span></th>
+                <th>Commit</th>
+                <th><span class="th-long">Tachyon p50</span><span class="th-short">T p50</span></th>
+                <th><span class="th-long">Tachyon p99</span><span class="th-short">T p99</span></th>
+                <th><span class="th-long">Flink p50</span><span class="th-short">F p50</span></th>
+                <th><span class="th-long">Flink p99</span><span class="th-short">F p99</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>ETL</td><td>1 s</td><td>720<span class="unit"> ms</span></td><td>1,246<span class="unit"> ms</span></td><td>843<span class="unit"> ms</span></td><td>1,778<span class="unit"> ms</span></td></tr>
+              <tr><td>ETL</td><td>250 ms</td><td>260<span class="unit"> ms</span></td><td>414<span class="unit"> ms</span></td><td>254<span class="unit"> ms</span></td><td>1,412<span class="unit"> ms</span></td></tr>
+              <tr><td>Window</td><td>1 s</td><td>726<span class="unit"> ms</span></td><td>1,475<span class="unit"> ms</span></td><td>1,180<span class="unit"> ms</span></td><td>1,780<span class="unit"> ms</span></td></tr>
+              <tr><td>Window</td><td>250 ms</td><td>471<span class="unit"> ms</span></td><td>630<span class="unit"> ms</span></td><td>521<span class="unit"> ms</span></td><td>1,570<span class="unit"> ms</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <span class="bench-ratio">At a 250 ms ETL commit, p99 is 414 ms against 1 412 ms: <strong>3.41×</strong></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="kinesis" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Linux x86_64 · Kinesis via floCi · drain 3 Oct 2026</span>
+      <h2>Kinesis in, Paimon out</h2>
+      <p class="section-sub">
+        Twelve Tachyon drains on 3 October, set against Flink's single drain from 30 September.
+        Ten million events, 16 shards, commit every 1 second, 4 CPUs.
+        The SQL drops the cancelled 10%, so each run commits 9,000,000 rows.
+        The checkpoint stores the shard sequence, so the Paimon snapshot is exactly-once.
+        All twelve matched the generator. The latency pair below is the 30 September run and was not repeated.
+      </p>
+    </div>
+    <div class="bench-grid">
+      <div class="bench-card" data-reveal>
+        <h3>Drain rate</h3>
+        <p class="bench-desc">Median slope of the Paimon snapshot from 20% to 95% full. Ten of the twelve Tachyon runs sat between 903K and 1.05M rows/s. Two runs, 186K and 321K, stayed under Flink. On the 321K run the log showed 16 GetRecords in flight for the whole slow stretch, so Tachyon was waiting on floCi. On a fast run the 20–80% window is about 6 seconds, and about 5 of them are the read: GetRecords plus decode. The Paimon write is 0.3 s and the commit is 1.1 s. Median drain is 9.9 s; Flink's run took 37 s.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">954K r/s</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 48.2%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">460K r/s</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Median Tachyon / Flink: <strong>2.08×</strong>. Slowest Tachyon run / that Flink run: <strong>0.40×</strong></span>
+      </div>
+      <div class="bench-card" data-reveal>
+        <h3>Rows per CPU-second</h3>
+        <p class="bench-desc">Tachyon's median was 1.92 cores and 551 MB. The two slow runs fell to 0.45 and 0.88 cores while they waited. Flink's 30 September run held 2.37 cores and 1 953 MB, JobManager included.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">496K</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 36.3%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">180K</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Rows per CPU-second: <strong>2.76×</strong> · RAM <strong>3.5×</strong> lower</span>
+      </div>
+      <div class="bench-card full-width" data-reveal>
+        <h3>Live latency, target 100K events/s</h3>
+        <p class="bench-desc">30 September, not re-run. floCi delivered 75K/s to Tachyon and 53K/s to Flink. Both landed every non-cancelled row (<span class="good">landed fraction 1.0</span>).</p>
+        <div class="latency-table-wrap">
+          <table class="latency-table">
+            <thead>
+              <tr>
+                <th>Engine</th>
+                <th>Arrival</th>
+                <th>p50</th>
+                <th>p99</th>
+                <th class="col-extra">p99.9</th>
+                <th class="col-extra">max</th>
+                <th class="col-extra">Cores</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Tachyon</td><td>75K/s</td><td>681 ms</td><td>1,259 ms</td><td class="col-extra">3,097 ms</td><td class="col-extra">3,117 ms</td><td class="col-extra">0.20</td></tr>
+              <tr><td>Flink</td><td>53K/s</td><td>780 ms</td><td>4,068 ms</td><td class="col-extra">4,209 ms</td><td class="col-extra">4,227 ms</td><td class="col-extra">1.33</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <span class="bench-ratio">Flink / Tachyon p99: <strong>3.23×</strong></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="sqs" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Linux x86_64 · SQS via floCi · Tachyon only</span>
+      <h2>SQS in, Paimon out</h2>
+      <p class="section-sub">
+        Flink has no SQS source, so this scenario has no pair. floCi serves the queue
+        at about 800–1,300 messages per second, and that is the rate the run records.
+        500,000 messages in, 450,000 rows out (the SQL drops the cancelled 10%), verified.
+      </p>
+    </div>
+    <div class="bench-grid">
+      <div class="bench-card" data-reveal>
+        <h3>Drain</h3>
+        <p class="bench-desc">776 rows/s on 0.05 cores, peak 403 MB. The engine is waiting on the emulator.</p>
+        <span class="bench-ratio">Output check: <strong>450,000 / 450,000</strong> rows, no duplicate versions</span>
+      </div>
+      <div class="bench-card" data-reveal>
+        <h3>Live latency at 500/s</h3>
+        <p class="bench-desc">Every non-cancelled row landed. The engine used 0.11 cores.</p>
+        <span class="bench-ratio">p50 <strong>553 ms</strong> · p99 <strong>1,049 ms</strong> · p99.9 <strong>1,066 ms</strong> · max <strong>1,076 ms</strong></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="kinesis-sink" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Linux x86_64 · Kinesis sink · 2–3 Oct 2026</span>
+      <h2>Kinesis in, Kinesis out</h2>
+      <p class="section-sub">
+        The same ETL filter, published with <code>PutRecords</code> instead of a Paimon commit.
+        The sink is at-least-once: a restart can republish, and the JSON carries
+        <code>source_version</code> so a consumer can drop duplicates. In these runs the output had none.
+      </p>
+    </div>
+    <div class="bench-grid">
+      <div class="bench-card" data-reveal>
+        <h3>Write rate, 20M event backlog</h3>
+        <p class="bench-desc">Fixed window: 10 seconds of warmup, then 30 seconds. The rate is output records divided by the whole 40 seconds. Both engines sit on floCi's read ceiling.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">80.9K r/s</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 99.3%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">80.3K r/s</span>
+          </div>
+        </div>
+        <span class="bench-ratio">3,212,713 and 3,235,609 records, <strong>zero</strong> extras, wrong values, or duplicates</span>
+      </div>
+      <div class="bench-card" data-reveal>
+        <h3>Rows per CPU-second</h3>
+        <p class="bench-desc">Tachyon 0.23 cores and 151 MB. Flink 0.91 cores and 1,775 MB.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">349K</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 25.5%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">89K</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Rows per CPU-second: <strong>3.9×</strong> · RAM <strong>11.8×</strong> lower</span>
+      </div>
+      <div class="bench-card full-width" data-reveal>
+        <h3>Sink latency at 2,000 events/s</h3>
+        <p class="bench-desc">
+          Both engines actually ingested 1,999/s for 30 seconds, so the input matches.
+          A tail reads each output shard from <code>LATEST</code> and stamps
+          <code>now − event_time</code>. Tachyon publishes the batch when it arrives.
+          Flink's Kinesis sink holds records until the sink buffer flushes, which is the long tail.
+          Every non-cancelled record was observed.
+        </p>
+        <div class="latency-table-wrap">
+          <table class="latency-table">
+            <thead>
+              <tr>
+                <th>Engine</th>
+                <th>p50</th>
+                <th>p90</th>
+                <th>p99</th>
+                <th class="col-extra">max</th>
+                <th class="col-extra">Cores</th>
+                <th class="col-extra">RAM</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Tachyon</td><td>173 ms</td><td>255 ms</td><td>280 ms</td><td class="col-extra">465 ms</td><td class="col-extra">0.02</td><td class="col-extra">31 MB</td></tr>
+              <tr><td>Flink</td><td>863 ms</td><td>5.2 s</td><td>7.9 s</td><td class="col-extra">8.3 s</td><td class="col-extra">0.47</td><td class="col-extra">1,467 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <span class="bench-ratio">Flink / Tachyon: p50 <strong>5.0×</strong> · p99 <strong>28×</strong></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="sqs-sink" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Linux x86_64 · SQS sink · Tachyon only</span>
+      <h2>SQS in, SQS out</h2>
+      <p class="section-sub">
+        Flink has no SQS sink. Tachyon published 20,929 messages in the 40 second window:
+        523 rows/s, 0.03 cores, 24 MB. The output matched the generator
+        (no extras, no wrong values, no duplicates). The rate is floCi's send path.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section id="news2" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Linux x86_64 · NEWS2 · 4 Oct 2026</span>
+      <h2>Split, score, then a one-minute union</h2>
+      <p class="section-sub">
+        Six Paimon measurement tables, six NEWS2 score tables, one wide window.
+        250 patients × 2,000 minutes, 2,994,922 events, 500,000 wide rows.
+        Two runs each, every row checked against a fold of the topic.
+        The diagram of the thirteen tables is on the <a href="./news2.html">NEWS2 page</a>.
+      </p>
+    </div>
+    <div class="bench-grid pair">
+      <div class="bench-card" data-reveal>
+        <h3>Wide-table throughput</h3>
+        <p class="bench-desc">Slope of <code>news2_wide</code> snapshots from 20% to 95%. Run 1, then run 2. Tachyon used 1.01 and 1.00 cores. Flink used 3.85 both times.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">275K · 260K</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 4%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">11.0K · 10.5K</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Each pair: <strong>24.9×</strong> · per core <strong>93.8×</strong> and <strong>93.3×</strong></span>
+      </div>
+      <div class="bench-card" data-reveal>
+        <h3>Same cap, less of it</h3>
+        <p class="bench-desc">Higher peak of anonymous memory. CPUs 4–7, 4,608 MiB, commit every 1 second. The drains took 6.36–6.65 s against 68.9–69.9 s.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 73.7%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">2,760 MiB</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">3,746 MiB</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Higher peaks 2,760 vs 3,746 MiB. Drains 6.36–6.65s vs 68.9–69.9s</span>
+      </div>
+    </div>
+    <p class="bench-cta" data-reveal>
+      <a href="./news2.html" class="btn btn-primary">See the full pipeline</a>
+    </p>
+  </div>
+</section>
+
+<section id="reading">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Reading the tables</span>
+      <h2>What stays inside the comparison</h2>
+    </div>
+    <div class="rules">
+      <article class="rule" data-reveal>
+        <strong>Two machines, labeled</strong>
+        <p>Redpanda numbers are the Apple M5 median. Kinesis, SQS, and NEWS2 numbers are one Linux box with 24 CPUs. They are not one ranking. NEWS2 is the 4 October pair in <code>bench/results/2026-10-04.jsonl</code>.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>floCi is in the path</strong>
+        <p>Kinesis and SQS are the floCi emulator on localhost:4566. SQS rates, and the ~80K rows/s Kinesis sink, describe that emulator. A preloaded Kinesis drain reads data already in the stream: ten of twelve runs reached 903K–1.05M rows/s, and two stayed at 186K and 321K. On AWS the engine reads shards in parallel.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>Sinks are at-least-once</strong>
+        <p>Kinesis and SQS have no transaction that ties the output to the input offsets. These runs still verified a clean output. A crash can republish; consumers dedupe on <code>source_version</code>.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>Raw files</strong>
+        <p>Every figure on this page comes from <code>bench/results/*.jsonl</code>. Which runs sit in each median is <code>bench/README.md</code>. <code>python3 bench/report.py</code> prints medians over every verified run in those files, including older builds.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container footer-inner">
+    <span class="footer-brand"><img src="./logo.svg" alt="" class="footer-mark">tachyons.sh — a streaming engine that ships as one binary</span>
+    <span class="footer-links"><a href="./index.html">Home</a><a href="./news2.html">NEWS2</a><a href="https://github.com/Rekeyea/tachyon">GitHub</a></span>
+  </div>
+</footer>
+
+<script src="./app.js" defer></script>
+</body>
+</html>

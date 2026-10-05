@@ -1,0 +1,18 @@
+{
+  "name": "tachyon-site",
+  "compatibility_date": "2025-01-01",
+  "assets": {
+    "directory": "."
+  },
+  "main": "index.js",
+  "routes": [
+    {
+      "pattern": "tachyons.sh/*",
+      "zone_id": "11c9281ce945a070cda25db387ccca86"
+    },
+    {
+      "pattern": "*.tachyons.sh/*",
+      "zone_id": "11c9281ce945a070cda25db387ccca86"
+    }
+  ]
+}

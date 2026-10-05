@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NEWS2 early warning — Tachyon vs Flink</title>
+<meta name="description" content="The thesis NEWS2 pipeline on Tachyon and Flink: six Paimon measurement tables, six score tables, and one one-minute window. Same input, same 4 CPU and 4.6 GiB budget. Tachyon committed the wide table about 25× faster.">
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body class="bench-page">
+
+<nav class="nav">
+  <div class="container nav-inner">
+    <a href="./index.html" class="nav-logo"><img src="./logo.svg" alt="Tachyon" class="nav-logo-mark">tachyon<span class="dot">.</span></a>
+    <div class="nav-links">
+      <a href="./index.html#philosophy">Philosophy</a>
+      <a href="./index.html#deploy">Deploy &amp; operate</a>
+      <a href="./index.html#use-cases">Use cases</a>
+      <a href="./benchmarks.html">Benchmarks</a>
+      <a href="https://github.com/Rekeyea/tachyon" class="nav-cta">GitHub →</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-hero">
+  <div class="container">
+    <span class="badge">Use case · NEWS2 · Linux · 4 Oct 2026</span>
+    <h1>Split each vital. Score it. Union the minute.</h1>
+    <p class="hero-sub">
+      A clinical early-warning pipeline, laid out the way the thesis does it on Paimon.
+      Six measurement tables, six NEWS2 score tables, then one wide row per patient per minute.
+      Tachyon and Flink 2.2.1 ran that graph on the same input, inside the same 4 CPU and 4.6 GiB cap.
+    </p>
+    <nav class="jump" aria-label="On this page">
+      <a href="#pipeline">Pipeline</a>
+      <a href="#engines">Both engines</a>
+      <a href="#gains">Gains</a>
+      <a href="#runs">Both runs</a>
+      <a href="#check">What was checked</a>
+    </nav>
+  </div>
+  <div class="hero-glow"></div>
+</header>
+
+<section class="stats" aria-label="Measured gains">
+  <div class="container stats-grid">
+    <div class="stat" data-reveal>
+      <span class="stat-value" data-count="24.9" data-suffix="×">24.9×</span>
+      <span class="stat-label">wide-table rows per second</span>
+    </div>
+    <div class="stat" data-reveal>
+      <span class="stat-value" data-count="93" data-suffix="×">93×</span>
+      <span class="stat-label">rows per CPU-second, lower run</span>
+    </div>
+    <div class="stat" data-reveal>
+      <span class="stat-value">1.0</span>
+      <span class="stat-label">Tachyon cores · Flink used 3.85</span>
+    </div>
+    <div class="stat" data-reveal>
+      <span class="stat-value">6.5s</span>
+      <span class="stat-label">to commit 500,000 rows · Flink 69s</span>
+    </div>
+  </div>
+</section>
+
+<section id="pipeline">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">The whole pipeline</span>
+      <h2>Thirteen Paimon tables, no topic in between</h2>
+      <p class="section-sub">
+        Redpanda only feeds the first layer. Each measurement type is stored, scored with its own NEWS2 bands, and kept. The window reads the six score tables and writes <code>news2_wide</code>.
+      </p>
+    </div>
+
+    <figure class="pipe" data-reveal>
+      <figcaption class="pipe-frame-label">database delta · both engines</figcaption>
+
+      <div class="pipe-source">
+        <span class="pipe-kicker">1 · ingest</span>
+        <strong>Redpanda</strong>
+        <span class="pipe-meta">one topic, one partition, key <code>patient_id</code></span>
+        <span class="pipe-meta">2,994,922 events · respiratory rate, oxygen saturation, systolic pressure, heart rate, temperature, consciousness</span>
+      </div>
+
+      <div class="pipe-stem" aria-hidden="true"></div>
+      <p class="pipe-step">split by measurement_type · one Paimon table each</p>
+
+      <div class="pipe-lanes">
+        <article class="lane">
+          <h3>Respiratory rate</h3>
+          <div class="lane-node">
+            <span class="lane-kind">2 · Paimon</span>
+            <strong>measurements_<wbr>respiratory_rate</strong>
+          </div>
+          <div class="lane-arrow" aria-hidden="true">↓ <span>NEWS2</span></div>
+          <div class="lane-node score">
+            <span class="lane-kind">3 · Paimon</span>
+            <strong>scores_<wbr>respiratory_rate</strong>
+          </div>
+        </article>
+        <article class="lane">
+          <h3>Oxygen saturation</h3>
+          <div class="lane-node">
+            <span class="lane-kind">2 · Paimon</span>
+            <strong>measurements_<wbr>oxygen_saturation</strong>
+          </div>
+          <div class="lane-arrow" aria-hidden="true">↓ <span>NEWS2</span></div>
+          <div class="lane-node score">
+            <span class="lane-kind">3 · Paimon</span>
+            <strong>scores_<wbr>oxygen_saturation</strong>
+          </div>
+        </article>
+        <article class="lane">
+          <h3>Systolic pressure</h3>
+          <div class="lane-node">
+            <span class="lane-kind">2 · Paimon</span>
+            <strong>measurements_<wbr>blood_pressure_<wbr>systolic</strong>
+          </div>
+          <div class="lane-arrow" aria-hidden="true">↓ <span>NEWS2</span></div>
+          <div class="lane-node score">
+            <span class="lane-kind">3 · Paimon</span>
+            <strong>scores_<wbr>blood_pressure_<wbr>systolic</strong>
+          </div>
+        </article>
+        <article class="lane">
+          <h3>Heart rate</h3>
+          <div class="lane-node">
+            <span class="lane-kind">2 · Paimon</span>
+            <strong>measurements_<wbr>heart_rate</strong>
+          </div>
+          <div class="lane-arrow" aria-hidden="true">↓ <span>NEWS2</span></div>
+          <div class="lane-node score">
+            <span class="lane-kind">3 · Paimon</span>
+            <strong>scores_<wbr>heart_rate</strong>
+          </div>
+        </article>
+        <article class="lane">
+          <h3>Temperature</h3>
+          <div class="lane-node">
+            <span class="lane-kind">2 · Paimon</span>
+            <strong>measurements_<wbr>temperature</strong>
+          </div>
+          <div class="lane-arrow" aria-hidden="true">↓ <span>NEWS2</span></div>
+          <div class="lane-node score">
+            <span class="lane-kind">3 · Paimon</span>
+            <strong>scores_<wbr>temperature</strong>
+          </div>
+        </article>
+        <article class="lane">
+          <h3>Consciousness</h3>
+          <div class="lane-node">
+            <span class="lane-kind">2 · Paimon</span>
+            <strong>measurements_<wbr>consciousness</strong>
+          </div>
+          <div class="lane-arrow" aria-hidden="true">↓ <span>NEWS2</span></div>
+          <div class="lane-node score">
+            <span class="lane-kind">3 · Paimon</span>
+            <strong>scores_<wbr>consciousness</strong>
+          </div>
+        </article>
+      </div>
+
+      <div class="pipe-stem" aria-hidden="true"></div>
+      <p class="pipe-step">union all six score tables · tumble 1 minute on measurement_timestamp · group by patient_id</p>
+
+      <div class="pipe-wide">
+        <span class="pipe-kicker">4 · window</span>
+        <strong>news2_wide</strong>
+        <span class="pipe-meta">500,000 rows · one per patient per closed minute · a missing vital scores 0 · <code>news2_score</code> is the sum</span>
+        <div class="chips" aria-label="Wide-row columns">
+          <span class="chip">patient_id</span>
+          <span class="chip">window_start</span>
+          <span class="chip">window_end</span>
+          <span class="chip">respiratory_rate_value</span>
+          <span class="chip">oxygen_saturation_value</span>
+          <span class="chip">blood_pressure_value</span>
+          <span class="chip">heart_rate_value</span>
+          <span class="chip">temperature_value</span>
+          <span class="chip">consciousness_value</span>
+          <span class="chip score">respiratory_rate_score</span>
+          <span class="chip score">oxygen_saturation_score</span>
+          <span class="chip score">blood_pressure_score</span>
+          <span class="chip score">heart_rate_score</span>
+          <span class="chip score">temperature_score</span>
+          <span class="chip score">consciousness_score</span>
+          <span class="chip score">news2_score</span>
+        </div>
+      </div>
+    </figure>
+
+    <div class="rules pipe-notes" data-reveal>
+      <article class="rule">
+        <strong>Watermark</strong>
+        <p>Event time is <code>measurement_timestamp</code>. The watermark lags it by 10 seconds. The window is a one-minute tumble.</p>
+      </article>
+      <article class="rule">
+        <strong>A missing vital</strong>
+        <p>Some patient-minutes omit oxygen saturation. The wide row is still written: that value is empty and that score is 0.</p>
+      </article>
+      <article class="rule">
+        <strong>What each layer holds</strong>
+        <p>Five measurement tables and five score tables hold 500,250 rows. Oxygen holds 493,672. The wide table holds the 500,000 closed windows, and nothing else.</p>
+      </article>
+      <article class="rule">
+        <strong>No hop in the middle</strong>
+        <p>The score tables are the input of the window. A topic does not stand in for any of the thirteen Paimon tables.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="engines" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Same layers, two runtimes</span>
+      <h2>How each engine runs that graph</h2>
+      <p class="section-sub">
+        The tables, the NEWS2 bands, the window, and the wide-row columns match. The processes do not have to.
+      </p>
+    </div>
+    <div class="engine-pair">
+      <article class="engine-card" data-reveal>
+        <span class="pipe-kicker">Flink 2.2.1 · Paimon 1.4.2</span>
+        <h3>One job, four slots</h3>
+        <p>
+          JobManager and TaskManager share the cgroup. All thirteen statements run as one statement set, so the stages share those four slots. Each Paimon table has four buckets. The window is a <code>UNION ALL</code> of the six score tables, then <code>TUMBLE</code>.
+        </p>
+        <ul class="engine-list">
+          <li>Parallelism 4, inside CPUs 4–7</li>
+          <li>Commit every 1 second, exactly-once checkpoints</li>
+          <li>TaskManager stays 3,072 MiB. Managed memory is 128 MiB, so the task heap is 2,190 MiB and each sink can spill a 32 MiB buffer</li>
+        </ul>
+      </article>
+      <article class="engine-card tachyon" data-reveal>
+        <span class="pipe-kicker">Tachyon</span>
+        <h3>Thirteen pipelines, one cgroup</h3>
+        <p>
+          Each stage is one process and one Paimon output: six splits, six scores, one window. The window process reads the six score tables directly. There is no JobManager and no network shuffle. Tables have one bucket.
+        </p>
+        <ul class="engine-list">
+          <li>Same CPUs 4–7 and the same 4,608 MiB cap</li>
+          <li>Commit every 1 second, with the Paimon snapshot</li>
+          <li>Throughput is the wide table. CPU and memory are the whole container</li>
+        </ul>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="gains" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Linux · 4 Oct 2026 · two runs each</span>
+      <h2>The wide table, under the same cap</h2>
+      <p class="section-sub">
+        250 patients × 2,000 minutes. Throughput is the slope of committed <code>news2_wide</code> snapshots from 20% to 95% of 500,000 rows. CPU and memory come from the container cgroup over that same span.
+      </p>
+    </div>
+    <div class="bench-grid">
+      <div class="bench-card" data-reveal>
+        <h3>Run 1 · rows/s</h3>
+        <p class="bench-desc">Tachyon’s slope is 3 commits across 0.88 s. Flink’s is 10 commits across 31 s. Tachyon used 1.01 cores. Flink used 3.85.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">275K r/s</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 4%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">11.0K r/s</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Tachyon / Flink: <strong>24.9×</strong> · 273K vs 2.9K rows per CPU-second</span>
+      </div>
+      <div class="bench-card" data-reveal>
+        <h3>Run 2 · rows/s</h3>
+        <p class="bench-desc">Tachyon’s slope is 3 commits across 0.92 s. Flink’s is 11 commits across 29 s. Tachyon used 1.00 cores. Flink used 3.85.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 94.7%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">260K r/s</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 3.8%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">10.5K r/s</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Tachyon / Flink: <strong>24.9×</strong> · 263K vs 2.8K rows per CPU-second</span>
+      </div>
+      <div class="bench-card" data-reveal>
+        <h3>Peak memory</h3>
+        <p class="bench-desc">Anonymous memory of the engine container at its high-water mark. Both stayed inside the 4,608 MiB cap. Lower is better.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 73.7%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">2,760 MiB</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">3,746 MiB</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Higher peak of each engine, <strong>1.36×</strong>. The other run was 2,666 vs 3,716 MiB</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="runs" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">bench/results/2026-10-04.jsonl</span>
+      <h2>Every counted run</h2>
+      <p class="section-sub">
+        All four committed 500,000 wide rows and passed the row check. The fit rate is the number the bars use. The 20–80% rate is the span between those two marks.
+      </p>
+    </div>
+    <div class="bench-card" data-reveal>
+      <div class="latency-table-wrap">
+        <table class="latency-table">
+          <thead>
+            <tr>
+              <th>Engine</th>
+              <th><span class="th-long">Rows/s fit</span><span class="th-short">Rows/s</span></th>
+              <th class="col-extra">Points</th>
+              <th class="col-extra">20–80%</th>
+              <th>Cores</th>
+              <th><span class="th-long">Rows/CPU-s</span><span class="th-short">/core</span></th>
+              <th><span class="th-long">RAM</span><span class="th-short">MiB</span></th>
+              <th class="col-extra">Drain</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Tachyon 1</td>
+              <td>274,725</td>
+              <td class="col-extra">3 · 0.88s</td>
+              <td class="col-extra">347,722</td>
+              <td>1.01</td>
+              <td>272,931</td>
+              <td>2,666<span class="unit"> MiB</span></td>
+              <td class="col-extra">6.36s</td>
+            </tr>
+            <tr>
+              <td>Tachyon 2</td>
+              <td>260,266</td>
+              <td class="col-extra">3 · 0.92s</td>
+              <td class="col-extra">272,395</td>
+              <td>1.00</td>
+              <td>262,862</td>
+              <td>2,760<span class="unit"> MiB</span></td>
+              <td class="col-extra">6.65s</td>
+            </tr>
+            <tr>
+              <td>Flink 1</td>
+              <td>11,043</td>
+              <td class="col-extra">10 · 31.0s</td>
+              <td class="col-extra">10,560</td>
+              <td>3.85</td>
+              <td>2,911</td>
+              <td>3,716<span class="unit"> MiB</span></td>
+              <td class="col-extra">68.9s</td>
+            </tr>
+            <tr>
+              <td>Flink 2</td>
+              <td>10,462</td>
+              <td class="col-extra">11 · 29.2s</td>
+              <td class="col-extra">10,851</td>
+              <td>3.85</td>
+              <td>2,816</td>
+              <td>3,746<span class="unit"> MiB</span></td>
+              <td class="col-extra">69.9s</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <span class="bench-ratio">Per core, run 1 is <strong>93.8×</strong> and run 2 is <strong>93.3×</strong>. Drain time is <strong>10.8×</strong> and <strong>10.5×</strong> shorter.</span>
+    </div>
+  </div>
+</section>
+
+<section id="check" class="scenario">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Why a run counts</span>
+      <h2>The wide rows match the input, not the other engine</h2>
+    </div>
+    <div class="rules">
+      <article class="rule" data-reveal>
+        <strong>Independent expected rows</strong>
+        <p>The checker reads the topic and folds it. Each wide row must have the right patient, window, six values, and six NEWS2 scores. <code>news2_score</code> must be the sum. <code>(patient_id, window_start)</code> must be unique.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>All thirteen tables</strong>
+        <p>Each measurement table and each score table may contain only its type. Score rows must match that type’s bands. A duplicate primary key drops the run.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>Short Tachyon slope</strong>
+        <p>Three snapshot jumps in under a second still meet the harness rule of at least three points between 20% and 95%. Flink’s slope is the longer series. Both are the same formula.</p>
+      </article>
+      <article class="rule" data-reveal>
+        <strong>The size both finished</strong>
+        <p>250 × 2,000 is the backlog both engines completed inside the cap. A 500 × 5,000 backlog filled Flink’s task heap before the wide table was done. The cap stayed 4,608 MiB.</p>
+      </article>
+    </div>
+    <p class="bench-note" data-reveal>
+      NEWS2 bands are the thesis scoring job: respiratory rate, oxygen saturation, systolic pressure, heart rate, temperature, and consciousness (1 scores 0, anything else scores 3).
+      The other measured workloads are on the <a href="./benchmarks.html">benchmarks page</a>.
+    </p>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container footer-inner">
+    <span class="footer-brand"><img src="./logo.svg" alt="" class="footer-mark">tachyons.sh — a streaming engine that ships as one binary</span>
+    <span class="footer-links"><a href="./index.html">Home</a><a href="./benchmarks.html">Benchmarks</a><a href="https://github.com/Rekeyea/tachyon">GitHub</a></span>
+  </div>
+</footer>
+
+<script src="./app.js" defer></script>
+</body>
+</html>

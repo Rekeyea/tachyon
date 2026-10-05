@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tachyon — A streaming engine that ships as one binary</title>
+<meta name="description" content="Tachyon runs streaming pipelines as a single self-contained Rust process: SQL for the logic, one YAML for the I/O, a Paimon table as the output. No JobManager, no ZooKeeper, no state-backend tuning.">
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+
+<!-- ─── NAV ─────────────────────────────────────────────────────── -->
+<nav class="nav">
+  <div class="container nav-inner">
+    <a href="#" class="nav-logo"><img src="./logo.svg" alt="Tachyon" class="nav-logo-mark">tachyon<span class="dot">.</span></a>
+    <div class="nav-links">
+      <a href="#philosophy">Philosophy</a>
+      <a href="#deploy">Deploy &amp; operate</a>
+      <a href="#use-cases">Use cases</a>
+      <a href="./benchmarks.html">Benchmarks</a>
+      <a href="https://github.com/Rekeyea/tachyon" class="nav-cta">GitHub →</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ─── HERO ────────────────────────────────────────────────────── -->
+<header class="hero">
+  <div class="container hero-grid">
+    <div class="hero-copy" data-reveal>
+      <span class="badge">Streaming engine · Rust · SQL-first</span>
+      <h1>A pipeline is<br>not a <em>cluster</em>.</h1>
+      <p class="hero-sub">
+        Tachyon runs streaming pipelines as a single self-contained Rust process.
+        SQL for the logic, one YAML for the I/O, a Paimon table as the output —
+        no JobManager, no ZooKeeper, no state-backend tuning.
+      </p>
+      <div class="hero-actions">
+        <a href="#philosophy" class="btn btn-primary">Read the philosophy</a>
+        <a href="./benchmarks.html" class="btn btn-ghost">See the numbers</a>
+      </div>
+      <div class="hero-meta">Redpanda → DataFusion → Paimon &nbsp;·&nbsp; exactly-once &nbsp;·&nbsp; no JVM</div>
+    </div>
+    <div class="hero-visual" data-reveal>
+      <div class="terminal">
+        <div class="terminal-bar">
+          <span class="t-dot"></span><span class="t-dot"></span><span class="t-dot"></span>
+          <span class="terminal-title">tachyon — run</span>
+        </div>
+        <div class="terminal-body">
+<pre><span class="t-cmd">$ tachyon run pipeline.sql pipeline.yaml</span>
+
+<span class="t-ok">✓ alignment</span>    inputs[*].key == output.key == order_id
+<span class="t-ok">✓ parallelism</span>  8 partitions == 8 buckets == 8 writers
+<span class="t-ok">✓ plan</span>         DataFusion · TUMBLE(1s) · watermark on event_time
+
+<span class="t-dim">→ orders-etl is running</span>
+  consumer group   <span class="t-val">tachyon/orders-etl</span>
+  throughput       <span class="t-val">5.42M rows/s</span>
+  p99 latency      <span class="t-val">414 ms</span>
+  RSS              <span class="t-val">236 MB</span>
+  state            <span class="t-val">redb · checkpoint every 10 s</span></pre>
+        </div>
+      </div>
+      <div class="flow" aria-hidden="true">
+        <span class="flow-node">Redpanda</span>
+        <span class="flow-line"><i></i><i></i><i></i></span>
+        <span class="flow-node flow-node-mid">Tachyon</span>
+        <span class="flow-line"><i></i><i></i><i></i></span>
+        <span class="flow-node">Paimon</span>
+      </div>
+    </div>
+  </div>
+  <div class="hero-glow"></div>
+</header>
+
+<!-- ─── STATS BAR ───────────────────────────────────────────────── -->
+<section class="stats">
+  <div class="container stats-grid">
+    <div class="stat" data-reveal>
+      <span class="stat-value" data-count="1.94" data-suffix="×">1.94×</span>
+      <span class="stat-label">higher ETL throughput</span>
+    </div>
+    <div class="stat" data-reveal>
+      <span class="stat-value" data-count="3.41" data-suffix="×">3.41×</span>
+      <span class="stat-label">lower ETL p99 at 250 ms</span>
+    </div>
+    <div class="stat" data-reveal>
+      <span class="stat-value" data-count="236" data-prefix="~" data-suffix=" MB">~236 MB</span>
+      <span class="stat-label">RAM floor (single partition)</span>
+    </div>
+    <div class="stat" data-reveal>
+      <span class="stat-value">0</span>
+      <span class="stat-label">processes to coordinate</span>
+    </div>
+  </div>
+</section>
+
+<!-- ─── PROBLEM ─────────────────────────────────────────────────── -->
+<section id="problem" class="problem">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">The problem</span>
+      <h2>You didn't sign up to operate a platform</h2>
+      <p class="section-sub">
+        Flink and Spark are powerful — and they turn every pipeline into a
+        distributed system you must provision, tune, and keep alive.
+      </p>
+    </div>
+    <div class="panels">
+      <div class="panel panel-flink" data-reveal>
+        <span class="panel-tag">The Flink / Spark way</span>
+        <div class="proc-grid">
+          <div class="proc-box"><span class="proc-name">JobManager</span><span class="proc-sub">JVM process</span></div>
+          <div class="proc-box"><span class="proc-name">TaskManager ×N</span><span class="proc-sub">JVM processes</span></div>
+          <div class="proc-box"><span class="proc-name">ZooKeeper / K8s</span><span class="proc-sub">coordination</span></div>
+          <div class="proc-box"><span class="proc-name">RocksDB state</span><span class="proc-sub">pick &amp; tune</span></div>
+        </div>
+        <p class="panel-copy">
+          Every pipeline becomes a cluster: a JVM heap model to balance,
+          a coordinator to run, a state backend to babysit, savepoints to plan
+          before every deploy.
+        </p>
+      </div>
+      <div class="panel panel-tachyon" data-reveal>
+        <span class="panel-tag">The Tachyon way</span>
+        <div class="proc-single">
+          <div class="proc-box proc-box-standalone"><span class="proc-name">tachyon</span><span class="proc-sub">one Rust process</span></div>
+          <span class="proc-caption">~236 MB floor · no coordinator · no JVM</span>
+        </div>
+        <p class="panel-copy">
+          Every pipeline is one self-contained binary. If the process is
+          healthy, the pipeline is healthy. That's the whole operational model.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── PHILOSOPHY ──────────────────────────────────────────────── -->
+<section id="philosophy" class="philosophy">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Philosophy</span>
+      <h2>A different way to think about streaming</h2>
+      <p class="section-sub lead">
+        Flink is a platform you run pipelines on. Tachyon is a pipeline that
+        runs itself. Six principles drive every design decision:
+      </p>
+    </div>
+    <ol class="principles">
+      <li class="principle" data-reveal>
+        <span class="principle-num">01</span>
+        <div class="principle-body">
+          <h3>SQL is the product</h3>
+          <p>
+            All transformation logic is SQL — DataFusion plus a small set of
+            streaming extensions (watermarks, TUMBLE / HOP / SESSION, state TTL).
+            I/O and deployment live in one YAML. There is no pipeline code to
+            write, review, or maintain.
+          </p>
+        </div>
+      </li>
+      <li class="principle" data-reveal>
+        <span class="principle-num">02</span>
+        <div class="principle-body">
+          <h3>A pipeline is a self-contained unit</h3>
+          <p>
+            One binary, one process, no coordination layer. The moment a cluster
+            becomes the unit of deployment, operating the platform becomes a
+            second product you have to run.
+          </p>
+        </div>
+      </li>
+      <li class="principle" data-reveal>
+        <span class="principle-num">03</span>
+        <div class="principle-body">
+          <h3>Scale by key, not by cluster</h3>
+          <p>
+            One key <code>K</code> partitions Redpanda, the state, the merge, and
+            the Paimon buckets. More volume means more partitions and more
+            independent instances with disjoint keys — no cross-node shuffle,
+            no rebalancing coordinator.
+          </p>
+        </div>
+      </li>
+      <li class="principle" data-reveal>
+        <span class="principle-num">04</span>
+        <div class="principle-body">
+          <h3>Opinionated by design</h3>
+          <p>
+            One state backend (redb), one checkpoint mechanism, one writer per
+            bucket. The configuration surface is the essential: connectors,
+            inputs, output, key, partitions. Everything else has a default we
+            stand behind.
+          </p>
+        </div>
+      </li>
+      <li class="principle" data-reveal>
+        <span class="principle-num">05</span>
+        <div class="principle-body">
+          <h3>Inherit the hard parts</h3>
+          <p>
+            A vectorized SQL engine is a multi-year project. DataFusion gives us
+            the planner and Arrow execution; Paimon gives us the lakehouse table;
+            Redpanda gives us the broker. We build only the streaming semantics:
+            watermarks, state, windows, exactly-once.
+          </p>
+        </div>
+      </li>
+      <li class="principle" data-reveal>
+        <span class="principle-num">06</span>
+        <div class="principle-body">
+          <h3>The output is a table</h3>
+          <p>
+            Every pipeline writes to Paimon — a streaming-first lakehouse table
+            (LSM, changelog, CDC, ACID). The result of a pipeline is data you can
+            query from any engine, not a topic you have to subscribe to.
+          </p>
+        </div>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<!-- ─── DEPLOY & OPERATE ────────────────────────────────────────── -->
+<section id="deploy" class="deploy">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Deploy &amp; operate</span>
+      <h2>From cluster to container</h2>
+      <p class="section-sub">
+        What it takes to run, scale, and recover a pipeline — side by side.
+      </p>
+    </div>
+    <div class="ops" data-reveal>
+      <div class="ops-col ops-flink">
+        <h3>The Flink way</h3>
+        <ol>
+          <li>Provision a cluster: JobManager + N TaskManagers (JVM)</li>
+          <li>Tune the memory model: heap, managed memory, network buffers</li>
+          <li>Stand up coordination: ZooKeeper or Kubernetes</li>
+          <li>Pick a state backend — RocksDB or heap — and tune it</li>
+          <li>Plan savepoints before every deploy</li>
+          <li>Scale by rebalancing tasks and migrating state</li>
+          <li>Debug across three kinds of JVM logs</li>
+        </ol>
+      </div>
+      <div class="ops-col ops-tachyon">
+        <h3>The Tachyon way</h3>
+        <ol>
+          <li>Write <code>pipeline.sql</code> — the logic</li>
+          <li>Write <code>pipeline.yaml</code> — inputs, output, key, partitions</li>
+          <li>Run: <code>tachyon run pipeline.sql pipeline.yaml</code> — one container</li>
+          <li>Watch one HTTP endpoint: throughput, lag, p99, state size</li>
+          <li>Scale by adding an instance — the consumer group rebalances, buckets stay disjoint</li>
+          <li>Recover by restoring the last local checkpoint — no cross-node barrier</li>
+          <li>Change the logic by editing the SQL and redeploying the binary</li>
+        </ol>
+      </div>
+    </div>
+    <div class="ops-table-wrap" data-reveal>
+      <table class="ops-table">
+        <thead>
+          <tr><th></th><th class="col-flink">Flink / Spark</th><th class="col-tachyon">Tachyon</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="ops-label">Unit of deployment</td>
+            <td class="col-flink">A cluster: JM + N×TM + ZooKeeper/K8s</td>
+            <td class="col-tachyon">One binary + SQL + YAML</td>
+          </tr>
+          <tr>
+            <td class="ops-label">Processes to coordinate</td>
+            <td class="col-flink">3+ (JM, TMs, ZK)</td>
+            <td class="col-tachyon"><strong>0</strong></td>
+          </tr>
+          <tr>
+            <td class="ops-label">RAM floor (stateless)</td>
+            <td class="col-flink">≥1 GB per TaskManager + JobManager</td>
+            <td class="col-tachyon"><strong>~236 MB</strong></td>
+          </tr>
+          <tr>
+            <td class="ops-label">State backend</td>
+            <td class="col-flink">RocksDB or heap — pick and tune</td>
+            <td class="col-tachyon"><strong>redb — there is no choice</strong></td>
+          </tr>
+          <tr>
+            <td class="ops-label">Scaling</td>
+            <td class="col-flink">Rebalance + state migration (savepoint)</td>
+            <td class="col-tachyon"><strong>Add an instance</strong> — disjoint keys, disjoint buckets</td>
+          </tr>
+          <tr>
+            <td class="ops-label">Recovery</td>
+            <td class="col-flink">Restore a savepoint across the cluster</td>
+            <td class="col-tachyon"><strong>Restore the last local checkpoint</strong></td>
+          </tr>
+          <tr>
+            <td class="ops-label">Change the logic</td>
+            <td class="col-flink">Rebuild the jar, redeploy the cluster job</td>
+            <td class="col-tachyon"><strong>Edit the SQL, redeploy the binary</strong></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ─── DECISIONS ───────────────────────────────────────────────── -->
+<section id="decisions" class="decisions">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">The why</span>
+      <h2>Why we built it this way</h2>
+      <p class="section-sub">
+        Every constraint is a choice. These are the ones that shaped Tachyon —
+        and the trade-offs we accepted.
+      </p>
+    </div>
+    <div class="dec-grid">
+      <article class="dec-card" data-reveal>
+        <span class="dec-num">01</span>
+        <h3>No Flink runtime</h3>
+        <p class="dec-considered"><span>We considered</span> Running pipelines on Flink and inheriting its coordination, state, and checkpointing layers.</p>
+        <p class="dec-reason"><span>We chose</span> A lean Rust process per pipeline. We build watermarks, state, and checkpointing ourselves — and a pipeline fits in one process: no JVM, no cluster, no coordinator.</p>
+      </article>
+      <article class="dec-card" data-reveal>
+        <span class="dec-num">02</span>
+        <h3>DataFusion instead of our own engine</h3>
+        <p class="dec-considered"><span>We considered</span> Writing a vectorized SQL engine from scratch — a multi-year effort with a well-trodden road ahead of it.</p>
+        <p class="dec-reason"><span>We chose</span> DataFusion: the planner, optimizers, and vectorized Arrow execution already exist. Our engineering goes into the layer that actually differentiates: streaming semantics.</p>
+      </article>
+      <article class="dec-card" data-reveal>
+        <span class="dec-num">03</span>
+        <h3>Paimon as the output</h3>
+        <p class="dec-considered"><span>We considered</span> Iceberg, Delta, and Hudi — the established lakehouse tables.</p>
+        <p class="dec-reason"><span>We chose</span> Paimon: it is streaming-first (LSM tree, changelog, CDC, ACID) and has a native Rust writer. The same table serves streaming and batch — one output for both worlds.</p>
+      </article>
+      <article class="dec-card" data-reveal>
+        <span class="dec-num">04</span>
+        <h3>Redpanda as the broker</h3>
+        <p class="dec-considered"><span>We considered</span> Kafka, Pulsar, NATS — each with its own partitioning and operations story.</p>
+        <p class="dec-reason"><span>We chose</span> Redpanda: Kafka-compatible, C++ thread-per-core, Jepsen-verified. Low latency with a small footprint — and the key that partitions the broker is the same key that partitions the state.</p>
+      </article>
+      <article class="dec-card" data-reveal>
+        <span class="dec-num">05</span>
+        <h3>redb as the only state backend</h3>
+        <p class="dec-considered"><span>We considered</span> RocksDB (Flink's default, C bindings), SQLite (relational, not a KV), LMDB (fast, but C), and tiered memory→disk approaches.</p>
+        <p class="dec-reason"><span>We chose</span> redb: pure Rust, single-file, copy-on-write. A checkpoint becomes a file snapshot — with reflink, near-instant. One backend, one mechanism, zero choices to get wrong.</p>
+      </article>
+      <article class="dec-card" data-reveal>
+        <span class="dec-num">06</span>
+        <h3>One key, one writer per bucket</h3>
+        <p class="dec-considered"><span>We considered</span> Independent partitioning per layer — each subsystem with its own key and its own routing.</p>
+        <p class="dec-reason"><span>We chose</span> A single aligned key: Redpanda partition key == state key == merge key == Paimon bucket key. Colocated state, no write conflicts, scaling in lockstep — validated at compile time.</p>
+      </article>
+      <article class="dec-card dec-card-wide" data-reveal>
+        <span class="dec-num">07</span>
+        <h3>No distributed runtime</h3>
+        <p class="dec-considered"><span>We considered</span> A Flink-style distributed runtime: tasks spread across nodes, coordinated by a JobManager, with cross-node shuffles and barriers.</p>
+        <p class="dec-reason"><span>We chose</span> Self-contained instances. Coordination is where operational complexity lives, so we removed it: inputs are co-partitioned by key, fan-in is a local merge, and checkpoints are local barriers. The trade-off we accept: if an upstream stream isn't partitioned by <code>K</code>, one repartitioning stage fixes it — a known, declarable cost instead of a hidden one.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ─── USE CASES ───────────────────────────────────────────────── -->
+<section id="use-cases" class="use-cases">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Use cases</span>
+      <h2>What people build with it</h2>
+      <p class="section-sub">
+        Tachyon turns streaming data into a lakehouse, without the operational overhead.
+      </p>
+    </div>
+    <div class="cases-grid">
+      <a class="case-card case-featured" href="./news2.html" data-reveal>
+        <div class="case-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h3l2-6 4 12 2-6h7"/></svg>
+        </div>
+        <h3>NEWS2 early warning, split by vital</h3>
+        <p>Six measurement tables, six NEWS2 score tables, then a one-minute window in Paimon. The same graph on Flink 2.2.1, same 4 CPUs and 4.6 GiB. Tachyon committed the 500,000-row wide table at 260–275K rows/s against 10–11K, on about one core instead of 3.85.</p>
+        <span class="case-more">See the pipeline and both runs →</span>
+      </a>
+
+      <article class="case-card" data-reveal>
+        <div class="case-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+        </div>
+        <h3>Real-time analytics on event streams</h3>
+        <p>Ingest JSON events from Redpanda, transform with SQL (filter, join, aggregate), and write a continuously-updated Paimon table. Windowed aggregations close automatically via watermarks.</p>
+        <pre class="code-block"><span class="code-sql">INSERT INTO orders_lake
+SELECT window_start, window_end,
+       order_id, COUNT(*) AS events
+FROM TABLE(
+  TUMBLE(TABLE orders,
+         DESCRIPTOR(event_time),
+         INTERVAL '1' MINUTE)
+) GROUP BY window_start, window_end, order_id;</span></pre>
+      </article>
+
+      <article class="case-card" data-reveal>
+        <div class="case-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h6l4 6M3 18h6l4-6M13 12h8"/></svg>
+        </div>
+        <h3>Cross-service event unification</h3>
+        <p>Multiple services publish events with different schemas. Tachyon's schema converter normalizes them to a common base before the SQL layer — no code, just config.</p>
+        <pre class="code-block"><span class="code-yaml">inputs:
+  - name: web_orders
+    topic: orders-web
+    convert_to: combined_orders
+  - name: app_orders
+    topic: orders-app
+    convert_to: combined_orders</span></pre>
+      </article>
+
+      <article class="case-card" data-reveal>
+        <div class="case-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/></svg>
+        </div>
+        <h3>CDC pipelines to the lakehouse</h3>
+        <p>Ingest change-data-capture events (insert, update, delete) and maintain a primary-key table in Paimon. Sequence numbers resolve out-of-order updates; rowkind fields encode the operation type.</p>
+        <pre class="code-block"><span class="code-yaml">output:
+  table: warehouse.dbo.customer_events
+  key: customer_id
+  bucket: 8
+  sequence.field: source_version
+  rowkind.field: op</span></pre>
+      </article>
+
+      <article class="case-card" data-reveal>
+        <div class="case-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="12" r="5"/><circle cx="16" cy="12" r="5"/></svg>
+        </div>
+        <h3>Session windows across services</h3>
+        <p>Combine multiple service streams with UNION ALL, apply a session window on the unified stream. One query replaces what used to require a whole Flink job graph.</p>
+        <pre class="code-block"><span class="code-sql">INSERT INTO user_sessions
+SELECT service, session_start, session_end,
+       COUNT(*) AS hits
+FROM TABLE(
+  SESSION(TABLE combined_streams,
+          DESCRIPTOR(event_time),
+          INTERVAL '30' MINUTE)
+) GROUP BY service, session_start, session_end;</span></pre>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ─── BENCHMARKS ──────────────────────────────────────────────── -->
+<section id="benchmarks" class="benchmarks">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Benchmarks</span>
+      <h2>Same input, same budget, output checked</h2>
+      <p class="section-sub">
+        Tachyon and Flink 2.2.1 run alone, pinned to 4 CPUs and 4.6 GiB.
+        Every throughput run is kept only when the output matches the generator row for row.
+      </p>
+    </div>
+    <div class="bench-grid">
+      <div class="bench-card" data-reveal>
+        <h3>Redpanda → Paimon, ETL</h3>
+        <p class="bench-desc">Apple M5. JSON filter into a primary-key table. Median of 3 runs, 60M events.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">5.42M r/s</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 51.5%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">2.79M r/s</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Throughput: <strong>1.94×</strong></span>
+      </div>
+
+      <div class="bench-card" data-reveal>
+        <h3>Kinesis → Paimon</h3>
+        <p class="bench-desc">Linux, floCi, 10M events, 16 shards. Median of 12 Tachyon drains on 3 Oct. Flink is one run from 30 Sep. Two Tachyon runs stayed at 186K and 321K.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">954K r/s</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 48.2%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">460K r/s</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Throughput: <strong>2.08×</strong> · 1.92 cores vs 2.37</span>
+      </div>
+
+      <div class="bench-card" data-reveal>
+        <h3>Kinesis → Kinesis sink</h3>
+        <p class="bench-desc">Linux, 20M events. Both write ~80K rows/s — floCi is the ceiling. Tachyon uses 0.23 cores, Flink 0.91.</p>
+        <div class="bar-chart">
+          <div class="bar-row">
+            <span class="bar-label">Tachyon</span>
+            <div class="bar-track" style="--bar-w: 100%"><div class="bar-fill bar-tachyon"></div></div>
+            <span class="bar-value">349K /core</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">Flink</span>
+            <div class="bar-track" style="--bar-w: 25.5%"><div class="bar-fill bar-flink"></div></div>
+            <span class="bar-value">89K /core</span>
+          </div>
+        </div>
+        <span class="bench-ratio">Rows per CPU-second: <strong>3.9×</strong> · p99 280 ms vs 7.9 s</span>
+      </div>
+    </div>
+    <p class="bench-cta" data-reveal>
+      <a href="./benchmarks.html" class="btn btn-primary">Full benchmark results</a>
+    </p>
+    <p class="bench-note" data-reveal>
+      Windows, SQS, latency tables, and the measurement rules are on the benchmarks page.
+      The <a href="./news2.html">NEWS2 split-then-union pipeline</a> has its own page.
+      Redpanda numbers are the Apple M5 median. Kinesis, SQS, and NEWS2 were measured on Linux x86_64.
+    </p>
+  </div>
+</section>
+
+<!-- ─── ARCHITECTURE ────────────────────────────────────────────── -->
+<section id="architecture" class="architecture">
+  <div class="container">
+    <div class="section-head" data-reveal>
+      <span class="overline">Architecture</span>
+      <h2>Inside the process</h2>
+      <p class="section-sub">
+        One Rust process. Five layers. No coordination between instances.
+      </p>
+    </div>
+    <div class="arch-frame" data-reveal>
+      <span class="arch-frame-label">one Rust process — self-contained</span>
+      <div class="arch-flow">
+        <div class="arch-step">
+          <span class="arch-step-label">1</span>
+          <h4>Redpanda</h4>
+          <p>Consume by consumer group, partitioned by key K. Decode JSON / Avro to Arrow RecordBatches.</p>
+        </div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-step">
+          <span class="arch-step-label">2</span>
+          <h4>Schema converter</h4>
+          <p>Heterogeneous source schemas → unified base. Column reordering + type coercion, stateless.</p>
+        </div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-step">
+          <span class="arch-step-label">3</span>
+          <h4>DataFusion SQL</h4>
+          <p>Vectorized, multithreaded execution on Arrow: filter, join, aggregate, window. Watermarks close windows on event time.</p>
+        </div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-step">
+          <span class="arch-step-label">4</span>
+          <h4>Key routing</h4>
+          <p>hash(K) % buckets. One writer per bucket. Fan-in is a local merge via co-partitioning — no cross-node shuffle.</p>
+        </div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-step">
+          <span class="arch-step-label">5</span>
+          <h4>Paimon</h4>
+          <p>Lakehouse sink. Sequence numbers resolve out-of-order updates; two-phase commit makes exactly-once visible.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── CTA ─────────────────────────────────────────────────────── -->
+<section class="cta">
+  <div class="container cta-inner" data-reveal>
+    <h2>One SQL file. One YAML. One binary.</h2>
+    <p>Stop operating a platform. Start shipping pipelines.</p>
+    <a href="https://github.com/Rekeyea/tachyon" class="btn btn-primary btn-large">Get started on GitHub</a>
+  </div>
+</section>
+
+<!-- ─── FOOTER ──────────────────────────────────────────────────── -->
+<footer class="footer">
+  <div class="container footer-inner">
+    <span class="footer-brand"><img src="./logo.svg" alt="" class="footer-mark">tachyons.sh — a streaming engine that ships as one binary</span>
+    <span class="footer-links"><a href="./benchmarks.html">Benchmarks</a><a href="./news2.html">NEWS2</a><a href="https://github.com/Rekeyea/tachyon">GitHub</a></span>
+  </div>
+</footer>
+
+<script src="./app.js" defer></script>
+</body>
+</html>
