@@ -16,7 +16,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/tachyon/tachyon"
+repository = "https://github.com/Rekeyea/tachyon"
 
 # Dependencias de workspace (se añaden las pesadas por slice; ver MVP.md §5).
 [workspace.dependencies]

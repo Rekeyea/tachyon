@@ -4,15 +4,16 @@ description = "Binario de Tachyon: corre un pipeline de streaming"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "tachyon"
 path = "src/main.rs"
 
 [dependencies]
-tachyon-config = { path = "../crates/tachyon-config" }
-tachyon-runtime = { path = "../crates/tachyon-runtime" }
-tachyon-sink = { path = "../crates/tachyon-sink" }
+tachyon-config = { version = "0.1.0", path = "../crates/tachyon-config" }
+tachyon-runtime = { version = "0.1.0", path = "../crates/tachyon-runtime" }
+tachyon-sink = { version = "0.1.0", path = "../crates/tachyon-sink" }
 anyhow.workspace = true
 clap.workspace = true
 serde = { version = "1", features = ["derive"] }
