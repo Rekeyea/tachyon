@@ -669,6 +669,16 @@ Técnica adicional para escalar el paralelismo **en un solo nodo** (escalado ver
 ### 10.2 Observabilidad
 
 - **Métricas:** OpenTelemetry (métricas, traces, logs).
+  - **Hecho (métricas):** la instancia exporta por OTLP (HTTP) throughput
+    (rows leídas/escritas), commits, consumer lag, errores y tiempos por
+    etapa (source_next, send_wait, write, commit) vía `tachyon-metrics`
+    (SDK `opentelemetry_sdk` + `PeriodicReader`); además el endpoint
+    `GET /metrics` en formato Prometheus. Stack local de visualización
+    (otel-collector + Prometheus + Grafana, dashboard "Tachyon") en
+    `monitoring/`. Config: `deployment.metrics.{bind_addr,otlp_endpoint,
+    otlp_interval,service_name}`.
+  - **Pendiente:** latencia p50/p99 evento→escritura, MB/s, memoria/CPU por
+    operador, I/O de Paimon, checkpointing (ver §10.1).
 - **Traces:** trace distribuido a través de los operadores (DataFusion soporta extensibilidad).
 - **Admin API:** endpoint HTTP para consultar estado, lag, métricas, trigger checkpoint, reassign particiones.
 - **Health:** liveness/readiness probes para K8s.

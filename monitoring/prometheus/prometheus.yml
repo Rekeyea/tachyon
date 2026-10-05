@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  # Métricas OTel de los pipelines, vía el exporter Prometheus del collector.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  # Opcional: el endpoint /metrics nativo del binario (formato Prometheus),
+  # si el pipeline corre en el host y no por el collector. Descomentar y
+  # ajustar el puerto (deployment.metrics.bind_addr).
+  # - job_name: tachyon
+  #   static_configs:
+  #     - targets: ["host.docker.internal:9090"]

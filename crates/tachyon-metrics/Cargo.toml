@@ -7,8 +7,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# MVP: métricas básicas + endpoint HTTP minimalista (sin OpenTelemetry todavía;
-# la integración OTel llega en la Fase 4, ver DESIGN.md §10.2).
 tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
 anyhow = "1"
 tracing = "0.1"
+# OpenTelemetry (Fase 4, DESIGN.md §10.2): métricas vía OTLP al collector.
+# `http-proto` = OTLP/HTTP (puerto 4318); el client bloqueante de reqwest es
+# el que usa el PeriodicReader (export en thread propio del SDK).
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
+
+[dev-dependencies]
+# Solo para tests: el exporter in-memory del SDK vive tras la feature
+# `testing`.
+opentelemetry_sdk = { version = "0.33", features = ["testing"] }

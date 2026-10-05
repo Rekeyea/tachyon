@@ -385,6 +385,17 @@ pub struct MetricsConfig {
     /// (puerto efímero, útil en tests).
     #[serde(default = "default_metrics_bind")]
     pub bind_addr: String,
+    /// URL base del collector OpenTelemetry (p. ej.
+    /// "http://otel-collector:4318"). Ausente: sin export OTLP. La ruta de
+    /// señal (`/v1/metrics`) se añade sola.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Intervalo de export OTLP (p. ej. "10s"). Default: "10s".
+    #[serde(default)]
+    pub otlp_interval: Option<String>,
+    /// `service.name` del recurso OTel (Default: nombre del pipeline).
+    #[serde(default)]
+    pub service_name: Option<String>,
 }
 
 fn default_metrics_bind() -> String {

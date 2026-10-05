@@ -20,7 +20,7 @@ use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
 use rdkafka::{Offset, TopicPartitionList};
 use tachyon_config::{PayloadFormat, PipelineConfig};
-use tachyon_metrics::{InstanceMetrics, MetricsServer};
+use tachyon_metrics::{start_observability, InstanceMetrics};
 use tachyon_sink::redpanda::RedpandaSink;
 use tachyon_sink::writer::{open_table_with, stream_schema, tail_appends};
 use tachyon_source::{
@@ -97,11 +97,9 @@ pub async fn run_table_stream(
         ),
     }
 
-    if let Some(bind) = options.metrics_bind {
-        let server = MetricsServer::new(bind, metrics.clone());
-        let addr = server.start().await.context("arrancando métricas")?;
-        tracing::info!(%addr, "métricas disponibles");
-    }
+    start_observability(metrics, options.metrics_bind, options.otlp.as_ref())
+        .await
+        .context("arrancando observabilidad")?;
 
     let brokers = config.redpanda()?.brokers.join(",");
     ensure_topic_partitions(&brokers, topic, config.deployment.partitions).await?;

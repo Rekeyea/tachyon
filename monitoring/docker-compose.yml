@@ -1,0 +1,41 @@
+# Stack de observabilidad local: otel-collector + Prometheus + Grafana
+#
+# El binario tachyon exporta métricas OTLP (HTTP, puerto 4318) al collector;
+# el collector las publica en su exporter Prometheus (8889); Prometheus las
+# scrapea y Grafana las grafica (dashboard "Tachyon" provisionado).
+#
+# Arranque:  docker compose up -d
+# Apagar:    docker compose down
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    command: ["--config=/etc/otel-collector/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
+    ports:
+      - "4318:4318" # OTLP/HTTP (donde apunta otlp_endpoint del pipeline)
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped

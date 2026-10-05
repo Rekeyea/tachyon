@@ -39,7 +39,7 @@ use tachyon_config::{parse_fixed_duration, InputKind, PayloadFormat, PipelineCon
 use tachyon_core::{
     kafka_offsets, merge_positions, CheckpointBody, InputPosition, InputPositions, SourceOffsets,
 };
-use tachyon_metrics::{InstanceMetrics, MetricsServer};
+use tachyon_metrics::{start_observability, InstanceMetrics};
 use tachyon_sink::kinesis::KinesisSink;
 use tachyon_sink::redpanda::RedpandaSink;
 use tachyon_sink::sqs::SqsSink;
@@ -273,6 +273,8 @@ pub struct RunOptions {
     pub commit_interval: Duration,
     /// Puerto/dirección del endpoint de métricas (None = deshabilitado).
     pub metrics_bind: Option<std::net::SocketAddr>,
+    /// Export OTLP (None = deshabilitada).
+    pub otlp: Option<tachyon_metrics::otlp::OtelConfig>,
     /// ID de consumer group (debe ser único por instancia; en producción se
     /// deriva del nombre del pipeline).
     pub group_id: String,
@@ -291,6 +293,25 @@ impl RunOptions {
             .metrics
             .as_ref()
             .map(|m| m.bind_addr.parse().expect("bind_addr inválido"));
+        let otlp = config.deployment.metrics.as_ref().and_then(|m| {
+            m.otlp_endpoint.as_ref().map(|endpoint| {
+                let interval = m
+                    .otlp_interval
+                    .as_deref()
+                    .map(parse_duration)
+                    .unwrap_or(Duration::from_secs(10));
+                let service_name = m
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| config.pipeline.name.clone());
+                tachyon_metrics::otlp::OtelConfig {
+                    endpoint: endpoint.clone(),
+                    interval,
+                    service_name,
+                    instance: instance_name(),
+                }
+            })
+        });
         let group_id = format!("tachyon-{}", config.pipeline.name);
         // Varias instancias del mismo pipeline escriben la misma tabla: cada
         // una necesita su propio `commit_user` (sus checkpoints son propios)
@@ -301,6 +322,7 @@ impl RunOptions {
         RunOptions {
             commit_interval,
             metrics_bind,
+            otlp,
             commit_user,
             group_id,
         }
@@ -541,13 +563,11 @@ pub(crate) async fn run_pipeline_with_lookup(
         "exactly-once activo (pass-through); el paralelismo sale del pin salvo override del yaml"
     );
 
-    // --- Métricas (endpoint HTTP) ---
-    let metrics_addr = if let Some(bind) = options.metrics_bind {
-        let server = MetricsServer::new(bind, metrics.clone());
-        Some(server.start().await.context("arrancando métricas")?)
-    } else {
-        None
-    };
+    // --- Observabilidad (endpoint HTTP + export OTLP) ---
+    let metrics_addr =
+        start_observability(&metrics, options.metrics_bind, options.otlp.as_ref())
+            .await
+            .context("arrancando observabilidad")?;
 
     // --- Recuperación: último checkpoint exactly-once de esta instancia ---
     let mut sink = sink
@@ -1685,12 +1705,10 @@ pub(crate) async fn run_topic_pipeline_with_lookup(
         "exactly-once activo (topic); el commit es la transacción de Redpanda"
     );
 
-    let metrics_addr = if let Some(bind) = options.metrics_bind {
-        let server = MetricsServer::new(bind, metrics.clone());
-        Some(server.start().await.context("arrancando métricas")?)
-    } else {
-        None
-    };
+    let metrics_addr =
+        start_observability(&metrics, options.metrics_bind, options.otlp.as_ref())
+            .await
+            .context("arrancando observabilidad")?;
 
     let brokers = config.redpanda()?.brokers.join(",");
     ensure_topic_partitions(&brokers, topic, config.deployment.partitions).await?;
@@ -2098,12 +2116,10 @@ pub(crate) async fn run_aws_pipeline(
         "at-least-once activo (kinesis/sqs); el registro es durable al publicarse"
     );
 
-    let metrics_addr = if let Some(bind) = options.metrics_bind {
-        let server = MetricsServer::new(bind, metrics.clone());
-        Some(server.start().await.context("arrancando métricas")?)
-    } else {
-        None
-    };
+    let metrics_addr =
+        start_observability(&metrics, options.metrics_bind, options.otlp.as_ref())
+            .await
+            .context("arrancando observabilidad")?;
 
     let input_def = &config.inputs[0];
     let prepared = input_codecs
@@ -2477,12 +2493,10 @@ async fn run_union_topic(
         "exactly-once activo (UNION ALL a topic); cada rama commitea su consumer group"
     );
 
-    let metrics_addr = if let Some(bind) = options.metrics_bind {
-        let server = MetricsServer::new(bind, metrics.clone());
-        Some(server.start().await.context("arrancando métricas")?)
-    } else {
-        None
-    };
+    let metrics_addr =
+        start_observability(&metrics, options.metrics_bind, options.otlp.as_ref())
+            .await
+            .context("arrancando observabilidad")?;
 
     let brokers = config.redpanda()?.brokers.join(",");
     ensure_topic_partitions(&brokers, topic, config.deployment.partitions).await?;

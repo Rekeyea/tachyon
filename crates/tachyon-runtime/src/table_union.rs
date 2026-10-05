@@ -16,7 +16,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use tachyon_config::{parse_fixed_duration, PipelineConfig};
 use tachyon_core::{CheckpointBody, PartitionProgress, WindowCheckpointV1};
-use tachyon_metrics::{InstanceMetrics, MetricsServer};
+use tachyon_metrics::{start_observability, InstanceMetrics};
 use tachyon_sink::writer::{
     open_table_with, projection_schema, publishes_rowkind, tail_next_append, PaimonSink, Recovered,
 };
@@ -264,11 +264,9 @@ pub async fn run_table_union(
         ),
     };
 
-    if let Some(bind) = options.metrics_bind {
-        let server = MetricsServer::new(bind, metrics.clone());
-        let addr = server.start().await.context("arrancando métricas")?;
-        tracing::info!(%addr, "métricas disponibles");
-    }
+    start_observability(metrics, options.metrics_bind, options.otlp.as_ref())
+        .await
+        .context("arrancando observabilidad")?;
     tracing::info!(
         tables = sources.len(),
         output = %output_id,

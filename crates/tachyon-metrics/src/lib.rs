@@ -1,15 +1,18 @@
 //! `tachyon-metrics`: métricas de una instancia de pipeline.
 //!
-//! Slice 5: métricas básicas (throughput, lag, memoria) + endpoint HTTP
-//! minimalista. La integración OpenTelemetry completa llega en la Fase 4
-//! (ver DESIGN.md §10.2); esto da ya el "footprint medible" del MVP.
+//! Métricas básicas (throughput, lag, memoria) + endpoint HTTP
+//! `GET /metrics` en formato Prometheus (scrapeable por Prometheus/Grafana
+//! directamente). La export OpenTelemetry (OTLP) corre en paralelo: una tarea
+//! de fondo lee los deltas de los contadores y los registra en el SDK de
+//! OpenTelemetry, que los envía a un collector cada `interval` (ver
+//! DESIGN.md §10.2).
 //!
-//! El endpoint expone `GET /metrics` en formato plano (clave: valor), legible
-//! por humanos y fácil de scrapear. Sin framework HTTP: `tokio::net` + parseo
-//! manual de la request (solo soporta el método GET a la ruta `/metrics`).
+//! El endpoint HTTP no usa framework: `tokio::net` + parseo manual de la
+//! request (solo soporta el método GET a la ruta `/metrics`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,7 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Métricas de una instancia de pipeline.
 ///
 /// Contadores monotónicos (rows procesadas/escritas) + gauge de lag. Se
-/// actualizan desde el loop de ejecución y se leen desde el endpoint HTTP.
+/// actualizan desde el loop de ejecución y se leen desde el endpoint HTTP
+/// y desde la export OTLP.
 #[derive(Debug, Default)]
 pub struct InstanceMetrics {
     /// Filas leídas de la fuente (acumulado).
@@ -84,35 +88,83 @@ impl InstanceMetrics {
         self.commit_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
-    /// Serializa las métricas actuales en formato plano.
+    /// Serializa las métricas actuales en formato Prometheus (texto plano con
+    /// `# HELP`/`# TYPE`), legible por humanos y scrapeable por
+    /// Prometheus/Grafana.
     pub fn render(&self) -> String {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        format!(
-            "tachyon_rows_read {}\n\
-             tachyon_rows_written {}\n\
-             tachyon_commits {}\n\
-             tachyon_consumer_lag {}\n\
-             tachyon_errors {}\n\
-             tachyon_source_next_ns {}\n\
-             tachyon_send_wait_ns {}\n\
-             tachyon_write_ns {}\n\
-             tachyon_commit_ns {}\n\
-             tachyon_timestamp {}\n",
+        let mut out = String::new();
+        render_metric(
+            &mut out,
+            "rows_read",
+            "counter",
+            "Filas leídas de la fuente (acumulado).",
             self.rows_read.load(Ordering::Relaxed),
+        );
+        render_metric(
+            &mut out,
+            "rows_written",
+            "counter",
+            "Filas escritas al sink (acumulado).",
             self.rows_written.load(Ordering::Relaxed),
+        );
+        render_metric(
+            &mut out,
+            "commits",
+            "counter",
+            "Commits de sink completados (acumulado).",
             self.commits.load(Ordering::Relaxed),
+        );
+        render_metric(
+            &mut out,
+            "consumer_lag",
+            "gauge",
+            "Consumer lag total (offsets no consumidos).",
             self.consumer_lag.load(Ordering::Relaxed),
+        );
+        render_metric(
+            &mut out,
+            "errors",
+            "counter",
+            "Errores de ejecución (acumulado).",
             self.errors.load(Ordering::Relaxed),
+        );
+        render_metric(
+            &mut out,
+            "source_next_ns",
+            "counter",
+            "Tiempo en stream.next() (ns, acumulado).",
             self.source_next_ns.load(Ordering::Relaxed),
+        );
+        render_metric(
+            &mut out,
+            "send_wait_ns",
+            "counter",
+            "Tiempo bloqueado enviando al writer (ns, acumulado).",
             self.send_wait_ns.load(Ordering::Relaxed),
+        );
+        render_metric(
+            &mut out,
+            "write_ns",
+            "counter",
+            "Tiempo en sink.write() (ns, acumulado).",
             self.write_ns.load(Ordering::Relaxed),
+        );
+        render_metric(
+            &mut out,
+            "commit_ns",
+            "counter",
+            "Tiempo en el checkpoint del sink (ns, acumulado).",
             self.commit_ns.load(Ordering::Relaxed),
-            now,
-        )
+        );
+        out
     }
+}
+
+/// Añade una métrica al texto Prometheus: `# HELP`, `# TYPE` y el valor.
+fn render_metric(out: &mut String, name: &str, ty: &str, help: &str, value: u64) {
+    out.push_str(&format!("# HELP tachyon_{name} {help}\n"));
+    out.push_str(&format!("# TYPE tachyon_{name} {ty}\n"));
+    out.push_str(&format!("tachyon_{name} {value}\n"));
 }
 
 /// Servidor de métricas HTTP minimalista.
@@ -198,6 +250,221 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Export de métricas vía OpenTelemetry (OTLP).
+///
+/// El SDK de OpenTelemetry (`opentelemetry_sdk`) recoge los instrumentos y
+/// un `PeriodicReader` los envía a un collector OTLP cada `interval`. El
+/// hot path del pipeline no toca el SDK: una tarea de fondo lee los deltas
+/// de los atómicos de `InstanceMetrics` y los registra como
+/// `MonotonicCounter`/`Gauge` (ver DESIGN.md §10.2).
+pub mod otlp {
+    use super::*;
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry::KeyValue;
+    use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+    use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+    use opentelemetry_sdk::resource::Resource;
+    use opentelemetry_otlp::MetricExporter;
+    use opentelemetry_otlp::WithExportConfig;
+
+    /// Configuración de la export OTLP.
+    #[derive(Debug, Clone)]
+    pub struct OtelConfig {
+        /// URL base del collector (p. ej. `http://otel-collector:4318`).
+        /// La ruta de señal (`/v1/metrics`) se añade sola.
+        pub endpoint: String,
+        /// Intervalo de export (también el de muestreo de los deltas).
+        pub interval: Duration,
+        /// `service.name` del recurso OTel (default: nombre del pipeline).
+        pub service_name: String,
+        /// `service.instance.id` del recurso OTel (identidad de la instancia).
+        pub instance: String,
+    }
+
+    /// Registro OTel de la instancia. El provider vive dentro de la tarea de
+    /// export; el registro solo lo expone para tests (drop = shutdown +
+    /// export final).
+    pub struct OtelRegistry {
+        /// No se lee: se conserva para que el provider viva mientras viva el
+        /// registro (drop = shutdown + export final). En tests se usa para
+        /// `force_flush`.
+        #[allow(dead_code)]
+        pub(crate) provider: SdkMeterProvider,
+    }
+
+    /// Instrumentos de la instancia (counters de deltas + gauge de lag).
+    struct Instruments {
+        rows_read: opentelemetry::metrics::Counter<u64>,
+        rows_written: opentelemetry::metrics::Counter<u64>,
+        commits: opentelemetry::metrics::Counter<u64>,
+        errors: opentelemetry::metrics::Counter<u64>,
+        source_next_ns: opentelemetry::metrics::Counter<u64>,
+        send_wait_ns: opentelemetry::metrics::Counter<u64>,
+        write_ns: opentelemetry::metrics::Counter<u64>,
+        commit_ns: opentelemetry::metrics::Counter<u64>,
+        consumer_lag: opentelemetry::metrics::Gauge<u64>,
+    }
+
+    impl Instruments {
+        fn new(provider: &SdkMeterProvider) -> Self {
+            let meter = provider.meter("tachyon");
+            Instruments {
+                rows_read: meter.u64_counter("tachyon.rows.read").build(),
+                rows_written: meter.u64_counter("tachyon.rows.written").build(),
+                commits: meter.u64_counter("tachyon.commits").build(),
+                errors: meter.u64_counter("tachyon.errors").build(),
+                source_next_ns: meter.u64_counter("tachyon.stage.source_next_ns").build(),
+                send_wait_ns: meter.u64_counter("tachyon.stage.send_wait_ns").build(),
+                write_ns: meter.u64_counter("tachyon.stage.write_ns").build(),
+                commit_ns: meter.u64_counter("tachyon.stage.commit_ns").build(),
+                consumer_lag: meter.u64_gauge("tachyon.consumer.lag").build(),
+            }
+        }
+    }
+
+    impl OtelRegistry {
+        /// Arranca la export OTLP: el provider vive en la tarea de fondo (la
+        /// export dura toda la vida del proceso). Devuelve error si el
+        /// exporter no se puede construir.
+        pub fn start(metrics: Arc<InstanceMetrics>, cfg: OtelConfig) -> Result<()> {
+            let url = otlp_metrics_url(&cfg.endpoint);
+            let exporter = MetricExporter::builder()
+                .with_http()
+                .with_endpoint(url)
+                .build()
+                .context("construyendo el exporter OTLP")?;
+            let reader = PeriodicReader::builder(exporter)
+                .with_interval(cfg.interval)
+                .build();
+            let resource = resource_for(&cfg.service_name, &cfg.instance);
+            let provider = SdkMeterProvider::builder()
+                .with_reader(reader)
+                .with_resource(resource)
+                .build();
+            let instruments = Instruments::new(&provider);
+            tokio::spawn(async move {
+                delta_loop(metrics, cfg.interval, instruments).await;
+                // El provider se dropa al terminar la tarea: export final.
+                drop(provider);
+            });
+            Ok(())
+        }
+
+        /// Variante con un reader propio (tests con exporter in-memory). El
+        /// caller posee el provider: su drop dispara el shutdown y la export
+        /// final.
+        #[doc(hidden)]
+        pub fn with_reader<E: PushMetricExporter + 'static>(
+            metrics: Arc<InstanceMetrics>,
+            interval: Duration,
+            reader: PeriodicReader<E>,
+            service_name: String,
+            instance: String,
+        ) -> OtelRegistry {
+            let resource = resource_for(&service_name, &instance);
+            let provider = SdkMeterProvider::builder()
+                .with_reader(reader)
+                .with_resource(resource)
+                .build();
+            let instruments = Instruments::new(&provider);
+            tokio::spawn(async move {
+                delta_loop(metrics, interval, instruments).await;
+            });
+            OtelRegistry { provider }
+        }
+    }
+
+    fn resource_for(service_name: &str, instance: &str) -> Resource {
+        Resource::builder()
+            .with_service_name(service_name.to_string())
+            .with_attribute(KeyValue::new("service.instance.id", instance.to_string()))
+            .build()
+    }
+
+    /// Bucle de deltas: cada `interval` registra en OTel lo que los
+    /// atómicos acumularon desde la última vuelta (los counters OTel son
+    /// monotónicos; el gauge refleja el lag actual).
+    async fn delta_loop(
+        metrics: Arc<InstanceMetrics>,
+        interval: Duration,
+        inst: Instruments,
+    ) {
+        let mut last = [0u64; 8];
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            let current = [
+                metrics.rows_read.load(Ordering::Relaxed),
+                metrics.rows_written.load(Ordering::Relaxed),
+                metrics.commits.load(Ordering::Relaxed),
+                metrics.errors.load(Ordering::Relaxed),
+                metrics.source_next_ns.load(Ordering::Relaxed),
+                metrics.send_wait_ns.load(Ordering::Relaxed),
+                metrics.write_ns.load(Ordering::Relaxed),
+                metrics.commit_ns.load(Ordering::Relaxed),
+            ];
+            let counters = [
+                &inst.rows_read,
+                &inst.rows_written,
+                &inst.commits,
+                &inst.errors,
+                &inst.source_next_ns,
+                &inst.send_wait_ns,
+                &inst.write_ns,
+                &inst.commit_ns,
+            ];
+            for (i, counter) in counters.iter().enumerate() {
+                let delta = current[i].saturating_sub(last[i]);
+                if delta > 0 {
+                    counter.add(delta, &[]);
+                }
+                last[i] = current[i];
+            }
+            inst.consumer_lag
+                .record(metrics.consumer_lag.load(Ordering::Relaxed), &[]);
+        }
+    }
+
+    /// URL del endpoint OTLP de métricas: respeta una URL completa que ya
+    /// incluya la ruta de señal y añade `/v1/metrics` a una URL base.
+    pub(crate) fn otlp_metrics_url(endpoint: &str) -> String {
+        let trimmed = endpoint.trim_end_matches('/');
+        if trimmed.ends_with("/v1/metrics") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/v1/metrics")
+        }
+    }
+}
+
+/// Arranca la observabilidad de la instancia: el endpoint HTTP de métricas
+/// (si hay `bind`) y la export OTLP (si hay `otlp`). Devuelve la dirección
+/// real del endpoint HTTP (None si no hay).
+pub async fn start_observability(
+    metrics: &Arc<InstanceMetrics>,
+    bind: Option<std::net::SocketAddr>,
+    otlp: Option<&otlp::OtelConfig>,
+) -> Result<Option<std::net::SocketAddr>> {
+    let metrics_addr = match bind {
+        Some(addr) => {
+            let server = MetricsServer::new(addr, metrics.clone());
+            let actual = server
+                .start()
+                .await
+                .context("arrancando el endpoint de métricas")?;
+            tracing::info!(%actual, "métricas disponibles");
+            Some(actual)
+        }
+        None => None,
+    };
+    if let Some(cfg) = otlp {
+        otlp::OtelRegistry::start(metrics.clone(), cfg.clone())
+            .context("arrancando la export OTLP")?;
+        tracing::info!(endpoint = %cfg.endpoint, "export OTLP activa");
+    }
+    Ok(metrics_addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +496,8 @@ mod tests {
         assert!(text.contains("tachyon_commits 0"));
         assert!(text.contains("tachyon_consumer_lag 0"));
         assert!(text.contains("tachyon_errors 0"));
+        assert!(text.contains("# TYPE tachyon_rows_read counter"));
+        assert!(text.contains("# TYPE tachyon_consumer_lag gauge"));
     }
 
     #[tokio::test]
@@ -266,5 +535,95 @@ mod tests {
         socket.read_to_end(&mut buf).await.expect("leyendo respuesta");
         let response = String::from_utf8_lossy(&buf);
         assert!(response.starts_with("HTTP/1.1 404"), "debe ser 404: {response}");
+    }
+
+    // --- Export OTLP (con exporter in-memory del SDK) ---
+
+    /// El valor máximo (acumulado) de la métrica `name` en las colecciones
+    /// del exporter (los counters son acumulativos: el último valor es el
+    /// mayor).
+    fn metric_max(
+        rms: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+        name: &str,
+    ) -> Option<u64> {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        let mut out: Option<u64> = None;
+        for rm in rms {
+            for scope in rm.scope_metrics() {
+                for m in scope.metrics() {
+                    if m.name() != name {
+                        continue;
+                    }
+                    let values: Vec<u64> = match m.data() {
+                        AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                            sum.data_points().map(|d| d.value()).collect()
+                        }
+                        AggregatedMetrics::U64(MetricData::Gauge(gauge)) => {
+                            gauge.data_points().map(|d| d.value()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let max = *values.iter().max().unwrap_or(&0);
+                    out = out.map(|v| v.max(max)).or(Some(max));
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn otlp_registry_records_deltas_and_gauge() {
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_millis(20))
+            .build();
+        let metrics = Arc::new(InstanceMetrics::new());
+        let registry = otlp::OtelRegistry::with_reader(
+            metrics.clone(),
+            Duration::from_millis(20),
+            reader,
+            "test-pipeline".to_string(),
+            "test-instance".to_string(),
+        );
+
+        metrics.inc_rows_read(10);
+        metrics.inc_rows_read(5);
+        metrics.inc_rows_written(4);
+        metrics.inc_commits();
+        metrics.inc_errors();
+        metrics.add_source_next_ns(123);
+        metrics.add_commit_ns(77);
+        metrics.set_consumer_lag(9);
+
+        // Varias vueltas del reader para que el in-memory exporter acumule.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        registry.provider.force_flush().expect("force_flush");
+        let rms = exporter.get_finished_metrics().expect("métricas");
+
+        assert_eq!(metric_max(&rms, "tachyon.rows.read"), Some(15));
+        assert_eq!(metric_max(&rms, "tachyon.rows.written"), Some(4));
+        assert_eq!(metric_max(&rms, "tachyon.commits"), Some(1));
+        assert_eq!(metric_max(&rms, "tachyon.errors"), Some(1));
+        assert_eq!(metric_max(&rms, "tachyon.stage.source_next_ns"), Some(123));
+        assert_eq!(metric_max(&rms, "tachyon.stage.commit_ns"), Some(77));
+        assert_eq!(metric_max(&rms, "tachyon.consumer.lag"), Some(9));
+    }
+
+    #[test]
+    fn otlp_url_appends_metrics_path() {
+        assert_eq!(
+            otlp::otlp_metrics_url("http://collector:4318"),
+            "http://collector:4318/v1/metrics"
+        );
+        assert_eq!(
+            otlp::otlp_metrics_url("http://collector:4318/"),
+            "http://collector:4318/v1/metrics"
+        );
+        assert_eq!(
+            otlp::otlp_metrics_url("http://collector:4318/v1/metrics"),
+            "http://collector:4318/v1/metrics"
+        );
     }
 }

@@ -17,7 +17,7 @@ use tachyon_core::{
     CheckpointBody, JoinCell, JoinCheckpointV1, JoinColumnSpec, JoinEvent, JoinKeyState, JoinSpec,
     JoinState, SourceOffsets,
 };
-use tachyon_metrics::{InstanceMetrics, MetricsServer};
+use tachyon_metrics::{start_observability, InstanceMetrics};
 use tachyon_sink::writer::{PaimonSink, Recovered};
 use tachyon_source::consumer::RdkafkaSource;
 use tachyon_source::decode::Decoder;
@@ -259,16 +259,10 @@ pub async fn run_join_pipeline(
     let left_lag = side_lag(config, &join.left, &join.left_time, &join.left_key)?;
     let right_lag = side_lag(config, &join.right, &join.right_time, &join.right_key)?;
     let budget = StatelessBudget::resolve(config).context("presupuesto del pipeline")?;
-    let metrics_addr = if let Some(bind) = options.metrics_bind {
-        Some(
-            MetricsServer::new(bind, metrics.clone())
-                .start()
-                .await
-                .context("arrancando métricas")?,
-        )
-    } else {
-        None
-    };
+    let metrics_addr =
+        start_observability(metrics, options.metrics_bind, options.otlp.as_ref())
+            .await
+            .context("arrancando observabilidad")?;
 
     let mut sink = sink
         .with_commit_user(&options.commit_user)

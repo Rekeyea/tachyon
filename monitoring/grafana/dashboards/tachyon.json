@@ -1,0 +1,169 @@
+{
+  "annotations": { "list": [] },
+  "title": "Tachyon",
+  "uid": "tachyon-pipeline",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "timezone": "browser",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["tachyon"],
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Pipeline",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "tachyon-prometheus" },
+        "queries": ["label_values(exported_job)"],
+        "query": "label_values(exported_job)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput (rows/s)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "tachyon-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (exported_job) (rate(tachyon_rows_read_total{exported_job=~\"$service\"}[1m]))",
+          "legendFormat": "{{exported_job}} read"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (exported_job) (rate(tachyon_rows_written_total{exported_job=~\"$service\"}[1m]))",
+          "legendFormat": "{{exported_job}} written"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Consumer lag (offsets)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "tachyon-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (exported_job) (tachyon_consumer_lag{exported_job=~\"$service\"})",
+          "legendFormat": "{{exported_job}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Tiempo por etapa (ns/s, apilado)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "tachyon-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ns",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 50,
+            "stacking": { "mode": "normal" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (rate(tachyon_stage_source_next_ns_total{exported_job=~\"$service\"}[1m]))",
+          "legendFormat": "source_next"
+        },
+        {
+          "refId": "B",
+          "expr": "sum (rate(tachyon_stage_send_wait_ns_total{exported_job=~\"$service\"}[1m]))",
+          "legendFormat": "send_wait"
+        },
+        {
+          "refId": "C",
+          "expr": "sum (rate(tachyon_stage_write_ns_total{exported_job=~\"$service\"}[1m]))",
+          "legendFormat": "write"
+        },
+        {
+          "refId": "D",
+          "expr": "sum (rate(tachyon_stage_commit_ns_total{exported_job=~\"$service\"}[1m]))",
+          "legendFormat": "commit"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Errores (rate)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "tachyon-prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (rate(tachyon_errors_total{exported_job=~\"$service\"}[5m]))",
+          "legendFormat": "errors/s"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Commits (rate)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "tachyon-prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (rate(tachyon_commits_total{exported_job=~\"$service\"}[1m]))",
+          "legendFormat": "commits/s"
+        }
+      ]
+    }
+  ]
+}

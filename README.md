@@ -118,10 +118,31 @@ El schema Arrow de cada input es un JSON con una línea por campo:
 ]
 ```
 
-### Métricas
+### Observabilidad
 
-Si la config define un puerto de métricas, el binario expone
-`http://<addr>/metrics` en formato Prometheus.
+El binario expone las métricas de la instancia de dos formas (independientes):
+
+- **Endpoint HTTP** (`deployment.metrics.bind_addr`): `http://<addr>/metrics`
+  en formato Prometheus, scrapeable directamente.
+- **OpenTelemetry** (`deployment.metrics.otlp_endpoint`): export OTLP (HTTP)
+  de las mismas métricas a un collector, con intervalo configurable
+  (`otlp_interval`, default 10s) y `service.name` configurable
+  (`service_name`, default: nombre del pipeline). En Prometheus (vía el
+  exporter del collector) los counters salen con sufijo `_total` y el
+  pipeline se identifica con la label `exported_job`.
+
+```yaml
+deployment:
+  metrics:
+    bind_addr: 0.0.0.0:9090
+    otlp_endpoint: http://otel-collector:4318
+    otlp_interval: 10s
+```
+
+Hay un stack local (otel-collector + Prometheus + Grafana, con dashboard
+"Tachyon" predefinido) en [`monitoring/`](monitoring/README.md):
+`cd monitoring && docker compose up -d` y ver el dashboard en
+http://localhost:3000.
 
 ## Arquitectura
 
